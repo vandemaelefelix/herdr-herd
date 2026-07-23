@@ -1,10 +1,12 @@
-//! Minimal raw unix-socket helper — Spike A scaffolding only.
+//! The herdr control socket client.
 //!
-//! Phase 0 does NOT ship a full socket client; that is Phase 1 (event
-//! subscription). This exists so Spike A can send a `layout.export` /
-//! `layout.apply` request to `$HERDR_SOCKET_PATH` and read the reply.
-//! (Spike A verified the wire uses newline-delimited JSON-RPC with dotted
-//! method names — see the design doc §5.)
+//! This is the persistent, line-delimited JSON-RPC client
+//! (`SocketClient`/`RealSocket`) used to subscribe to socket events and
+//! receive framed lines, one per newline-delimited JSON-RPC message. It also
+//! retains the one-shot `request` helper (from Phase 0 Spike A) for simple
+//! request/reply calls such as `layout.export` / `layout.apply` against
+//! `$HERDR_SOCKET_PATH`. (Spike A verified the wire uses newline-delimited
+//! JSON-RPC with dotted method names — see the design doc §5.)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -33,7 +35,11 @@ pub trait SocketClient {
     fn send_line(&mut self, line: &str) -> std::io::Result<()>;
     /// Read one framed line, with the trailing newline stripped.
     ///
-    /// Returns an error if the socket is closed (a zero-byte read).
+    /// Returns an error if the socket is closed (a zero-byte read). On
+    /// `RealSocket`, an `Err` whose `kind()` is `WouldBlock` or `TimedOut`
+    /// means no line arrived within the read timeout — a normal idle tick,
+    /// not a dead connection. `Ok(0)`/EOF is still a real close, surfaced as
+    /// `io::Error::other("socket closed")`.
     fn recv_line(&mut self) -> std::io::Result<String>;
 }
 
@@ -46,9 +52,15 @@ pub struct RealSocket {
 
 impl RealSocket {
     /// Connect to the herdr control socket at `path`.
+    ///
+    /// The read half gets a short read timeout so `recv_line` cannot block
+    /// forever, letting the watcher's slow-poll safety net run even while
+    /// connected (see `recv_line`).
     pub fn connect(path: &Path) -> std::io::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        let reader = BufReader::new(stream.try_clone()?);
+        let read_half = stream.try_clone()?;
+        read_half.set_read_timeout(Some(std::time::Duration::from_millis(400)))?;
+        let reader = BufReader::new(read_half);
         Ok(Self {
             writer: stream,
             reader,
@@ -73,7 +85,8 @@ impl SocketClient for RealSocket {
     }
 }
 
-/// The verified `events.subscribe` request line (refine per Spike 1).
+/// A sensible default `events.subscribe` request line, pending live
+/// verification (Spike 1 was deferred; refine once it runs).
 pub fn subscribe_request() -> String {
     r#"{"id":"pets","method":"events.subscribe","params":{}}"#.to_string()
 }

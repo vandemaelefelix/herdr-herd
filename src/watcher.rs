@@ -94,43 +94,55 @@ pub fn watch(
     debounce_ms: u64,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        use std::io::ErrorKind;
+
         // Initial snapshot.
         if let Some(s) = refetch(cli.as_ref()) {
             let _ = tx.send(s);
         }
-        let mut last = clock.now_ms();
+        let mut last_send = clock.now_ms();
         if let Some(sock) = socket.as_mut() {
             let _ = sock.send_line(&subscribe_request());
         }
         loop {
-            let mut fired = false;
             if let Some(sock) = socket.as_mut() {
                 match sock.recv_line() {
                     Ok(_line) => {
+                        // An event arrived; debounce a refetch.
                         let now = clock.now_ms();
-                        if now.saturating_sub(last) >= debounce_ms {
+                        if now.saturating_sub(last_send) >= debounce_ms {
                             if let Some(s) = refetch(cli.as_ref()) {
                                 if tx.send(s).is_err() {
                                     return;
                                 }
                             }
-                            last = now;
+                            last_send = now;
                         }
-                        fired = true;
+                    }
+                    Err(ref e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        // Idle tick within the read timeout; not a failure.
                     }
                     Err(_) => {
-                        socket = None; // degrade to polling
+                        socket = None; // real close -> degrade to poll-only
                     }
                 }
-            }
-            if !fired {
+            } else {
                 std::thread::sleep(std::time::Duration::from_millis(slow_ms));
+            }
+
+            // Slow-poll safety net: guarantees a refresh at least every
+            // `slow_ms` regardless of socket state (connected, idle-ticking,
+            // or degraded to `None`).
+            let now = clock.now_ms();
+            if now.saturating_sub(last_send) >= slow_ms {
                 if let Some(s) = refetch(cli.as_ref()) {
                     if tx.send(s).is_err() {
                         return;
                     }
                 }
-                last = clock.now_ms();
+                last_send = now;
             }
         }
     })
