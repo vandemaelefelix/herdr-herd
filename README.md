@@ -6,8 +6,9 @@ every tab. Each pet's behavior reflects its agent's live state — so you can fe
 the state of your whole fleet at a glance, without reading a thing.
 
 > Status: **in design.** This README describes what herdr-pets is meant to be.
-> The project's north star lives in [GOAL.md](GOAL.md); the full design will land
-> in `docs/superpowers/specs/`.
+> The project's north star lives in [GOAL.md](GOAL.md), the phased roadmap in
+> [docs/PLAN.md](docs/PLAN.md); each phase's detailed design + plan land in
+> `docs/superpowers/specs/`.
 
 <!-- ![herdr-pets: a slim strip of pixel pets along the bottom of a herdr tab](assets/strip.png) -->
 
