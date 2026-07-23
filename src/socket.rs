@@ -6,7 +6,7 @@
 //! (Spike A verified the wire uses newline-delimited JSON-RPC with dotted
 //! method names — see the design doc §5.)
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -26,11 +26,97 @@ pub fn request(path: &Path, payload: &str) -> std::io::Result<String> {
     Ok(reply)
 }
 
+/// A persistent, line-delimited JSON-RPC connection (see Phase 0 Spike A: the
+/// control socket speaks newline-delimited JSON-RPC with dotted method names).
+pub trait SocketClient {
+    /// Write `line` followed by a newline and flush.
+    fn send_line(&mut self, line: &str) -> std::io::Result<()>;
+    /// Read one framed line, with the trailing newline stripped.
+    ///
+    /// Returns an error if the socket is closed (a zero-byte read).
+    fn recv_line(&mut self) -> std::io::Result<String>;
+}
+
+/// A `SocketClient` backed by a real `UnixStream`, with an internal
+/// `BufReader` for line-buffered reads.
+pub struct RealSocket {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl RealSocket {
+    /// Connect to the herdr control socket at `path`.
+    pub fn connect(path: &Path) -> std::io::Result<Self> {
+        let stream = UnixStream::connect(path)?;
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            writer: stream,
+            reader,
+        })
+    }
+}
+
+impl SocketClient for RealSocket {
+    fn send_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    fn recv_line(&mut self) -> std::io::Result<String> {
+        let mut s = String::new();
+        let n = self.reader.read_line(&mut s)?;
+        if n == 0 {
+            return Err(std::io::Error::other("socket closed"));
+        }
+        Ok(s.trim_end_matches(['\r', '\n']).to_string())
+    }
+}
+
+/// The verified `events.subscribe` request line (refine per Spike 1).
+pub fn subscribe_request() -> String {
+    r#"{"id":"pets","method":"events.subscribe","params":{}}"#.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn real_socket_sends_and_receives_framed_lines() {
+        let path = std::env::temp_dir().join(format!("herdr-pets-rt-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let (conn, _) = listener.accept().unwrap();
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut w = conn;
+                let mut got = String::new();
+                r.read_line(&mut got).unwrap();
+                w.write_all(b"{\"event\":\"ok\"}\n").unwrap();
+                let _ = std::fs::remove_file(&path);
+                got
+            }
+        });
+        let mut c = RealSocket::connect(&path).unwrap();
+        c.send_line("{\"id\":\"x\",\"method\":\"events.subscribe\",\"params\":{}}")
+            .unwrap();
+        let reply = c.recv_line().unwrap();
+        assert_eq!(reply, "{\"event\":\"ok\"}");
+        let got = server.join().unwrap();
+        assert!(got.contains("events.subscribe"));
+    }
+
+    #[test]
+    fn subscribe_request_is_valid_json_line() {
+        let s = subscribe_request();
+        assert!(s.contains("events.subscribe"));
+        assert!(!s.contains('\n'));
+    }
 
     #[test]
     fn request_writes_payload_and_reads_reply() {
