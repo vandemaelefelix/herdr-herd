@@ -28,6 +28,25 @@ pub fn request(path: &Path, payload: &str) -> std::io::Result<String> {
     Ok(reply)
 }
 
+/// Connect, send `payload` + a newline, and read exactly one reply line (with
+/// the trailing newline stripped). Unlike [`request`], this does **not** wait
+/// for the server to close: the herdr control socket is persistent, so a
+/// request/reply is framed by the newline, not by EOF.
+pub fn request_line(path: &Path, payload: &str) -> std::io::Result<String> {
+    let stream = UnixStream::connect(path)?;
+    let mut writer = stream.try_clone()?;
+    writer.write_all(payload.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        return Err(std::io::Error::other("socket closed before reply"));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 /// A persistent, line-delimited JSON-RPC connection (see Phase 0 Spike A: the
 /// control socket speaks newline-delimited JSON-RPC with dotted method names).
 pub trait SocketClient {
@@ -172,5 +191,32 @@ mod tests {
         assert_eq!(reply, "PONG");
         let got = server.join().unwrap();
         assert_eq!(got, "PING\n");
+    }
+
+    #[test]
+    fn request_line_reads_one_reply_line_without_needing_eof() {
+        let path = std::env::temp_dir().join(format!("herdr-pets-rl-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let (conn, _) = listener.accept().unwrap();
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut w = conn;
+                let mut got = String::new();
+                r.read_line(&mut got).unwrap();
+                w.write_all(b"{\"reply\":1}\n").unwrap();
+                w.flush().unwrap();
+                // Hold the connection open (a persistent socket does not EOF).
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = std::fs::remove_file(&path);
+                got
+            }
+        });
+        let reply = request_line(&path, "{\"ping\":1}").unwrap();
+        assert_eq!(reply, "{\"reply\":1}");
+        let got = server.join().unwrap();
+        assert_eq!(got, "{\"ping\":1}\n");
     }
 }
