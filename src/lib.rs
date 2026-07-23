@@ -3,6 +3,7 @@
 //! Phase 0: foundations. Modules are added task-by-task.
 
 pub mod agent;
+pub mod anim;
 pub mod herdr;
 pub mod identity;
 pub mod render;
