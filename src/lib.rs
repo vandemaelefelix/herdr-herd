@@ -12,3 +12,4 @@ pub mod pet;
 pub mod render;
 pub mod socket;
 pub mod sprite;
+pub mod watcher;
