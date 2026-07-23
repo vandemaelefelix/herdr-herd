@@ -284,7 +284,59 @@ and the event layer is best-effort. Record the finding in this section; update
 `GOAL.md` / `docs/PLAN.md` only if it contradicts the design (it should not — the
 design degrades gracefully).
 
-**Finding:** _(to be filled in during implementation)_
+**Finding** _(run 2026-07-23, herdr 0.7.0, live macOS session with 24 agents)_:
+
+**`events.subscribe` works and delivers events; agent *status* changes are
+per-pane, not global. The watcher subscribes to global structural events and
+covers pure status flips via the slow poll.**
+
+- **Request shape.** `params.subscriptions` is **required** (omitting it →
+  `invalid_request: missing field 'subscriptions'`). Each entry is an
+  **internally-tagged enum keyed by `type`** with **dotted** names. Empty
+  `subscriptions: []` is accepted (`{"result":{"type":"subscription_started"}}`)
+  but streams nothing useful. Valid types (from the enum-error enumeration):
+  `workspace.{created,updated,renamed,closed,focused}`,
+  `worktree.{created,opened,removed}`, `tab.{created,closed,focused,renamed}`,
+  `pane.{created,closed,focused,moved,exited,agent_detected,output_matched,agent_status_changed}`.
+
+- **Delivery confirmed.** Subscribing then creating/closing a scratch tab
+  streamed `tab_created` / `pane_created` / `tab_closed` with full payloads,
+  plus a live `pane_agent_detected` for another workspace's agent. **On connect,
+  herdr replays current state** (existing tabs/panes) before streaming live
+  changes — a free structural snapshot.
+
+- **⚠️ Stream vs. subscription naming.** Subscription `type`s are dotted
+  (`tab.created`); the streamed events use **underscores** in both `event` and
+  `data.type` (`{"event":"tab_created","data":{...,"type":"tab_created"}}`).
+  Harmless for us — the watcher ignores event contents and just refetches.
+
+- **⚠️ `pane.agent_status_changed` is PER-PANE.** It requires a `pane_id`
+  (`{"type":"pane.agent_status_changed","pane_id":"w1T:p1"}` → accepted); there
+  is **no global "any agent status changed" event**. So catching every agent's
+  `idle`↔`working`↔`blocked`↔`done` transition instantly would require
+  subscribing per pane and re-subscribing as panes appear.
+
+- **Decision for Phase 1.** `subscribe_request()` subscribes to the **global**
+  structural set (`pane.created/closed/exited/agent_detected`, `tab.created/closed`)
+  — reliably delivered, no per-pane bookkeeping. Structural changes (agents
+  appearing/leaving/being detected) refetch instantly; **pure status flips are
+  covered by the ~2.5 s slow poll**, which the live check confirmed keeps
+  `agent list` correct. This satisfies "near-real-time" without per-pane
+  subscription complexity.
+
+- **Bug this caught.** The originally-shipped `subscribe_request()` sent
+  `params:{}` (no `subscriptions`), so the socket returned `invalid_request` and
+  closed — the watcher silently degraded to poll-only on every run. Fixed to the
+  valid global subscription above.
+
+- **Follow-up (tracked, not Phase 1).** For instant per-agent status updates,
+  subscribe `pane.agent_status_changed` per pane (seed from the connect-time
+  replay / `pane list`, add on `pane.created`). Until then, status latency is
+  bounded by the slow-poll interval.
+
+This **does not contradict** `GOAL.md` / the Phase 1 design (which specified
+"any event → refetch" with a slow-poll safety net, and treated the exact
+mechanism as this spike's job). No `GOAL.md` / `docs/PLAN.md` change required.
 
 ## 9. Module plan
 

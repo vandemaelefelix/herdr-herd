@@ -85,10 +85,20 @@ impl SocketClient for RealSocket {
     }
 }
 
-/// A sensible default `events.subscribe` request line, pending live
-/// verification (Spike 1 was deferred; refine once it runs).
+/// The `events.subscribe` request line (verified live — Spike 1, herdr 0.7.0).
+///
+/// `params.subscriptions` is required and each entry is an internally-tagged
+/// enum keyed by `type` (dotted names). We subscribe to the **global**
+/// structural events that signal the herd changed — panes/agents appearing,
+/// disappearing, or being detected — so the watcher refetches promptly. Pure
+/// status transitions (`idle`↔`working`↔`blocked`↔`done`) arrive only via the
+/// per-pane `pane.agent_status_changed` subscription (which requires a
+/// `pane_id`), so those are covered here by the watcher's slow poll rather than
+/// by an event. On connect herdr also replays current state, giving an
+/// immediate structural snapshot. (Stream event names use underscores, e.g.
+/// `pane_created`; the watcher ignores event contents and just refetches.)
 pub fn subscribe_request() -> String {
-    r#"{"id":"pets","method":"events.subscribe","params":{}}"#.to_string()
+    r#"{"id":"pets","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"}]}}"#.to_string()
 }
 
 #[cfg(test)]
