@@ -4,3 +4,4 @@
 
 pub mod agent;
 pub mod herdr;
+pub mod render;
