@@ -1,0 +1,36 @@
+name = TestBlob
+
+[idle]    frame_ms=500 motion=breathe overlay=bubble:Zz
+.MM.
+MMMM
+M##M
+.MM.
+
+.MM.
+MMMM
+M##M
+.MM.
+
+[working] frame_ms=140 motion=hop+wander overlay=none
+.MM.
+MMMM
+MMMM
+.MM.
+
+[done]    frame_ms=900 motion=hop overlay=badge:! color=accent
+.MM.
+MMMM
+MMMM
+.MM.
+
+[blocked] frame_ms=110 motion=shake overlay=badge:! color=#e62d23
+.MM.
+M##M
+MMMM
+.MM.
+
+[unknown] frame_ms=0 motion=sway overlay=bubble:? ghost=true
+.MM.
+MMMM
+MMMM
+.MM.
