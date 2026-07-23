@@ -1,0 +1,6 @@
+{"id":"cli:agent:list","result":{"agents":[
+  {"agent":"claude","agent_status":"working","cwd":"/Users/felix/projects/herdr-pets","focused":true,"foreground_cwd":"/Users/felix/projects/herdr-pets","name":"pets-dev","pane_id":"w1T:p1","revision":0,"tab_id":"w1T:t1","terminal_id":"term_aaa","workspace_id":"w1T"},
+  {"agent":"claude","agent_status":"idle","cwd":"/Users/felix","focused":false,"foreground_cwd":"/Users/felix","pane_id":"w7:p8","revision":2,"tab_id":"w7:t6","terminal_id":"term_bbb","workspace_id":"w7"},
+  {"agent_status":"unknown","cwd":"/Users/felix/x","focused":false,"foreground_cwd":"/Users/felix/x","pane_id":"w1F:p3","revision":0,"tab_id":"w1F:t1","terminal_id":"term_ccc","workspace_id":"w1F"},
+  {"agent":"claude","agent_status":"blocked","cwd":"/tmp","focused":false,"foreground_cwd":"/tmp","name":"watcher","pane_id":"w4:p5","revision":1,"tab_id":"w4:t3","terminal_id":"term_ddd","workspace_id":"w4"}
+],"type":"agent_list"}}

@@ -1,0 +1,12 @@
+---
+source: src/render.rs
+expression: terminal.backend()
+---
+"┌herdr-pets────────────────────────────┐"
+"│*  pets-dev                           │"
+"│z  claude                             │"
+"│?  w1F:p3                             │"
+"│!  watcher                            │"
+"│                                      │"
+"│                                      │"
+"└──────────────────────────────────────┘"

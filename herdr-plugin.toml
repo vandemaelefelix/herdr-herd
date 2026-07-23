@@ -1,0 +1,19 @@
+# herdr-plugin.toml — manifest for herdr-pets (Phase 0).
+id = "herdr-pets"
+name = "herdr-pets"
+version = "0.1.0"
+description = "A herd of pixel-art pets for your herdr agents."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/build.sh"]
+
+# Phase 0: the pane is opened manually via `herdr plugin pane open`.
+# Full-width bottom placement + auto-injection are Phases 2-3.
+[[panes]]
+id = "pets"
+title = "Pets"
+placement = "split"
+command = ["./target/release/herdr-pets", "render"]

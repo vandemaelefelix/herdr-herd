@@ -1,0 +1,8 @@
+---
+source: src/render.rs
+expression: terminal.backend()
+---
+"┌herdr-pets────────────────────────────┐"
+"│no agents                             │"
+"│                                      │"
+"└──────────────────────────────────────┘"

@@ -114,7 +114,7 @@ placement depends on Spike A, and 3 depends on 2 being in place.
 
 | Phase | Name | Status | Design | Plan |
 |---|---|---|---|---|
-| 0 | Foundations & spikes | Not started | — | — |
+| 0 | Foundations & spikes | Done | [design](superpowers/specs/2026-07-23-phase-0-foundations-design.md) | [plan](superpowers/plans/2026-07-23-phase-0-foundations.md) |
 | 1 | The pets (renderer core) | Not started | — | — |
 | 2 | Interactivity & placement | Not started | — | — |
 | 3 | Always everywhere (controller) | Not started | — | — |
