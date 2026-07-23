@@ -137,7 +137,11 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
             }
             let frame_ms = kv(header, "frame_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
             let motion = parse_motion(kv(header, "motion").unwrap_or("none"))?;
-            let overlay = parse_overlay(kv(header, "overlay").unwrap_or("none"))?;
+            let overlay_str = kv(header, "overlay").unwrap_or("none");
+            let overlay = match kv(header, "color") {
+                Some(c) => parse_overlay(&format!("{overlay_str} color={c}"))?,
+                None => parse_overlay(overlay_str)?,
+            };
             let dim = kv(header, "dim") == Some("true");
             let ghost = kv(header, "ghost") == Some("true");
             states.insert(
@@ -159,8 +163,9 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
         if line.trim_start().starts_with('[') {
             flush(&mut buf, &mut frames)?;
             commit(&mut states, cur_status, &cur_header, &mut frames)?;
+            let open = line.find('[').ok_or("missing [ in state header")?;
             let close = line.find(']').ok_or("missing ] in state header")?;
-            let key = &line[line.find('[').unwrap() + 1..close];
+            let key = &line[open + 1..close];
             cur_status = Some(status_from_key(key).ok_or_else(|| format!("unknown state '{key}'"))?);
             cur_header = line[close + 1..].trim().to_string();
             continue;
@@ -178,6 +183,17 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
 
     if name.is_empty() {
         return Err("missing name".into());
+    }
+    for st in [
+        AgentStatus::Idle,
+        AgentStatus::Working,
+        AgentStatus::Done,
+        AgentStatus::Blocked,
+        AgentStatus::Unknown,
+    ] {
+        if !states.contains_key(&st) {
+            return Err(format!("species '{name}' missing state {st:?}"));
+        }
     }
     Ok(Species { name, states })
 }
@@ -225,6 +241,7 @@ pub fn load_species() -> Vec<Species> {
 mod tests {
     use super::*;
     use crate::agent::AgentStatus;
+    use crate::anim::{OverlayColor, Rgb};
 
     const BLOB: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/test-blob.sprite"));
 
@@ -261,6 +278,21 @@ mod tests {
     }
 
     #[test]
+    fn overlay_color_config_reaches_the_spec() {
+        let sp = parse_species(BLOB).unwrap();
+        let done = &sp.states[&AgentStatus::Done];
+        assert_eq!(done.overlay.color, OverlayColor::Accent);
+        let blocked = &sp.states[&AgentStatus::Blocked];
+        assert_eq!(blocked.overlay.color, OverlayColor::Literal(Rgb(0xe6, 0x2d, 0x23)));
+    }
+
+    #[test]
+    fn species_missing_a_state_is_an_error() {
+        let bad = "name = X\n[idle] frame_ms=1 motion=none overlay=none\n.M.\nMMM\n.M.\n";
+        assert!(parse_species(bad).is_err());
+    }
+
+    #[test]
     fn role_from_char_covers_the_legend() {
         assert_eq!(role_from_char('#'), Some(Role::Outline));
         assert_eq!(role_from_char('M'), Some(Role::CoatMid));
@@ -272,9 +304,18 @@ mod tests {
     // The guard: every shipped species is well-formed. Fails CI on a bad sprite.
     #[test]
     fn every_embedded_species_is_valid() {
+        // `embedded_species()` silently drops sprites that fail to parse
+        // (`filter_map(...ok())`), so a broken embedded sprite would vanish
+        // from `all` below rather than failing the guard. Parse the raw
+        // sources directly first so a broken sprite fails loudly.
+        for src in EMBEDDED {
+            parse_species(src).expect("embedded sprite must parse");
+        }
+
         let all = embedded_species();
         assert!(!all.is_empty());
         for sp in &all {
+            let species_size = sp.size();
             for st in [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done,
                        AgentStatus::Blocked, AgentStatus::Unknown] {
                 let spec = sp.states.get(&st)
@@ -282,6 +323,7 @@ mod tests {
                 assert!(!spec.frames.is_empty(), "{} {st:?} has no frames", sp.name);
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
                 assert!(h <= 12, "{} taller than the 6-row budget", sp.name);
+                assert_eq!((w, h), species_size, "{} {st:?} size differs from species size", sp.name);
                 for f in &spec.frames {
                     assert_eq!((f.w, f.h), (w, h), "{} {st:?} frame size drift", sp.name);
                 }
