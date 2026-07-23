@@ -1,8 +1,10 @@
 //! Minimal raw unix-socket helper — Spike A scaffolding only.
 //!
 //! Phase 0 does NOT ship a full socket client; that is Phase 1 (event
-//! subscription). This exists so Spike A can send a `layout_export` /
-//! `layout_apply` request to `$HERDR_SOCKET_PATH` and read the reply.
+//! subscription). This exists so Spike A can send a `layout.export` /
+//! `layout.apply` request to `$HERDR_SOCKET_PATH` and read the reply.
+//! (Spike A verified the wire uses newline-delimited JSON-RPC with dotted
+//! method names — see the design doc §5.)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
