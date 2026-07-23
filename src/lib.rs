@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod anim;
+pub mod herd;
 pub mod herdr;
 pub mod identity;
 pub mod palette;
