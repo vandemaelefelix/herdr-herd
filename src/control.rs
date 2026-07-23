@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::herdr::HerdrCli;
-use crate::place::{TARGET_ROWS, parse_tab_rows, slim_ratio};
+use crate::place::{parse_tab_rows, slim_ratio};
 use crate::{lock, socket};
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
@@ -113,10 +113,15 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
 /// (the sole pane of a single-pane tab): measure the tab, split down at the slim
 /// ratio, run the renderer in the new pane, and stamp the de-dup label. Uses
 /// `pane split` (NOT `layout.apply`) so the existing pane's process survives.
-pub fn inject_strip(cli: &dyn HerdrCli, root_pane_id: &str, self_exe: &str) -> io::Result<()> {
+pub fn inject_strip(
+    cli: &dyn HerdrCli,
+    root_pane_id: &str,
+    self_exe: &str,
+    target_rows: u16,
+) -> io::Result<()> {
     let layout_json = cli.run_json(&["pane", "layout", "--pane", root_pane_id])?;
     let rows = parse_tab_rows(&layout_json)?;
-    let ratio_arg = format!("{:.4}", slim_ratio(rows, TARGET_ROWS));
+    let ratio_arg = format!("{:.4}", slim_ratio(rows, target_rows));
     let split_reply = cli.run_json(&[
         "pane",
         "split",
@@ -148,11 +153,11 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
 /// One sweep: list tabs + panes, then inject a strip into every eligible tab.
 /// A per-tab injection failure is logged and skipped so one bad tab never
 /// aborts the sweep or the other tabs (unobtrusive).
-pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str) -> io::Result<()> {
+pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::Result<()> {
     let tabs = parse_tabs(&cli.run_json(&["tab", "list"])?)?;
     let panes = parse_panes(&cli.run_json(&["pane", "list"])?)?;
     for (tab_id, root_pane) in plan_injections(&tabs, &panes) {
-        if let Err(e) = inject_strip(cli, &root_pane, self_exe) {
+        if let Err(e) = inject_strip(cli, &root_pane, self_exe, target_rows) {
             eprintln!("herdr-pets: could not place strip in {tab_id}: {e}");
         }
     }
@@ -168,6 +173,7 @@ pub fn control(
     self_exe: &str,
     lock_path: &Path,
     interval: Duration,
+    target_rows: u16,
 ) -> io::Result<()> {
     let _guard = match lock::acquire(lock_path)? {
         Some(g) => g,
@@ -177,7 +183,7 @@ pub fn control(
         }
     };
     loop {
-        if let Err(e) = sweep_once(cli, self_exe) {
+        if let Err(e) = sweep_once(cli, self_exe, target_rows) {
             eprintln!("herdr-pets: sweep failed: {e}");
         }
         std::thread::sleep(interval);
@@ -240,7 +246,7 @@ mod tests {
     #[test]
     fn inject_strip_splits_runs_and_labels_in_order() {
         let cli = FakeCli::new();
-        inject_strip(&cli, "w1:p1", "/abs/herdr-pets").unwrap();
+        inject_strip(&cli, "w1:p1", "/abs/herdr-pets", 7).unwrap();
         let calls = cli.calls.borrow();
         assert_eq!(calls[0], vec!["pane", "layout", "--pane", "w1:p1"]);
         // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
@@ -411,7 +417,7 @@ mod tests {
     #[test]
     fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
         let cli = FailableCli::new("", "", "w1:p1");
-        let result = inject_strip(&cli, "w1:p1", "/abs/herdr-pets");
+        let result = inject_strip(&cli, "w1:p1", "/abs/herdr-pets", 7);
         assert!(result.is_err(), "a failed split must surface as an error");
         let calls = cli.calls.borrow();
         assert!(
@@ -443,7 +449,7 @@ mod tests {
                 {"pane_id":"w1:p2","tab_id":"w1:t2"}]}}"#,
             "w1:p1",
         );
-        let result = sweep_once(&cli, "/abs/herdr-pets");
+        let result = sweep_once(&cli, "/abs/herdr-pets", 7);
         assert!(
             result.is_ok(),
             "one failing tab must not abort the whole sweep"
@@ -480,7 +486,7 @@ mod tests {
                 {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-pets"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-pets").unwrap();
+        sweep_once(&cli, "/abs/herdr-pets", 7).unwrap();
         let calls = cli.calls.borrow();
         // Exactly one split, targeting t1's sole pane w1:p1.
         let splits: Vec<&Vec<String>> = calls

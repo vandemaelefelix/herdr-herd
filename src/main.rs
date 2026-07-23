@@ -47,6 +47,11 @@ fn main() -> ExitCode {
             }
         }
         Some("control") => {
+            let cfg = herdr_pets::config::load();
+            if !cfg.enabled {
+                eprintln!("herdr-pets: disabled by config; not starting the controller");
+                return ExitCode::SUCCESS;
+            }
             let cli = LiveHerdr::from_env();
             let self_exe = std::env::current_exe()
                 .ok()
@@ -57,7 +62,8 @@ fn main() -> ExitCode {
                 &cli,
                 &self_exe,
                 &lock_path,
-                std::time::Duration::from_millis(3000),
+                std::time::Duration::from_millis(cfg.sweep_interval_ms),
+                cfg.strip_rows,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
