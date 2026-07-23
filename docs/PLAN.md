@@ -126,5 +126,5 @@ placement depends on Spike A, and 3 depends on 2 being in place.
 | 0 | Foundations & spikes | Done | [design](superpowers/specs/2026-07-23-phase-0-foundations-design.md) | [plan](superpowers/plans/2026-07-23-phase-0-foundations.md) |
 | 1 | The pets (renderer core) | Done | [design](superpowers/specs/2026-07-23-phase-1-renderer-core-design.md) | [plan](superpowers/plans/2026-07-23-phase-1-renderer-core.md) |
 | 2 | Interactivity & placement | Done | [design](superpowers/specs/2026-07-23-phase-2-interactivity-placement-design.md) | [plan](superpowers/plans/2026-07-23-phase-2-interactivity-placement.md) |
-| 3 | Always everywhere (controller) | Not started | — | — |
+| 3 | Always everywhere (controller) | Done | [design](superpowers/specs/2026-07-23-phase-3-controller-design.md) | [plan](superpowers/plans/2026-07-23-phase-3-controller.md) |
 | 4 | Config & polish | Not started | — | — |
