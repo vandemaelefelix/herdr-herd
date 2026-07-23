@@ -154,6 +154,39 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
     }
 }
 
+/// The index of the visible pet drawn under terminal column `col`, if any.
+/// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
+/// Only pets that are actually drawn (the visible set on overflow) are
+/// hit-testable; when pets overlap, the topmost — highest `priority`, matching
+/// the draw z-order — wins. Returns `None` over a gap or out of range.
+pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16) -> Option<usize> {
+    let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
+    let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
+
+    let x = col as i32;
+    let mut best: Option<usize> = None;
+    for &i in &visible {
+        let pet = &herd.pets[i];
+        let w = species
+            .get(pet.identity.species_index)
+            .or_else(|| species.first())
+            .map(|s| s.size().0)
+            .unwrap_or(base_w) as i32;
+        let left = pet.x.round() as i32;
+        if x >= left && x < left + w {
+            let take = match best {
+                None => true,
+                Some(b) => priority(pet.status) > priority(herd.pets[b].status),
+            };
+            if take {
+                best = Some(i);
+            }
+        }
+    }
+    best
+}
+
 /// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
 /// draws, and quits on `q`/Ctrl-C. Restores the terminal on exit.
 pub fn run(rx: Receiver<Vec<Agent>>, species: Vec<Species>, theme: Theme) -> io::Result<()> {
@@ -294,5 +327,27 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    use crate::pet::Pet;
+    use crate::identity::identity_for;
+
+    #[test]
+    fn pet_at_column_returns_the_topmost_pet_when_they_overlap() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        // Two overlapping pets near x=10: idle (low priority) and blocked (high).
+        herd.pets.push(Pet::new("idle".into(), identity_for("idle", 1), AgentStatus::Idle, 10.0));
+        herd.pets.push(Pet::new("blk".into(), identity_for("blk", 1), AgentStatus::Blocked, 12.0));
+        let hit = pet_at_column(&herd, &species, 200, 13).expect("a pet under column 13");
+        assert_eq!(herd.pets[hit].terminal_id, "blk", "blocked draws on top, so it wins the hit");
+    }
+
+    #[test]
+    fn pet_at_column_is_none_over_a_gap() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        herd.pets.push(Pet::new("a".into(), identity_for("a", 1), AgentStatus::Idle, 4.0));
+        assert!(pet_at_column(&herd, &species, 200, 150).is_none(), "column far past the pet is empty");
     }
 }
