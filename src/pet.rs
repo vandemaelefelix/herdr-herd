@@ -101,14 +101,15 @@ mod tests {
     fn advance_wraps_phase() {
         let mut p = pet(AgentStatus::Idle);
         p.phase = 0.9;
-        p.advance(600.0, 500); // 600ms over a 500ms frame cycle basis
-        assert!((0.0..1.0).contains(&p.phase));
+        p.advance(600.0, 500); // cycle_ms = 500*2 = 1000; 0.9 + 600/1000 = 1.5 -> wraps to 0.5
+        assert_eq!(p.phase, 0.5);
     }
 
     #[test]
-    fn static_state_keeps_a_single_frame() {
+    fn static_state_pins_phase_to_zero() {
         let mut p = pet(AgentStatus::Unknown);
-        p.advance(1000.0, 0);
-        assert_eq!(p.frame_index(1), 0);
+        p.phase = 0.7; // start non-zero
+        p.advance(1000.0, 0); // frame_ms == 0 => static
+        assert_eq!(p.phase, 0.0); // proves it was pinned, not left at 0.7
     }
 }
