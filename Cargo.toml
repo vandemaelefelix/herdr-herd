@@ -1,0 +1,28 @@
+[package]
+name = "herdr-pets"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A herd of pixel-art pets for your herdr agents."
+license = "MIT"
+repository = "https://github.com/vandemaelefelix/herdr-pets"
+keywords = ["herdr", "tui", "ratatui", "agents"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "herdr_pets"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-pets"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+insta = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
