@@ -67,3 +67,24 @@ fn manifest_action_places_the_strip_via_the_release_binary() {
         .collect();
     assert_eq!(cmd, vec!["./target/release/herdr-pets", "place"]);
 }
+
+#[test]
+fn manifest_action_starts_the_controller_via_the_release_binary() {
+    let m = manifest();
+    let actions = m
+        .get("actions")
+        .and_then(Value::as_array)
+        .expect("[[actions]] present");
+    let ctrl = actions
+        .iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some("start-pets-controller"))
+        .expect("start-pets-controller action present");
+    let cmd: Vec<&str> = ctrl
+        .get("command")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(cmd, vec!["./target/release/herdr-pets", "control"]);
+}

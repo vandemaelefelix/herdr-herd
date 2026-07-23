@@ -22,3 +22,8 @@ command = ["./target/release/herdr-pets", "render"]
 id = "place-pets"
 title = "Place pets strip"
 command = ["./target/release/herdr-pets", "place"]
+
+[[actions]]
+id = "start-pets-controller"
+title = "Start pets controller"
+command = ["./target/release/herdr-pets", "control"]
