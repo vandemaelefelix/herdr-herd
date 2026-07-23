@@ -6,7 +6,10 @@ use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -21,6 +24,7 @@ use ratatui::text::Span;
 use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb, motion_offset};
 use crate::herd::{Herd, Lcg, visible_and_hidden};
+use crate::herdr::HerdrCli;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
@@ -232,18 +236,34 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
     best
 }
 
+/// Focus the agent identified by `terminal_id` via `herdr agent focus`.
+/// The caller swallows the error — a failed focus must never crash the strip.
+pub fn focus_agent(cli: &dyn HerdrCli, terminal_id: &str) -> io::Result<()> {
+    cli.run_json(&["agent", "focus", terminal_id]).map(|_| ())
+}
+
 /// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
-/// draws, and quits on `q`/Ctrl-C. Restores the terminal on exit.
-pub fn run(rx: Receiver<Vec<Agent>>, species: Vec<Species>, theme: Theme) -> io::Result<()> {
+/// draws, handles mouse hover/click, and quits on `q`/Ctrl-C. Restores the
+/// terminal (raw mode, alternate screen, mouse capture) on exit.
+pub fn run(
+    rx: Receiver<Vec<Agent>>,
+    species: Vec<Species>,
+    theme: Theme,
+    focus: Box<dyn HerdrCli>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = run_loop(&mut terminal, rx, &species, theme);
+    let result = run_loop(&mut terminal, rx, &species, theme, focus.as_ref());
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -253,6 +273,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     rx: Receiver<Vec<Agent>>,
     species: &[Species],
     theme: Theme,
+    focus: &dyn HerdrCli,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -262,6 +283,7 @@ where
     let mut herd = Herd::new();
     let mut rng = Lcg::new(0xC0FFEE);
     let mut last = Instant::now();
+    let mut hovered: Option<String> = None;
     loop {
         while let Ok(agents) = rx.try_recv() {
             let w = terminal.size()?.width as f32;
@@ -282,15 +304,38 @@ where
                 .unwrap_or(0);
             p.advance(dt_ms, fm);
         }
-        terminal.draw(|f| draw_herd(f, &herd, species, theme))?;
+        let strip_w = terminal.size()?.width as usize;
+        let caption = hovered.clone();
+        terminal.draw(|f| {
+            draw_herd(f, &herd, species, theme);
+            draw_caption(f, f.area(), caption.as_deref());
+        })?;
 
-        if event::poll(tick)?
-            && let Event::Key(k) = event::read()?
-        {
-            let quit = k.code == KeyCode::Char('q')
-                || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
-            if quit {
-                return Ok(());
+        if event::poll(tick)? {
+            match event::read()? {
+                Event::Key(k) => {
+                    let quit = k.code == KeyCode::Char('q')
+                        || (k.code == KeyCode::Char('c')
+                            && k.modifiers.contains(KeyModifiers::CONTROL));
+                    if quit {
+                        return Ok(());
+                    }
+                }
+                Event::Mouse(MouseEvent { kind, column, .. }) => match kind {
+                    MouseEventKind::Moved => {
+                        hovered = pet_at_column(&herd, species, strip_w, column)
+                            .map(|i| herd.pets[i].label.clone());
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(i) = pet_at_column(&herd, species, strip_w, column) {
+                            let tid = herd.pets[i].terminal_id.clone();
+                            // Swallow focus errors: the strip must keep running.
+                            let _ = focus_agent(focus, &tid);
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
@@ -474,5 +519,39 @@ mod tests {
             pet_at_column(&herd, &species, 200, 150).is_none(),
             "column far past the pet is empty"
         );
+    }
+
+    use crate::herdr::{CommandRunner, LiveHerdr};
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+    use std::rc::Rc;
+
+    struct Recorder {
+        args: Rc<RefCell<Vec<String>>>,
+    }
+    impl CommandRunner for Recorder {
+        fn run(&self, _program: &OsStr, args: &[&str]) -> std::io::Result<Output> {
+            *self.args.borrow_mut() = args.iter().map(|s| s.to_string()).collect();
+            Ok(Output {
+                status: ExitStatus::from_raw(0),
+                stdout: b"{\"result\":{}}".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn focus_agent_shells_agent_focus_with_the_terminal_id() {
+        let args = Rc::new(RefCell::new(Vec::new()));
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::clone(&args),
+            },
+        );
+        focus_agent(&cli, "term_abc").unwrap();
+        assert_eq!(*args.borrow(), vec!["agent", "focus", "term_abc"]);
     }
 }
