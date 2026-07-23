@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                 &cli,
                 &self_exe,
                 &lock_path,
-                std::time::Duration::from_millis(cfg.sweep_interval_ms),
+                std::time::Duration::from_millis(cfg.sweep_interval_ms.max(250)),
                 cfg.strip_rows,
             ) {
                 Ok(()) => ExitCode::SUCCESS,

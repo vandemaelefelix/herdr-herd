@@ -51,8 +51,11 @@ principle argues against shipping speculatively:
   `herdr plugin config-dir herdr-pets`.
 - Motion has two sources: wandering in `Herd::step` (updates `target_x`/`x`) and a
   per-frame bounce in `draw_herd` via `motion_offset(spec, pet.phase)`. Pets are
-  created with `phase = 0.0`. Skipping `step` freezes both wander and phase, so
-  `motion_offset(_, 0.0)` ≈ zero ⇒ calm pets **without touching `draw_herd` or
+  created with `phase = 0.0`, but `phase` is advanced separately, by
+  `Pet::advance` in the per-pet loop in `run_loop` — not by `Herd::step`.
+  `reduced_motion` must therefore skip **both** the roam step and the
+  phase-advance loop (via a `simulate_tick` helper), so phase stays 0 and
+  `motion_offset(_, 0.0)` is zero ⇒ calm pets **without touching `draw_herd` or
   its snapshots**.
 
 ## 4. Architecture
@@ -101,9 +104,11 @@ herdr-pets` and trims the path (thin, untested glue).
   interval and `strip_rows` into the sweep. `inject_strip` gains a `target_rows:
   u16` param (replacing the hard-coded `TARGET_ROWS`); `sweep_once` threads it.
 - **render**: `main.rs` loads `Config`; `render::run` gains `reduced_motion:
-  bool`; `run_loop` skips `herd.step(...)` when it is set (pets stay calm). The
-  on-demand `place` strip keeps the default height (7) — config-driven height is
-  the always-on controller's concern; documented.
+  bool`; `run_loop` delegates to a `simulate_tick` helper that skips both
+  `herd.step(...)` and the per-pet `Pet::advance` phase update when it is set
+  (pets stay calm — no wander, no bounce). The on-demand `place` strip keeps
+  the default height (7) — config-driven height is the always-on controller's
+  concern; documented.
 
 ## 5. Error handling
 

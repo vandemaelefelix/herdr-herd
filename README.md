@@ -96,6 +96,9 @@ an opinionated default:
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
 
+`strip_rows` applies to the always-on `control` watchdog; the on-demand
+`herdr-pets place` uses a fixed height.
+
 Example `config.toml`:
 
     reduced_motion = true

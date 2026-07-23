@@ -276,6 +276,33 @@ pub fn run(
     result
 }
 
+/// Advance the herd one tick: roam + animation phase. A no-op under
+/// `reduced_motion`, which freezes both horizontal wander and the per-frame
+/// bounce/shake/breathe (phase stays 0, so `motion_offset` stays zero).
+fn simulate_tick(
+    herd: &mut Herd,
+    species: &[Species],
+    dt_ms: f32,
+    w: f32,
+    pet_w: f32,
+    rng: &mut dyn crate::herd::Rng,
+    reduced_motion: bool,
+) {
+    if reduced_motion {
+        return;
+    }
+    herd.step(dt_ms, w, pet_w, rng);
+    for p in herd.pets.iter_mut() {
+        let fm = species
+            .get(p.identity.species_index)
+            .or_else(|| species.first())
+            .and_then(|s| s.states.get(&p.status))
+            .map(|st| st.frame_ms)
+            .unwrap_or(0);
+        p.advance(dt_ms, fm);
+    }
+}
+
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     rx: Receiver<Vec<Agent>>,
@@ -303,18 +330,15 @@ where
         last = now;
         let w = terminal.size()?.width as f32;
         let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
-        if !reduced_motion {
-            herd.step(dt_ms, w, pet_w, &mut rng);
-        }
-        for p in herd.pets.iter_mut() {
-            let fm = species
-                .get(p.identity.species_index)
-                .or_else(|| species.first())
-                .and_then(|s| s.states.get(&p.status))
-                .map(|st| st.frame_ms)
-                .unwrap_or(0);
-            p.advance(dt_ms, fm);
-        }
+        simulate_tick(
+            &mut herd,
+            species,
+            dt_ms,
+            w,
+            pet_w,
+            &mut rng,
+            reduced_motion,
+        );
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
         terminal.draw(|f| {
@@ -529,6 +553,29 @@ mod tests {
         assert!(
             pet_at_column(&herd, &species, 200, 150).is_none(),
             "column far past the pet is empty"
+        );
+    }
+
+    #[test]
+    fn simulate_tick_freezes_position_and_phase_under_reduced_motion() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        herd.pets.push(Pet::new(
+            "a".into(),
+            identity_for("a", 1),
+            AgentStatus::Working,
+            10.0,
+        ));
+        let mut rng = Lcg::new(1);
+        let (x0, ph0) = (herd.pets[0].x, herd.pets[0].phase);
+        simulate_tick(&mut herd, &species, 500.0, 200.0, 12.0, &mut rng, true);
+        assert_eq!(herd.pets[0].x, x0, "reduced motion freezes x");
+        assert_eq!(herd.pets[0].phase, ph0, "reduced motion freezes phase");
+        // Motion on: phase advances (Working has frame_ms > 0).
+        simulate_tick(&mut herd, &species, 500.0, 200.0, 12.0, &mut rng, false);
+        assert!(
+            herd.pets[0].phase != ph0,
+            "phase advances when motion is on"
         );
     }
 
