@@ -203,7 +203,7 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
         if x >= left && x < left + w {
             let take = match best {
                 None => true,
-                Some(b) => priority(pet.status) > priority(herd.pets[b].status),
+                Some(b) => priority(pet.status) >= priority(herd.pets[b].status),
             };
             if take {
                 best = Some(i);
@@ -399,6 +399,31 @@ mod tests {
         assert_eq!(
             herd.pets[hit].terminal_id, "blk",
             "blocked draws on top, so it wins the hit"
+        );
+    }
+
+    #[test]
+    fn pet_at_column_breaks_ties_by_draw_order_topmost_wins() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        // Same-priority overlap: "b" is pushed later, so the stable sort in
+        // draw_herd keeps it later in z-order and it draws on top.
+        herd.pets.push(Pet::new(
+            "a".into(),
+            identity_for("a", 1),
+            AgentStatus::Idle,
+            10.0,
+        ));
+        herd.pets.push(Pet::new(
+            "b".into(),
+            identity_for("b", 1),
+            AgentStatus::Idle,
+            12.0,
+        ));
+        let hit = pet_at_column(&herd, &species, 200, 13).expect("a pet under column 13");
+        assert_eq!(
+            herd.pets[hit].terminal_id, "b",
+            "later-pushed same-priority pet draws on top, so it wins the hit"
         );
     }
 
