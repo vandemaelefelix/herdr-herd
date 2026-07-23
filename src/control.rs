@@ -8,10 +8,11 @@ use std::io;
 
 use serde_json::Value;
 
-// NOTE: Tasks 3 and 4 add the imports their code needs (`crate::herdr::HerdrCli`,
-// `crate::place::{...}`, `std::path::{Path, PathBuf}`, `std::time::Duration`,
-// `crate::{lock, socket}`). Task 2 imports ONLY what its pure logic uses, so this
-// commit stays clippy-clean under `-D warnings`.
+use crate::herdr::HerdrCli;
+use crate::place::{TARGET_ROWS, parse_tab_rows, slim_ratio};
+
+// NOTE: Task 4 adds the imports its code needs (`std::path::{Path, PathBuf}`,
+// `std::time::Duration`, `crate::{lock, socket}`).
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
 /// fresh controller after a restart) recognise it and never stack a second one.
@@ -106,9 +107,104 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
         .collect()
 }
 
+/// Non-destructively place a slim full-width pets strip below `root_pane_id`
+/// (the sole pane of a single-pane tab): measure the tab, split down at the slim
+/// ratio, run the renderer in the new pane, and stamp the de-dup label. Uses
+/// `pane split` (NOT `layout.apply`) so the existing pane's process survives.
+pub fn inject_strip(cli: &dyn HerdrCli, root_pane_id: &str, self_exe: &str) -> io::Result<()> {
+    let layout_json = cli.run_json(&["pane", "layout", "--pane", root_pane_id])?;
+    let rows = parse_tab_rows(&layout_json)?;
+    let ratio_arg = format!("{:.4}", slim_ratio(rows, TARGET_ROWS));
+    let split_reply = cli.run_json(&[
+        "pane",
+        "split",
+        root_pane_id,
+        "--direction",
+        "down",
+        "--ratio",
+        &ratio_arg,
+        "--no-focus",
+    ])?;
+    let strip_pane = parse_split_pane_id(&split_reply)?;
+    let render_cmd = format!("{self_exe} render");
+    cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
+    cli.run_json(&["pane", "rename", &strip_pane, STRIP_LABEL])?;
+    Ok(())
+}
+
+/// Extract `result.pane.pane_id` from a `herdr pane split` reply.
+fn parse_split_pane_id(reply: &str) -> io::Result<String> {
+    let v: Value = serde_json::from_str(reply).map_err(io::Error::other)?;
+    v.get("result")
+        .and_then(|r| r.get("pane"))
+        .and_then(|p| p.get("pane_id"))
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| io::Error::other("no result.pane.pane_id in pane split reply"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    struct FakeCli {
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+    impl FakeCli {
+        fn new() -> Self {
+            FakeCli {
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl HerdrCli for FakeCli {
+        fn run_json(&self, args: &[&str]) -> io::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            match args {
+                ["tab", "list"] => {
+                    Ok(r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":1}]}}"#.into())
+                }
+                ["pane", "list"] => {
+                    Ok(r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}"#.into())
+                }
+                ["pane", "layout", ..] => {
+                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
+                }
+                ["pane", "split", ..] => Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into()),
+                _ => Ok(r#"{"result":{}}"#.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn inject_strip_splits_runs_and_labels_in_order() {
+        let cli = FakeCli::new();
+        inject_strip(&cli, "w1:p1", "/abs/herdr-pets").unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(calls[0], vec!["pane", "layout", "--pane", "w1:p1"]);
+        // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "split",
+                "w1:p1",
+                "--direction",
+                "down",
+                "--ratio",
+                "0.8906",
+                "--no-focus"
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec!["pane", "run", "w1:pNEW", "/abs/herdr-pets render"]
+        );
+        assert_eq!(calls[3], vec!["pane", "rename", "w1:pNEW", "herdr-pets"]);
+    }
 
     fn tab(id: &str, panes: u32) -> TabRef {
         TabRef {
