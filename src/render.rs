@@ -250,13 +250,21 @@ pub fn run(
     species: Vec<Species>,
     theme: Theme,
     focus: Box<dyn HerdrCli>,
+    reduced_motion: bool,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = run_loop(&mut terminal, rx, &species, theme, focus.as_ref());
+    let result = run_loop(
+        &mut terminal,
+        rx,
+        &species,
+        theme,
+        focus.as_ref(),
+        reduced_motion,
+    );
 
     disable_raw_mode()?;
     execute!(
@@ -274,6 +282,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     species: &[Species],
     theme: Theme,
     focus: &dyn HerdrCli,
+    reduced_motion: bool,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -294,7 +303,9 @@ where
         last = now;
         let w = terminal.size()?.width as f32;
         let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
-        herd.step(dt_ms, w, pet_w, &mut rng);
+        if !reduced_motion {
+            herd.step(dt_ms, w, pet_w, &mut rng);
+        }
         for p in herd.pets.iter_mut() {
             let fm = species
                 .get(p.identity.species_index)

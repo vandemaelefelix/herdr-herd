@@ -12,6 +12,7 @@ fn main() -> ExitCode {
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
         Some("render") => {
+            let cfg = herdr_pets::config::load();
             let species = load_species();
             let (tx, rx) = mpsc::channel();
             let cli = Box::new(LiveHerdr::from_env());
@@ -20,7 +21,7 @@ fn main() -> ExitCode {
                 .and_then(|p| RealSocket::connect(&p).ok())
                 .map(|s| Box::new(s) as Box<dyn SocketClient + Send>);
             let _watcher = watch(cli, socket, Box::new(RealClock::new()), tx, 2500, 250);
-            match render::run(rx, species, Theme::Dark, focus) {
+            match render::run(rx, species, Theme::Dark, focus, cfg.reduced_motion) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("herdr-pets: {e}");
