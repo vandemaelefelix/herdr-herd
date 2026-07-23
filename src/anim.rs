@@ -125,7 +125,7 @@ fn parse_color(c: &str) -> Result<OverlayColor, String> {
         return Ok(OverlayColor::Accent);
     }
     let hex = c.strip_prefix('#').ok_or_else(|| format!("bad color '{c}'"))?;
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("bad color '{c}'"));
     }
     let byte =
@@ -191,5 +191,12 @@ mod tests {
             OverlayColor::Literal(Rgb(0xe6, 0x2d, 0x23))
         );
         assert_eq!(parse_overlay("none").unwrap().kind, Overlay::None);
+    }
+
+    #[test]
+    fn parse_overlay_rejects_malformed_color_without_panicking() {
+        assert!(parse_overlay("badge:! color=#12zz34").is_err());
+        assert!(parse_overlay("badge:! color=#1é234").is_err()); // 6 bytes, non-ASCII -> Err, no panic
+        assert!(parse_overlay("badge:! color=#fff").is_err()); // wrong length
     }
 }
