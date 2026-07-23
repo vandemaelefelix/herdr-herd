@@ -65,14 +65,17 @@ impl Herd {
         for a in agents {
             if let Some(p) = self.pets.iter_mut().find(|p| p.terminal_id == a.terminal_id) {
                 p.status = a.agent_status;
+                p.label = a.label();
             } else {
                 let x = rng.next_unit() * strip_w.max(1.0);
-                self.pets.push(Pet::new(
+                let mut pet = Pet::new(
                     a.terminal_id.clone(),
                     identity_for(&a.terminal_id, species_count),
                     a.agent_status,
                     x,
-                ));
+                );
+                pet.label = a.label();
+                self.pets.push(pet);
             }
         }
         // Remove departed.
@@ -181,6 +184,22 @@ mod tests {
         for p in &h.pets {
             assert!(p.x >= 0.0 && p.x <= 80.0, "x={} out of bounds", p.x);
         }
+    }
+
+    #[test]
+    fn reconcile_sets_and_updates_the_pet_label() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        let mut a = agent("a", AgentStatus::Idle);
+        a.name = Some("backend".into());
+        h.reconcile(&[a], 1, 100.0, &mut rng);
+        assert_eq!(h.pets[0].label, "backend");
+
+        // A survivor renamed mid-session picks up the new label.
+        let mut a2 = agent("a", AgentStatus::Idle);
+        a2.name = Some("frontend".into());
+        h.reconcile(&[a2], 1, 100.0, &mut rng);
+        assert_eq!(h.pets[0].label, "frontend");
     }
 
     #[test]
