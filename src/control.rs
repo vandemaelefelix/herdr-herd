@@ -5,14 +5,14 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::herdr::HerdrCli;
 use crate::place::{TARGET_ROWS, parse_tab_rows, slim_ratio};
-
-// NOTE: Task 4 adds the imports its code needs (`std::path::{Path, PathBuf}`,
-// `std::time::Duration`, `crate::{lock, socket}`).
+use crate::{lock, socket};
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
 /// fresh controller after a restart) recognise it and never stack a second one.
@@ -141,6 +141,53 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| io::Error::other("no result.pane.pane_id in pane split reply"))
+}
+
+/// One sweep: list tabs + panes, then inject a strip into every eligible tab.
+/// A per-tab injection failure is logged and skipped so one bad tab never
+/// aborts the sweep or the other tabs (unobtrusive).
+pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str) -> io::Result<()> {
+    let tabs = parse_tabs(&cli.run_json(&["tab", "list"])?)?;
+    let panes = parse_panes(&cli.run_json(&["pane", "list"])?)?;
+    for (tab_id, root_pane) in plan_injections(&tabs, &panes) {
+        if let Err(e) = inject_strip(cli, &root_pane, self_exe) {
+            eprintln!("herdr-pets: could not place strip in {tab_id}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Run the watchdog: take the single-owner lock (exit cleanly if another
+/// controller holds it), then sweep every `interval` forever. The poll unifies
+/// startup, new-tab injection, and respawn/re-assert (a closed strip reappears
+/// next sweep). A failed whole sweep is logged and retried next interval.
+pub fn control(
+    cli: &dyn HerdrCli,
+    self_exe: &str,
+    lock_path: &Path,
+    interval: Duration,
+) -> io::Result<()> {
+    let _guard = match lock::acquire(lock_path)? {
+        Some(g) => g,
+        None => {
+            eprintln!("herdr-pets: another controller is already running; exiting");
+            return Ok(());
+        }
+    };
+    loop {
+        if let Err(e) = sweep_once(cli, self_exe) {
+            eprintln!("herdr-pets: sweep failed: {e}");
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Session-scoped path for the controller lock: next to the herdr socket if
+/// known, else the system temp dir.
+pub fn controller_lock_path() -> PathBuf {
+    socket::socket_path()
+        .and_then(|p| p.parent().map(|d| d.join("herdr-pets-controller.lock")))
+        .unwrap_or_else(|| std::env::temp_dir().join("herdr-pets-controller.lock"))
 }
 
 #[cfg(test)]
@@ -284,5 +331,59 @@ mod tests {
         ];
         let plan = plan_injections(&tabs, &panes);
         assert_eq!(plan, vec![("w1:t1".to_string(), "w1:p1".to_string())]);
+    }
+
+    struct SweepFake {
+        calls: RefCell<Vec<Vec<String>>>,
+        tabs: String,
+        panes: String,
+    }
+    impl HerdrCli for SweepFake {
+        fn run_json(&self, args: &[&str]) -> io::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            match args {
+                ["tab", "list"] => Ok(self.tabs.clone()),
+                ["pane", "list"] => Ok(self.panes.clone()),
+                ["pane", "layout", ..] => {
+                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
+                }
+                ["pane", "split", ..] => Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into()),
+                _ => Ok(r#"{"result":{}}"#.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_once_injects_only_the_eligible_tab() {
+        // t1: single-pane, no strip -> inject. t2: multi-pane -> skip.
+        // t3: single-pane but already stripped -> skip.
+        let cli = SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[
+                {"tab_id":"w1:t1","pane_count":1},
+                {"tab_id":"w1:t2","pane_count":2},
+                {"tab_id":"w1:t3","pane_count":1}]}}"#
+                .into(),
+            panes: r#"{"result":{"panes":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1"},
+                {"pane_id":"w1:p2","tab_id":"w1:t2"},
+                {"pane_id":"w1:p9","tab_id":"w1:t2"},
+                {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-pets"}]}}"#
+                .into(),
+        };
+        sweep_once(&cli, "/abs/herdr-pets").unwrap();
+        let calls = cli.calls.borrow();
+        // Exactly one split, targeting t1's sole pane w1:p1.
+        let splits: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|c| {
+                c.first().map(String::as_str) == Some("pane")
+                    && c.get(1).map(String::as_str) == Some("split")
+            })
+            .collect();
+        assert_eq!(splits.len(), 1, "only the one eligible tab is injected");
+        assert_eq!(splits[0][2], "w1:p1");
     }
 }

@@ -46,12 +46,32 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("control") => {
+            let cli = LiveHerdr::from_env();
+            let self_exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "herdr-pets".to_string());
+            let lock_path = herdr_pets::control::controller_lock_path();
+            match herdr_pets::control::control(
+                &cli,
+                &self_exe,
+                &lock_path,
+                std::time::Duration::from_millis(3000),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("herdr-pets: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("--version") | Some("-V") => {
             println!("herdr-pets {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: herdr-pets render|place");
+            eprintln!("usage: herdr-pets render|place|control");
             ExitCode::FAILURE
         }
     }
