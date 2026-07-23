@@ -58,30 +58,48 @@ Both read state from herdr's socket API; herdr is the single source of truth.
 
 ## Install
 
-> Not yet released. Planned install paths:
-
 ```sh
-# From the plugin registry (release):
-herdr plugin install <owner>/herdr-pets
+# For local development, from a checkout of this repo:
+herdr plugin link .
 
-# For local development:
-herdr plugin link /path/to/herdr-pets
+# From the plugin registry (release): builds from source via this repo's
+# `[[build]]` step in herdr-plugin.toml.
+herdr plugin install <owner>/herdr-pets
 ```
 
 herdr-pets requires **herdr ≥ 0.7.0**.
 
+## Usage
+
+herdr-pets ships two actions (run via herdr's action picker, or their
+underlying commands directly):
+
+- **`place-pets`** / `herdr-pets place` — on-demand: places a full-width pets
+  strip in the current tab right now. This uses herdr's destructive pane
+  rebuild to make room, so it's opt-in — run it when you want a strip and
+  don't already have one.
+- **`start-pets-controller`** / `herdr-pets control` — the always-on watchdog.
+  Once started, it keeps a strip present across tabs automatically: it's
+  non-destructive and only auto-injects into tabs that currently have a single
+  pane, so it never rearranges or kills a tab with work already running in it.
+
 ## Configuration
 
-Opinionated defaults, a few knobs (shipped as `config.example.toml`):
+herdr-pets reads an optional `config.toml` from its plugin config dir
+(`herdr plugin config-dir herdr-pets`). Every key is optional and falls back to
+an opinionated default:
 
-- **enable / auto-inject** — turn it off globally, or inject into every tab vs.
-  only tabs you opt into.
-- **scope** — `mirror-sidebar` (default) · `all` · `current-workspace` ·
-  `current-tab`.
-- **height & motion** — strip height in rows (default 3), animation speed, and a
-  calm `reduced-motion` mode.
-- **palette & behavior** — how pet colors are generated (herdr-theme-aligned or
-  vivid), and optional overrides of the state→behavior mapping.
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Whether the `control` watchdog runs. |
+| `strip_rows` | int | `7` | Strip height, in rows. |
+| `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
+| `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
+
+Example `config.toml`:
+
+    reduced_motion = true
+    strip_rows = 6
 
 ## Development
 
