@@ -200,11 +200,12 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
 
 /// Embedded sprite sources. Add one line per new animal.
 ///
-/// NOTE: the real roster is `sheep.sprite` + `goat.sprite`, authored in a
-/// later task. Until then this points at the test fixture only, so this
-/// module compiles and the validation guard test has something to check.
-const EMBEDDED: &[&str] =
-    &[include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/test-blob.sprite"))];
+/// `test-blob.sprite` is intentionally absent here: it is a unit-test fixture
+/// only (included directly by the sprite/render tests), not a shipped species.
+const EMBEDDED: &[&str] = &[
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/sheep.sprite")),
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/goat.sprite")),
+];
 
 /// Parse the embedded sprites. Guarded by `every_embedded_species_is_valid`.
 pub fn embedded_species() -> Vec<Species> {
