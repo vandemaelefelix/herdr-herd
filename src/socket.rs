@@ -208,15 +208,57 @@ mod tests {
                 r.read_line(&mut got).unwrap();
                 w.write_all(b"{\"reply\":1}\n").unwrap();
                 w.flush().unwrap();
-                // Hold the connection open (a persistent socket does not EOF).
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Hold the connection open (a persistent socket does not EOF):
+                // block on a second read, which only returns once the client
+                // drops its stream. A read-to-EOF implementation would still
+                // be blocked here when the client-side timeout below fires.
+                let mut trailing = String::new();
+                let _ = r.read_line(&mut trailing);
                 let _ = std::fs::remove_file(&path);
                 got
             }
         });
-        let reply = request_line(&path, "{\"ping\":1}").unwrap();
-        assert_eq!(reply, "{\"reply\":1}");
+
+        // Run the client call on a worker thread so a hung (read-to-EOF)
+        // implementation can't block this test forever: we bound the wait
+        // with recv_timeout instead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let result = request_line(&path, "{\"ping\":1}");
+                let _ = tx.send(result);
+            }
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("request_line did not return promptly after one reply line");
+        assert_eq!(result.unwrap(), "{\"reply\":1}");
+
+        client.join().unwrap();
         let got = server.join().unwrap();
         assert_eq!(got, "{\"ping\":1}\n");
+    }
+
+    #[test]
+    fn request_line_errors_when_the_socket_closes_before_a_reply() {
+        let path = std::env::temp_dir().join(format!("herdr-pets-rl-close-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let (conn, _) = listener.accept().unwrap();
+                // Accept, then close without replying.
+                drop(conn);
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+
+        let result = request_line(&path, "{\"ping\":1}");
+        assert!(result.is_err());
+
+        server.join().unwrap();
     }
 }
