@@ -17,3 +17,8 @@ id = "pets"
 title = "Pets"
 placement = "split"
 command = ["./target/release/herdr-pets", "render"]
+
+[[actions]]
+id = "place-pets"
+title = "Place pets strip"
+command = ["./target/release/herdr-pets", "place"]

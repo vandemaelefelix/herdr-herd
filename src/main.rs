@@ -28,12 +28,30 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("place") => {
+            let cli = LiveHerdr::from_env();
+            let self_exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "herdr-pets".to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| ".".to_string());
+            match herdr_pets::place::place(&cli, &self_exe, &cwd) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("herdr-pets: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("--version") | Some("-V") => {
             println!("herdr-pets {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: herdr-pets render");
+            eprintln!("usage: herdr-pets render|place");
             ExitCode::FAILURE
         }
     }

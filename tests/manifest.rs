@@ -48,3 +48,22 @@ fn manifest_pane_runs_the_release_binary_in_render_mode() {
         .collect();
     assert_eq!(cmd, vec!["./target/release/herdr-pets", "render"]);
 }
+
+#[test]
+fn manifest_action_places_the_strip_via_the_release_binary() {
+    let m = manifest();
+    let actions = m
+        .get("actions")
+        .and_then(Value::as_array)
+        .expect("[[actions]] present");
+    let a = &actions[0];
+    assert_eq!(a.get("id").and_then(Value::as_str), Some("place-pets"));
+    let cmd: Vec<&str> = a
+        .get("command")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(cmd, vec!["./target/release/herdr-pets", "place"]);
+}

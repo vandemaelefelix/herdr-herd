@@ -9,6 +9,9 @@ use std::io;
 
 use serde_json::{Value, json};
 
+use crate::herdr::HerdrCli;
+use crate::socket;
+
 /// Rows the strip should occupy: pets take 6 half-block rows, plus 1 caption.
 pub const TARGET_ROWS: u16 = 7;
 
@@ -84,6 +87,38 @@ pub fn check_reply(reply: &str) -> io::Result<()> {
             "herdr rejected the request: {err}"
         )));
     }
+    Ok(())
+}
+
+/// Inject a full-width pets strip into the current tab. Reads `$HERDR_TAB_ID`
+/// (the target) and `$HERDR_SOCKET_PATH` (the control socket); measures the tab
+/// with `herdr pane layout --current` via `cli`, then `layout.export` +
+/// `layout.apply` over the socket to place the strip. `self_exe` is the
+/// absolute path to this binary; the bottom pane runs `<self_exe> render` in
+/// `cwd`.
+///
+/// De-duplication (avoiding a second strip if one already exists) is a Phase 3
+/// concern; this one-shot wraps whatever tree it exports.
+pub fn place(cli: &dyn HerdrCli, self_exe: &str, cwd: &str) -> io::Result<()> {
+    let tab_id = std::env::var("HERDR_TAB_ID").map_err(|_| {
+        io::Error::other("HERDR_TAB_ID is not set — run `place` inside a herdr session")
+    })?;
+    let sock =
+        socket::socket_path().ok_or_else(|| io::Error::other("HERDR_SOCKET_PATH is not set"))?;
+
+    let layout_json = cli.run_json(&["pane", "layout", "--current"])?;
+    let tab_rows = parse_tab_rows(&layout_json)?;
+    let ratio = slim_ratio(tab_rows, TARGET_ROWS);
+
+    let export_reply = socket::request_line(&sock, &export_request(&tab_id))?;
+    check_reply(&export_reply)?;
+    let tree = extract_export_root(&export_reply)?;
+
+    let cmd = vec![self_exe.to_string(), "render".to_string()];
+    let root = wrap_root(tree, ratio, &cmd, cwd);
+
+    let apply_reply = socket::request_line(&sock, &apply_request(&tab_id, &root))?;
+    check_reply(&apply_reply)?;
     Ok(())
 }
 
