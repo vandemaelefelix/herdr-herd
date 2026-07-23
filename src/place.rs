@@ -105,12 +105,25 @@ mod tests {
     }
 
     #[test]
+    fn slim_ratio_clamps_down_on_a_huge_tab() {
+        // 1000-row tab, 7-row strip => 1 - 7/1000 = 0.993, clamped down to the 0.95 ceiling.
+        assert_eq!(slim_ratio(1000, 7), 0.95);
+    }
+
+    #[test]
+    fn slim_ratio_returns_a_sane_default_when_tab_rows_is_zero() {
+        assert_eq!(slim_ratio(0, 7), 0.85);
+    }
+
+    #[test]
     fn wrap_root_puts_a_command_leaf_with_no_pane_id_at_the_bottom() {
         let tree = json!({"type": "pane", "pane_id": "w1:p1", "cwd": "/x"});
         let cmd = vec!["/abs/herdr-pets".to_string(), "render".to_string()];
         let root = wrap_root(tree.clone(), 0.89, &cmd, "/work");
         assert_eq!(root["type"], "split");
         assert_eq!(root["direction"], "down");
+        let ratio = root["ratio"].as_f64().unwrap();
+        assert!((ratio - 0.89).abs() < 1e-6, "got {ratio}");
         assert_eq!(
             root["first"], tree,
             "existing tree preserved verbatim on top"
@@ -142,6 +155,29 @@ mod tests {
         let root = extract_export_root(reply).unwrap();
         assert_eq!(root["type"], "pane");
         assert_eq!(root["pane_id"], "w1:p1");
+    }
+
+    #[test]
+    fn extract_export_root_errors_when_the_root_is_absent() {
+        assert!(extract_export_root(r#"{"result":{"layout":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn export_request_builds_a_layout_export_request() {
+        let line = export_request("w1:t1");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "layout.export");
+        assert_eq!(v["params"]["tab_id"], "w1:t1");
+    }
+
+    #[test]
+    fn apply_request_builds_a_layout_apply_request_with_the_root() {
+        let root = json!({"type": "split", "direction": "down", "ratio": 0.89});
+        let line = apply_request("w1:t1", &root);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "layout.apply");
+        assert_eq!(v["params"]["tab_id"], "w1:t1");
+        assert_eq!(v["params"]["root"], root);
     }
 
     #[test]
