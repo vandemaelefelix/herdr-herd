@@ -196,7 +196,51 @@ session-start / plugin-enable trigger)?
 3. If nothing fires, confirm the polling fallback: `herdr tab list` polled every
    ~1–2s detects new tabs.
 
-**Finding:** _(to be filled in during implementation)_
+**Finding** _(run 2026-07-23, herdr 0.7.0, live macOS session)_:
+
+**`[[events]]` manifest hooks fire. Phase 3 auto-injection can be event-driven —
+polling is a fallback, not the primary mechanism.**
+
+- **Hooks fire on `tab.created`.** Creating a tab ran the hook: `herdr plugin log
+  list --plugin herdr-pets` recorded
+  `{"event":"tab.created","status":"succeeded","exit_code":0}` and the logging
+  command wrote its line. Latency was sub-second (started/finished ~16ms apart).
+
+- **Manifest schema (verified).** The event entry uses an **inline `command`**
+  and an `on` field — **not** an `action`-reference and **not** a PascalCase
+  `TabCreated`. Event names are **dotted lowercase**:
+  ```toml
+  [[events]]
+  on = "tab.created"
+  command = ["/bin/sh", "-c", "…"]
+  ```
+  (This matches the shipped `reviewr` plugin, which hooks `on = "worktree.created"`.)
+  The plan's original `[[actions]]` + `action = "pets-spike-log"` +
+  `on = "TabCreated"` shape was a guess and is **wrong** for herdr 0.7.0.
+
+- **Unknown event names are lenient, not fatal.** Linking with `on =
+  "bogus.nonexistent"` still **succeeds** but returns
+  `warnings:["unknown event 'bogus.nonexistent'"]`; a recognised name
+  (`tab.created`) links with no warning. herdr does **not** enumerate the full
+  valid event set on error, so Phase 3 should confirm each event name it relies on
+  by watching for the absence of that warning. Known-valid so far: `tab.created`,
+  `worktree.created`.
+
+- **No plugin-enable / session-start trigger found.** `herdr plugin disable`
+  then `enable` did **not** fire `tab.created` and produced no new plugin-log
+  entry. There is no observed "run once when the plugin comes up" event; a
+  bootstrap pass over existing tabs at Phase 3 startup must be done explicitly
+  (e.g. an initial `herdr tab list` sweep), not via an enable hook.
+
+- **Polling fallback works.** `herdr tab list` reflects newly created tabs
+  immediately, so a ~1–2s poll reliably detects new tabs if an event-driven
+  approach is ever undesirable. But given hooks fire reliably, **event-driven is
+  the recommended primary** for Phase 3, with the startup sweep covering
+  pre-existing tabs.
+
+This **does not contradict** `GOAL.md` / `docs/PLAN.md`; no design change
+required. The experimental `[[events]]`/action manifest edits were reverted
+(manifest is back to the committed Phase 0 form).
 
 Feeds **Phase 3** (auto-injection: event-driven vs. polling).
 
