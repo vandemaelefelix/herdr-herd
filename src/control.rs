@@ -4,6 +4,8 @@
 //! shells over the `herdr` CLI seam. See the Phase 3 design spec.
 
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -126,7 +128,7 @@ pub fn inject_strip(cli: &dyn HerdrCli, root_pane_id: &str, self_exe: &str) -> i
         "--no-focus",
     ])?;
     let strip_pane = parse_split_pane_id(&split_reply)?;
-    let render_cmd = format!("{self_exe} render");
+    let render_cmd = format!("'{self_exe}' render");
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     cli.run_json(&["pane", "rename", &strip_pane, STRIP_LABEL])?;
     Ok(())
@@ -183,10 +185,19 @@ pub fn control(
 }
 
 /// Session-scoped path for the controller lock: next to the herdr socket if
-/// known, else the system temp dir.
+/// known, else the system temp dir. The lock filename embeds a hash of the
+/// full socket path so two herdr sessions that happen to share a socket
+/// parent directory don't collide on one lock file — each session's
+/// controller gets its own lock, scoped to its specific session socket.
 pub fn controller_lock_path() -> PathBuf {
     socket::socket_path()
-        .and_then(|p| p.parent().map(|d| d.join("herdr-pets-controller.lock")))
+        .and_then(|p| {
+            let parent = p.parent()?.to_path_buf();
+            let mut hasher = DefaultHasher::new();
+            p.to_string_lossy().hash(&mut hasher);
+            let file_name = format!("herdr-pets-controller-{:x}.lock", hasher.finish());
+            Some(parent.join(file_name))
+        })
         .unwrap_or_else(|| std::env::temp_dir().join("herdr-pets-controller.lock"))
 }
 
@@ -248,7 +259,7 @@ mod tests {
         );
         assert_eq!(
             calls[2],
-            vec!["pane", "run", "w1:pNEW", "/abs/herdr-pets render"]
+            vec!["pane", "run", "w1:pNEW", "'/abs/herdr-pets' render"]
         );
         assert_eq!(calls[3], vec!["pane", "rename", "w1:pNEW", "herdr-pets"]);
     }
@@ -353,6 +364,102 @@ mod tests {
                 _ => Ok(r#"{"result":{}}"#.into()),
             }
         }
+    }
+
+    /// A recording fake that fails the `pane split` call targeting one chosen
+    /// pane id (`fail_split_for`), succeeding for every other split — lets
+    /// tests exercise the failure-isolation guarantees around one bad tab.
+    struct FailableCli {
+        calls: RefCell<Vec<Vec<String>>>,
+        tabs: String,
+        panes: String,
+        fail_split_for: String,
+    }
+    impl FailableCli {
+        fn new(tabs: &str, panes: &str, fail_split_for: &str) -> Self {
+            FailableCli {
+                calls: RefCell::new(Vec::new()),
+                tabs: tabs.to_string(),
+                panes: panes.to_string(),
+                fail_split_for: fail_split_for.to_string(),
+            }
+        }
+    }
+    impl HerdrCli for FailableCli {
+        fn run_json(&self, args: &[&str]) -> io::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            match args {
+                ["tab", "list"] => Ok(self.tabs.clone()),
+                ["pane", "list"] => Ok(self.panes.clone()),
+                ["pane", "layout", ..] => {
+                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
+                }
+                ["pane", "split", target, ..] => {
+                    if *target == self.fail_split_for {
+                        Err(io::Error::other("boom"))
+                    } else {
+                        Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into())
+                    }
+                }
+                _ => Ok(r#"{"result":{}}"#.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
+        let cli = FailableCli::new("", "", "w1:p1");
+        let result = inject_strip(&cli, "w1:p1", "/abs/herdr-pets");
+        assert!(result.is_err(), "a failed split must surface as an error");
+        let calls = cli.calls.borrow();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("pane")
+                    && c.get(1).map(String::as_str) == Some("run")),
+            "the render command must never run once the split has failed"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("pane")
+                    && c.get(1).map(String::as_str) == Some("rename")),
+            "the strip pane must never be renamed once the split has failed"
+        );
+    }
+
+    #[test]
+    fn sweep_once_continues_after_one_tab_fails() {
+        // t1's split fails; t2's split must still be attempted and the sweep
+        // as a whole must still report success.
+        let cli = FailableCli::new(
+            r#"{"result":{"tabs":[
+                {"tab_id":"w1:t1","pane_count":1},
+                {"tab_id":"w1:t2","pane_count":1}]}}"#,
+            r#"{"result":{"panes":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1"},
+                {"pane_id":"w1:p2","tab_id":"w1:t2"}]}}"#,
+            "w1:p1",
+        );
+        let result = sweep_once(&cli, "/abs/herdr-pets");
+        assert!(
+            result.is_ok(),
+            "one failing tab must not abort the whole sweep"
+        );
+        let calls = cli.calls.borrow();
+        let splits: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|c| {
+                c.first().map(String::as_str) == Some("pane")
+                    && c.get(1).map(String::as_str) == Some("split")
+            })
+            .collect();
+        assert!(
+            splits.iter().any(|c| c[2] == "w1:p2"),
+            "the split for t2's pane must still be attempted after t1's split failed"
+        );
     }
 
     #[test]
