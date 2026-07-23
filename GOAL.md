@@ -45,6 +45,25 @@ tabs. This is a *rendering-location* compromise, not a change of intent: the
 strip still shows the same agents the sidebar shows, still always in view, still
 reflecting live state. The goal above is unchanged.
 
+### Injection must never disturb running work (verified 2026-07-23, Phase 3 spike)
+
+A hard constraint discovered while building Phase 3: herdr's `layout.apply`
+(the full-tab rewrite that Phase 2's on-demand `place` uses) **re-materialises
+every pane in the tab, killing the process running in each** (verified: a marker
+process was SIGHUP-killed by an injection). So `layout.apply` can *never* be used
+for **automatic** injection — doing so across every tab would kill every running
+agent, violating the "unobtrusive / never interrupt work" principle above.
+
+The safe primitive is an **incremental `pane split` (down)**, which preserves the
+existing pane's process — but it only yields a **full-width** strip on a
+**single-pane** tab (on a multi-pane tab it splits just one column). Therefore
+automatic injection is **non-destructive and scoped to single-pane tabs**, which
+covers **every newly created tab** (single-pane at creation) and any existing
+single-pane tab. Pre-existing **multi-pane** tabs are left to the **on-demand
+`place`** command (Phase 2), where the user knowingly accepts the rebuild. This
+keeps "always everywhere" true for the natural forward workflow while never
+killing work. See `docs/decisions.md` and the Phase 3 design spec.
+
 ## Design principles
 
 - **Glanceable over detailed.** The win is instant emotional read of the whole

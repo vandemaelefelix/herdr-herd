@@ -70,12 +70,21 @@ change with state.
 its agent.
 
 ### Phase 3 — Always everywhere (controller / watchdog)
-**Goal:** strips appear and stay in every tab, automatically.
-- `control` mode: inject into all existing tabs on startup; inject into new tabs
-  (event hook or polling fallback from Spike B); respawn on close; re-assert
-  placement; single-owner lockfile; session-restore de-dup; bootstrap story.
+**Goal:** strips appear and stay in every *eligible* tab, automatically, without
+ever disturbing running work.
+- `control` mode: inject into eligible existing tabs on startup; inject into new
+  tabs (event-driven from Spike B, polling fallback); re-assert placement /
+  respawn on close via periodic re-sweep; single-owner lockfile; session-restore
+  de-dup; bootstrap story.
+- **Non-destructive injection only** (Phase 3 spike, 2026-07-23): automatic
+  injection uses an incremental `pane split` (down), NOT Phase 2's `layout.apply`
+  — the latter re-materialises panes and kills their processes. `pane split` is
+  full-width only on **single-pane** tabs, so auto-injection is scoped to those
+  (covers all new tabs). Multi-pane tabs stay on the on-demand `place`. See
+  GOAL.md's "Injection must never disturb running work" and `docs/decisions.md`.
 
-**Exit:** enable the plugin → a strip is present in every tab and returns if closed.
+**Exit:** enable the plugin → a strip is present in every eligible tab, returns
+if closed, and no running agent is ever killed by injection.
 
 ### Phase 4 — Config & polish
 **Goal:** configurable, documented, installable.
