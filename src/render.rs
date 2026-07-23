@@ -239,15 +239,14 @@ where
         }
         terminal.draw(|f| draw_herd(f, &herd, species, theme))?;
 
-        if event::poll(tick)? {
-            if let Event::Key(k) = event::read()? {
+        if event::poll(tick)?
+            && let Event::Key(k) = event::read()? {
                 let quit = k.code == KeyCode::Char('q')
                     || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
                     return Ok(());
                 }
             }
-        }
     }
 }
 

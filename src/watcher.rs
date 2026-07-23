@@ -111,11 +111,10 @@ pub fn watch(
                         // An event arrived; debounce a refetch.
                         let now = clock.now_ms();
                         if now.saturating_sub(last_send) >= debounce_ms {
-                            if let Some(s) = refetch(cli.as_ref()) {
-                                if tx.send(s).is_err() {
+                            if let Some(s) = refetch(cli.as_ref())
+                                && tx.send(s).is_err() {
                                     return;
                                 }
-                            }
                             last_send = now;
                         }
                     }
@@ -137,11 +136,10 @@ pub fn watch(
             // or degraded to `None`).
             let now = clock.now_ms();
             if now.saturating_sub(last_send) >= slow_ms {
-                if let Some(s) = refetch(cli.as_ref()) {
-                    if tx.send(s).is_err() {
+                if let Some(s) = refetch(cli.as_ref())
+                    && tx.send(s).is_err() {
                         return;
                     }
-                }
                 last_send = now;
             }
         }

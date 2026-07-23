@@ -215,8 +215,8 @@ pub fn embedded_species() -> Vec<Species> {
 /// Embedded species, with any `$HERDR_PETS_SPRITES/*.sprite` overriding by name.
 pub fn load_species() -> Vec<Species> {
     let mut out = embedded_species();
-    if let Some(dir) = std::env::var_os("HERDR_PETS_SPRITES") {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Some(dir) = std::env::var_os("HERDR_PETS_SPRITES")
+        && let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("sprite") {
@@ -234,7 +234,6 @@ pub fn load_species() -> Vec<Species> {
                 }
             }
         }
-    }
     out
 }
 
@@ -255,8 +254,8 @@ mod tests {
         assert_eq!(idle.frames.len(), 2);
         assert_eq!((idle.frames[0].w, idle.frames[0].h), (4, 4));
         assert_eq!(idle.frame_ms, 500);
-        assert!(idle.frames[0].cells.iter().any(|c| *c == Role::CoatMid));
-        assert!(idle.frames[0].cells.iter().any(|c| *c == Role::Outline));
+        assert!(idle.frames[0].cells.contains(&Role::CoatMid));
+        assert!(idle.frames[0].cells.contains(&Role::Outline));
     }
 
     #[test]
