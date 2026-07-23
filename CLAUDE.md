@@ -33,3 +33,19 @@ Always branch off `main`; never commit directly to `main`.
 - **Do not commit or push without the user asking.** Propose commits; the user
   controls when work lands and when it is pushed.
 - Local checkpoint commits on a feature branch are fine to propose as we go.
+
+## Rust skills
+
+Project-tuned Rust skills live in `.claude/skills/` and are auto-listed in the
+Skill tool. Use the relevant one before writing Rust here, so new code matches
+the patterns already in `src/`:
+
+- `rust-error-handling` — `Result`/`?`, `io::Error::other`, degrade at the UI
+  boundary, no `unwrap`/`expect` outside tests.
+- `rust-testability-seams` — the trait + `Real`/`Fake` dependency-injection
+  pattern so tests never touch the real world.
+- `rust-serde-tolerant-parsing` — deserializing external CLI JSON (envelopes,
+  `rename_all`, `#[serde(other)]`, `#[serde(default)]`).
+- `rust-tui-snapshot-testing` — ratatui + `insta` + `TestBackend` snapshots.
+- `rust-project-conventions` — doc-comment style, sentence-style test names,
+  toolchain/dependency discipline.
