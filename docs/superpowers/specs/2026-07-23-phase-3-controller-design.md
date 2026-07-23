@@ -117,8 +117,10 @@ covers respawn in the same mechanism, and Spike B verified polling is reliable
 
 ### 4.4 Lock
 
-`lock.rs`: open/create a file at a session-scoped path
-(`$HERDR_SOCKET_PATH` dir + `/herdr-pets-controller.lock`, else temp dir),
+`lock.rs`: open/create a file at a session-scoped path (`$HERDR_SOCKET_PATH`'s
+parent dir + `/herdr-pets-controller-<hash-of-full-socket-path>.lock`, else temp
+dir — the hash keeps the lock **per session** so sessions sharing a socket
+directory don't collide; whole-branch-review fix),
 `flock(LOCK_EX | LOCK_NB)`. Hold the fd for process lifetime; the OS releases it
 on exit (covers crashes). `acquire() -> io::Result<Option<LockGuard>>`; `None`
 when already locked.
