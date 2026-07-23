@@ -8,3 +8,4 @@ pub mod herdr;
 pub mod identity;
 pub mod render;
 pub mod socket;
+pub mod sprite;

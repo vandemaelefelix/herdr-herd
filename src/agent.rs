@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 /// An agent's live status. `Unknown` is the fallback for panes with no detected
 /// agent and for any status string herdr adds later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Idle,
