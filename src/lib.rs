@@ -3,3 +3,4 @@
 //! Phase 0: foundations. Modules are added task-by-task.
 
 pub mod agent;
+pub mod herdr;
