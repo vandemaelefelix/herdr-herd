@@ -3,7 +3,8 @@
 //! badges and a `+N` counter.
 
 use std::io;
-use std::time::Duration;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -17,10 +18,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
-use crate::agent::parse_agent_list;
+use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb, motion_offset};
-use crate::herd::{Herd, visible_and_hidden};
-use crate::herdr::HerdrCli;
+use crate::herd::{Herd, Lcg, visible_and_hidden};
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
@@ -154,15 +154,15 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
     }
 }
 
-/// Run the render loop: fetch agents, draw, poll for input, repeat until `q`
-/// or Ctrl-C. Restores the terminal on exit.
-pub fn run(herdr: &dyn HerdrCli) -> io::Result<()> {
+/// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
+/// draws, and quits on `q`/Ctrl-C. Restores the terminal on exit.
+pub fn run(rx: Receiver<Vec<Agent>>, species: Vec<Species>, theme: Theme) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = run_loop(&mut terminal, herdr);
+    let result = run_loop(&mut terminal, rx, &species, theme);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -172,35 +172,44 @@ pub fn run(herdr: &dyn HerdrCli) -> io::Result<()> {
 
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    herdr: &dyn HerdrCli,
+    rx: Receiver<Vec<Agent>>,
+    species: &[Species],
+    theme: Theme,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
 {
-    // Minimal adaptation so the Phase 0 loop shell compiles against the new
-    // renderer; Task 11 rewrites this into the real roam/animation loop.
-    let species = crate::sprite::load_species();
+    let tick = Duration::from_millis(83); // ~12 fps
+    let species_count = species.len().max(1);
     let mut herd = Herd::new();
-    let mut rng = crate::herd::Lcg::new(1);
-
+    let mut rng = Lcg::new(0xC0FFEE);
+    let mut last = Instant::now();
     loop {
-        let agents = herdr
-            .run_json(&["agent", "list"])
-            .ok()
-            .and_then(|s| parse_agent_list(&s).ok())
-            .unwrap_or_default();
+        while let Ok(agents) = rx.try_recv() {
+            let w = terminal.size()?.width as f32;
+            herd.reconcile(&agents, species_count, w, &mut rng);
+        }
+        let now = Instant::now();
+        let dt_ms = (now - last).as_millis() as f32;
+        last = now;
+        let w = terminal.size()?.width as f32;
+        let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
+        herd.step(dt_ms, w, pet_w, &mut rng);
+        for p in herd.pets.iter_mut() {
+            let fm = species
+                .get(p.identity.species_index)
+                .or_else(|| species.first())
+                .and_then(|s| s.states.get(&p.status))
+                .map(|st| st.frame_ms)
+                .unwrap_or(0);
+            p.advance(dt_ms, fm);
+        }
+        terminal.draw(|f| draw_herd(f, &herd, species, theme))?;
 
-        let strip_w = terminal.size().map(|s| s.width as f32).unwrap_or(120.0);
-        herd.reconcile(&agents, species.len().max(1), strip_w, &mut rng);
-
-        terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark))?;
-
-        // ~1.5s refresh cadence; wake early on a keypress.
-        if event::poll(Duration::from_millis(1500))? {
-            if let Event::Key(key) = event::read()? {
-                let quit = key.code == KeyCode::Char('q')
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL));
+        if event::poll(tick)? {
+            if let Event::Key(k) = event::read()? {
+                let quit = k.code == KeyCode::Char('q')
+                    || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
                     return Ok(());
                 }
@@ -268,6 +277,21 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle; 20]);
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn reconcile_then_draw_shows_the_incoming_herd() {
+        // A focused integration check: feed one snapshot, reconcile, draw, snapshot.
+        use crate::agent::AgentStatus::*;
+        use crate::herd::{Herd, Lcg};
+        let species = vec![crate::sprite::parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        let mut rng = Lcg::new(3);
+        herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1, 60.0, &mut rng);
+        for (i, p) in herd.pets.iter_mut().enumerate() { p.x = 4.0 + i as f32 * 18.0; p.target_x = p.x; }
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
