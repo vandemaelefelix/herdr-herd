@@ -22,7 +22,10 @@ pub struct StateStyle {
 impl StateStyle {
     /// No overrides: render the role's base color unchanged.
     pub fn none() -> Self {
-        Self { dim: false, ghost: false }
+        Self {
+            dim: false,
+            ghost: false,
+        }
     }
 }
 
@@ -83,7 +86,10 @@ mod tests {
 
     #[test]
     fn transparent_role_has_no_color() {
-        assert_eq!(role_color(Role::Transparent, 120, Theme::Dark, StateStyle::none()), None);
+        assert_eq!(
+            role_color(Role::Transparent, 120, Theme::Dark, StateStyle::none()),
+            None
+        );
     }
 
     #[test]
@@ -113,7 +119,16 @@ mod tests {
     #[test]
     fn ghost_desaturates_the_coat_toward_grey() {
         let normal = role_color(Role::CoatMid, 200, Theme::Dark, StateStyle::none()).unwrap();
-        let ghost = role_color(Role::CoatMid, 200, Theme::Dark, StateStyle { dim: false, ghost: true }).unwrap();
+        let ghost = role_color(
+            Role::CoatMid,
+            200,
+            Theme::Dark,
+            StateStyle {
+                dim: false,
+                ghost: true,
+            },
+        )
+        .unwrap();
         let spread = |c: Rgb| c.0.max(c.1).max(c.2) as i32 - c.0.min(c.1).min(c.2) as i32;
         assert!(spread(ghost) < spread(normal), "ghost should be greyer");
     }

@@ -157,7 +157,9 @@ mod tests {
                 loop {
                     let n = conn.read(&mut buf).unwrap();
                     got.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if got.contains('\n') { break; }
+                    if got.contains('\n') {
+                        break;
+                    }
                 }
                 conn.write_all(b"PONG").unwrap();
                 drop(conn); // EOF for the client

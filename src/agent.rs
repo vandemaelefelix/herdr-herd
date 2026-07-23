@@ -66,7 +66,10 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<Agent>, serde_json::Error> {
 mod tests {
     use super::*;
 
-    const FIXTURE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/agent-list.json"));
+    const FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/agent-list.json"
+    ));
 
     #[test]
     fn parses_all_agents_from_the_envelope() {
@@ -101,8 +104,8 @@ mod tests {
     #[test]
     fn label_prefers_name_then_agent_then_pane_id() {
         let a = parse_agent_list(FIXTURE).unwrap();
-        assert_eq!(a[0].label(), "pets-dev");   // has name
-        assert_eq!(a[1].label(), "claude");     // no name, has agent
-        assert_eq!(a[2].label(), "w1F:p3");     // neither -> pane_id
+        assert_eq!(a[0].label(), "pets-dev"); // has name
+        assert_eq!(a[1].label(), "claude"); // no name, has agent
+        assert_eq!(a[2].label(), "w1F:p3"); // neither -> pane_id
     }
 }

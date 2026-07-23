@@ -124,7 +124,9 @@ fn parse_color(c: &str) -> Result<OverlayColor, String> {
     if c == "accent" {
         return Ok(OverlayColor::Accent);
     }
-    let hex = c.strip_prefix('#').ok_or_else(|| format!("bad color '{c}'"))?;
+    let hex = c
+        .strip_prefix('#')
+        .ok_or_else(|| format!("bad color '{c}'"))?;
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("bad color '{c}'"));
     }
@@ -164,7 +166,10 @@ mod tests {
     fn hop_offset_never_goes_below_ground() {
         let spec = parse_motion("hop").unwrap();
         for p in [0.0, 0.5, 1.0] {
-            assert!(motion_offset(&spec, p).dy <= 0.0, "hop only lifts (negative = up)");
+            assert!(
+                motion_offset(&spec, p).dy <= 0.0,
+                "hop only lifts (negative = up)"
+            );
         }
     }
 
@@ -185,7 +190,10 @@ mod tests {
         let badge = parse_overlay("badge:!").unwrap();
         assert_eq!(badge.kind, Overlay::Badge("!".into()));
 
-        assert_eq!(parse_overlay("badge:! color=accent").unwrap().color, OverlayColor::Accent);
+        assert_eq!(
+            parse_overlay("badge:! color=accent").unwrap().color,
+            OverlayColor::Accent
+        );
         assert_eq!(
             parse_overlay("badge:! color=#e62d23").unwrap().color,
             OverlayColor::Literal(Rgb(0xe6, 0x2d, 0x23))

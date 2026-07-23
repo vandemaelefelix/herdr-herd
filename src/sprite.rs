@@ -105,7 +105,11 @@ fn parse_frame(lines: &[&str]) -> Result<Frame, String> {
             cells.push(role_from_char(c).ok_or_else(|| format!("illegal symbol '{c}'"))?);
         }
     }
-    Ok(Frame { w, h: lines.len(), cells })
+    Ok(Frame {
+        w,
+        h: lines.len(),
+        cells,
+    })
 }
 
 /// Parse one `.sprite` file into a `Species`.
@@ -135,7 +139,9 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
             if frames.is_empty() {
                 return Err(format!("state {st:?} has no frames"));
             }
-            let frame_ms = kv(header, "frame_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let frame_ms = kv(header, "frame_ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let motion = parse_motion(kv(header, "motion").unwrap_or("none"))?;
             let overlay_str = kv(header, "overlay").unwrap_or("none");
             let overlay = match kv(header, "color") {
@@ -146,7 +152,14 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
             let ghost = kv(header, "ghost") == Some("true");
             states.insert(
                 st,
-                StateSpec { frames: std::mem::take(frames), frame_ms, motion, overlay, dim, ghost },
+                StateSpec {
+                    frames: std::mem::take(frames),
+                    frame_ms,
+                    motion,
+                    overlay,
+                    dim,
+                    ghost,
+                },
             );
         }
         Ok(())
@@ -166,7 +179,8 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
             let open = line.find('[').ok_or("missing [ in state header")?;
             let close = line.find(']').ok_or("missing ] in state header")?;
             let key = &line[open + 1..close];
-            cur_status = Some(status_from_key(key).ok_or_else(|| format!("unknown state '{key}'"))?);
+            cur_status =
+                Some(status_from_key(key).ok_or_else(|| format!("unknown state '{key}'"))?);
             cur_header = line[close + 1..].trim().to_string();
             continue;
         }
@@ -209,31 +223,35 @@ const EMBEDDED: &[&str] = &[
 
 /// Parse the embedded sprites. Guarded by `every_embedded_species_is_valid`.
 pub fn embedded_species() -> Vec<Species> {
-    EMBEDDED.iter().filter_map(|src| parse_species(src).ok()).collect()
+    EMBEDDED
+        .iter()
+        .filter_map(|src| parse_species(src).ok())
+        .collect()
 }
 
 /// Embedded species, with any `$HERDR_PETS_SPRITES/*.sprite` overriding by name.
 pub fn load_species() -> Vec<Species> {
     let mut out = embedded_species();
     if let Some(dir) = std::env::var_os("HERDR_PETS_SPRITES")
-        && let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let path = e.path();
-                if path.extension().and_then(|x| x.to_str()) != Some("sprite") {
-                    continue;
+        && let Ok(entries) = std::fs::read_dir(&dir)
+    {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("sprite") {
+                continue;
+            }
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| parse_species(&s))
+            {
+                Ok(sp) => {
+                    out.retain(|x| x.name != sp.name);
+                    out.push(sp);
                 }
-                match std::fs::read_to_string(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|s| parse_species(&s))
-                {
-                    Ok(sp) => {
-                        out.retain(|x| x.name != sp.name);
-                        out.push(sp);
-                    }
-                    Err(err) => eprintln!("herdr-pets: skipping sprite {path:?}: {err}"),
-                }
+                Err(err) => eprintln!("herdr-pets: skipping sprite {path:?}: {err}"),
             }
         }
+    }
     out
 }
 
@@ -243,7 +261,10 @@ mod tests {
     use crate::agent::AgentStatus;
     use crate::anim::{OverlayColor, Rgb};
 
-    const BLOB: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/test-blob.sprite"));
+    const BLOB: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sprites/test-blob.sprite"
+    ));
 
     #[test]
     fn parses_name_states_and_frame_grid() {
@@ -283,7 +304,10 @@ mod tests {
         let done = &sp.states[&AgentStatus::Done];
         assert_eq!(done.overlay.color, OverlayColor::Accent);
         let blocked = &sp.states[&AgentStatus::Blocked];
-        assert_eq!(blocked.overlay.color, OverlayColor::Literal(Rgb(0xe6, 0x2d, 0x23)));
+        assert_eq!(
+            blocked.overlay.color,
+            OverlayColor::Literal(Rgb(0xe6, 0x2d, 0x23))
+        );
     }
 
     #[test]
@@ -316,14 +340,26 @@ mod tests {
         assert!(!all.is_empty());
         for sp in &all {
             let species_size = sp.size();
-            for st in [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done,
-                       AgentStatus::Blocked, AgentStatus::Unknown] {
-                let spec = sp.states.get(&st)
+            for st in [
+                AgentStatus::Idle,
+                AgentStatus::Working,
+                AgentStatus::Done,
+                AgentStatus::Blocked,
+                AgentStatus::Unknown,
+            ] {
+                let spec = sp
+                    .states
+                    .get(&st)
                     .unwrap_or_else(|| panic!("{} missing state {st:?}", sp.name));
                 assert!(!spec.frames.is_empty(), "{} {st:?} has no frames", sp.name);
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
                 assert!(h <= 12, "{} taller than the 6-row budget", sp.name);
-                assert_eq!((w, h), species_size, "{} {st:?} size differs from species size", sp.name);
+                assert_eq!(
+                    (w, h),
+                    species_size,
+                    "{} {st:?} size differs from species size",
+                    sp.name
+                );
                 for f in &spec.frames {
                     assert_eq!((f.w, f.h), (w, h), "{} {st:?} frame size drift", sp.name);
                 }

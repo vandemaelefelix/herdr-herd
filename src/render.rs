@@ -38,7 +38,11 @@ pub struct PixelBuf {
 impl PixelBuf {
     /// A fully-transparent buffer of `w` by `h` pixels.
     pub fn new(w: usize, h: usize) -> Self {
-        Self { w, h, px: vec![None; w * h] }
+        Self {
+            w,
+            h,
+            px: vec![None; w * h],
+        }
     }
 
     /// Set the pixel at `(x, y)`, silently ignoring out-of-bounds writes.
@@ -61,7 +65,11 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     for ry in 0..rows {
         for x in 0..buf.w {
             let top = buf.px[(ry * 2) * buf.w + x];
-            let bot = if ry * 2 + 1 < buf.h { buf.px[(ry * 2 + 1) * buf.w + x] } else { None };
+            let bot = if ry * 2 + 1 < buf.h {
+                buf.px[(ry * 2 + 1) * buf.w + x]
+            } else {
+                None
+            };
             let cx = area.x + x as u16;
             let cy = area.y + ry as u16;
             if cx >= area.right() || cy >= area.bottom() {
@@ -96,13 +104,21 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
 
     for &i in &order {
         let pet = &herd.pets[i];
-        let Some(sp) = species.get(pet.identity.species_index).or_else(|| species.first()) else {
+        let Some(sp) = species
+            .get(pet.identity.species_index)
+            .or_else(|| species.first())
+        else {
             continue;
         };
-        let Some(state) = sp.states.get(&pet.status) else { continue };
+        let Some(state) = sp.states.get(&pet.status) else {
+            continue;
+        };
         let fi = pet.frame_index(state.frames.len());
         let fr = &state.frames[fi];
-        let style = StateStyle { dim: state.dim, ghost: state.ghost };
+        let style = StateStyle {
+            dim: state.dim,
+            ghost: state.ghost,
+        };
         let off = motion_offset(&state.motion, pet.phase);
         let ox = (pet.x + off.dx).round() as i32;
         let oy = (off.dy).round() as i32; // ground-aligned; dy<=0 lifts
@@ -120,10 +136,15 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
     // Overlays (bubbles/badges) as text cells above each visible pet.
     for &i in &order {
         let pet = &herd.pets[i];
-        let Some(sp) = species.get(pet.identity.species_index).or_else(|| species.first()) else {
+        let Some(sp) = species
+            .get(pet.identity.species_index)
+            .or_else(|| species.first())
+        else {
             continue;
         };
-        let Some(state) = sp.states.get(&pet.status) else { continue };
+        let Some(state) = sp.states.get(&pet.status) else {
+            continue;
+        };
         let (glyph, _kind) = match &state.overlay.kind {
             Overlay::Bubble(g) => (g.clone(), 'b'),
             Overlay::Badge(g) => (g.clone(), 'a'),
@@ -138,7 +159,12 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             + (pet.x.round() as u16)
                 .saturating_add(3)
                 .min(area.width.saturating_sub(glyph.chars().count() as u16));
-        frame.buffer_mut().set_span(cx, area.y, &Span::styled(glyph, Style::default().fg(color)), area.width);
+        frame.buffer_mut().set_span(
+            cx,
+            area.y,
+            &Span::styled(glyph, Style::default().fg(color)),
+            area.width,
+        );
     }
 
     if hidden > 0 {
@@ -240,13 +266,14 @@ where
         terminal.draw(|f| draw_herd(f, &herd, species, theme))?;
 
         if event::poll(tick)?
-            && let Event::Key(k) = event::read()? {
-                let quit = k.code == KeyCode::Char('q')
-                    || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
-                if quit {
-                    return Ok(());
-                }
+            && let Event::Key(k) = event::read()?
+        {
+            let quit = k.code == KeyCode::Char('q')
+                || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
+            if quit {
+                return Ok(());
             }
+        }
     }
 }
 
@@ -260,7 +287,10 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    const BLOB: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/test-blob.sprite"));
+    const BLOB: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sprites/test-blob.sprite"
+    ));
 
     fn agent(tid: &str, s: AgentStatus) -> Agent {
         Agent {
@@ -281,8 +311,11 @@ mod tests {
     fn fixed_herd(states: &[AgentStatus]) -> Herd {
         let mut h = Herd::new();
         let mut rng = Lcg::new(1);
-        let agents: Vec<_> =
-            states.iter().enumerate().map(|(i, s)| agent(&format!("t{i}"), *s)).collect();
+        let agents: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| agent(&format!("t{i}"), *s))
+            .collect();
         h.reconcile(&agents, 1, 120.0, &mut rng);
         // Freeze positions + phase for a deterministic snapshot.
         for (i, p) in h.pets.iter_mut().enumerate() {
@@ -299,7 +332,9 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle, Working, Done, Blocked, Unknown]);
         let mut terminal = Terminal::new(TestBackend::new(90, 6)).unwrap();
-        terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
 
@@ -309,7 +344,9 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle; 20]);
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
 
@@ -321,32 +358,63 @@ mod tests {
         let species = vec![crate::sprite::parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
         let mut rng = Lcg::new(3);
-        herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1, 60.0, &mut rng);
-        for (i, p) in herd.pets.iter_mut().enumerate() { p.x = 4.0 + i as f32 * 18.0; p.target_x = p.x; }
+        herd.reconcile(
+            &[agent("a", Working), agent("b", Blocked)],
+            1,
+            60.0,
+            &mut rng,
+        );
+        for (i, p) in herd.pets.iter_mut().enumerate() {
+            p.x = 4.0 + i as f32 * 18.0;
+            p.target_x = p.x;
+        }
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
-        terminal.draw(|f| draw_herd(f, &herd, &species, Theme::Dark)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
 
-    use crate::pet::Pet;
     use crate::identity::identity_for;
+    use crate::pet::Pet;
 
     #[test]
     fn pet_at_column_returns_the_topmost_pet_when_they_overlap() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
         // Two overlapping pets near x=10: idle (low priority) and blocked (high).
-        herd.pets.push(Pet::new("idle".into(), identity_for("idle", 1), AgentStatus::Idle, 10.0));
-        herd.pets.push(Pet::new("blk".into(), identity_for("blk", 1), AgentStatus::Blocked, 12.0));
+        herd.pets.push(Pet::new(
+            "idle".into(),
+            identity_for("idle", 1),
+            AgentStatus::Idle,
+            10.0,
+        ));
+        herd.pets.push(Pet::new(
+            "blk".into(),
+            identity_for("blk", 1),
+            AgentStatus::Blocked,
+            12.0,
+        ));
         let hit = pet_at_column(&herd, &species, 200, 13).expect("a pet under column 13");
-        assert_eq!(herd.pets[hit].terminal_id, "blk", "blocked draws on top, so it wins the hit");
+        assert_eq!(
+            herd.pets[hit].terminal_id, "blk",
+            "blocked draws on top, so it wins the hit"
+        );
     }
 
     #[test]
     fn pet_at_column_is_none_over_a_gap() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        herd.pets.push(Pet::new("a".into(), identity_for("a", 1), AgentStatus::Idle, 4.0));
-        assert!(pet_at_column(&herd, &species, 200, 150).is_none(), "column far past the pet is empty");
+        herd.pets.push(Pet::new(
+            "a".into(),
+            identity_for("a", 1),
+            AgentStatus::Idle,
+            4.0,
+        ));
+        assert!(
+            pet_at_column(&herd, &species, 200, 150).is_none(),
+            "column far past the pet is empty"
+        );
     }
 }

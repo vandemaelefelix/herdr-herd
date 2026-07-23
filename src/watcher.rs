@@ -6,9 +6,9 @@
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
-use crate::agent::{parse_agent_list, Agent};
+use crate::agent::{Agent, parse_agent_list};
 use crate::herdr::HerdrCli;
-use crate::socket::{subscribe_request, SocketClient};
+use crate::socket::{SocketClient, subscribe_request};
 
 /// A source of monotonic milliseconds, behind a seam so tests never sleep or
 /// touch the real clock.
@@ -112,9 +112,10 @@ pub fn watch(
                         let now = clock.now_ms();
                         if now.saturating_sub(last_send) >= debounce_ms {
                             if let Some(s) = refetch(cli.as_ref())
-                                && tx.send(s).is_err() {
-                                    return;
-                                }
+                                && tx.send(s).is_err()
+                            {
+                                return;
+                            }
                             last_send = now;
                         }
                     }
@@ -137,9 +138,10 @@ pub fn watch(
             let now = clock.now_ms();
             if now.saturating_sub(last_send) >= slow_ms {
                 if let Some(s) = refetch(cli.as_ref())
-                    && tx.send(s).is_err() {
-                        return;
-                    }
+                    && tx.send(s).is_err()
+                {
+                    return;
+                }
                 last_send = now;
             }
         }

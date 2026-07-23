@@ -63,7 +63,11 @@ impl Herd {
     ) {
         // Update survivors / add new.
         for a in agents {
-            if let Some(p) = self.pets.iter_mut().find(|p| p.terminal_id == a.terminal_id) {
+            if let Some(p) = self
+                .pets
+                .iter_mut()
+                .find(|p| p.terminal_id == a.terminal_id)
+            {
                 p.status = a.agent_status;
                 p.label = a.label();
             } else {
@@ -151,10 +155,17 @@ mod tests {
 
     fn agent(tid: &str, status: AgentStatus) -> Agent {
         Agent {
-            agent: Some("claude".into()), agent_status: status, name: None,
-            cwd: "/".into(), foreground_cwd: "/".into(), workspace_id: "w".into(),
-            tab_id: "t".into(), pane_id: "p".into(), terminal_id: tid.into(),
-            revision: 0, focused: false,
+            agent: Some("claude".into()),
+            agent_status: status,
+            name: None,
+            cwd: "/".into(),
+            foreground_cwd: "/".into(),
+            workspace_id: "w".into(),
+            tab_id: "t".into(),
+            pane_id: "p".into(),
+            terminal_id: tid.into(),
+            revision: 0,
+            focused: false,
         }
     }
 
@@ -162,12 +173,28 @@ mod tests {
     fn reconcile_adds_updates_and_removes_by_terminal_id() {
         let mut h = Herd::new();
         let mut rng = Lcg::new(1);
-        h.reconcile(&[agent("a", AgentStatus::Idle), agent("b", AgentStatus::Working)], 2, 200.0, &mut rng);
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Idle),
+                agent("b", AgentStatus::Working),
+            ],
+            2,
+            200.0,
+            &mut rng,
+        );
         assert_eq!(h.pets.len(), 2);
 
         // 'a' changes status, 'b' leaves, 'c' joins.
         h.pets[0].x = 42.0; // survivor position must be preserved
-        h.reconcile(&[agent("a", AgentStatus::Blocked), agent("c", AgentStatus::Idle)], 2, 200.0, &mut rng);
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Blocked),
+                agent("c", AgentStatus::Idle),
+            ],
+            2,
+            200.0,
+            &mut rng,
+        );
         let a = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
         assert_eq!(a.status, AgentStatus::Blocked);
         assert_eq!(a.x, 42.0, "survivor keeps position");
@@ -179,8 +206,17 @@ mod tests {
     fn step_keeps_pets_within_bounds() {
         let mut h = Herd::new();
         let mut rng = Lcg::new(7);
-        h.reconcile(&(0..6).map(|i| agent(&format!("t{i}"), AgentStatus::Working)).collect::<Vec<_>>(), 2, 100.0, &mut rng);
-        for _ in 0..200 { h.step(50.0, 100.0, 20.0, &mut rng); }
+        h.reconcile(
+            &(0..6)
+                .map(|i| agent(&format!("t{i}"), AgentStatus::Working))
+                .collect::<Vec<_>>(),
+            2,
+            100.0,
+            &mut rng,
+        );
+        for _ in 0..200 {
+            h.step(50.0, 100.0, 20.0, &mut rng);
+        }
         for p in &h.pets {
             assert!(p.x >= 0.0 && p.x <= 80.0, "x={} out of bounds", p.x);
         }
@@ -205,14 +241,32 @@ mod tests {
     #[test]
     fn overflow_keeps_attention_states_and_drops_idle_first() {
         let pets = vec![
-            crate::pet::Pet::new("i".into(), crate::identity::identity_for("i", 2), AgentStatus::Idle, 0.0),
-            crate::pet::Pet::new("b".into(), crate::identity::identity_for("b", 2), AgentStatus::Blocked, 0.0),
-            crate::pet::Pet::new("w".into(), crate::identity::identity_for("w", 2), AgentStatus::Working, 0.0),
+            crate::pet::Pet::new(
+                "i".into(),
+                crate::identity::identity_for("i", 2),
+                AgentStatus::Idle,
+                0.0,
+            ),
+            crate::pet::Pet::new(
+                "b".into(),
+                crate::identity::identity_for("b", 2),
+                AgentStatus::Blocked,
+                0.0,
+            ),
+            crate::pet::Pet::new(
+                "w".into(),
+                crate::identity::identity_for("w", 2),
+                AgentStatus::Working,
+                0.0,
+            ),
         ];
         let (visible, hidden) = visible_and_hidden(&pets, 2);
         assert_eq!(hidden, 1);
         // the blocked and working pets must be the visible ones; idle dropped.
-        let names: Vec<&str> = visible.iter().map(|&i| pets[i].terminal_id.as_str()).collect();
+        let names: Vec<&str> = visible
+            .iter()
+            .map(|&i| pets[i].terminal_id.as_str())
+            .collect();
         assert!(names.contains(&"b") && names.contains(&"w"));
         assert!(!names.contains(&"i"));
     }

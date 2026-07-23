@@ -43,7 +43,10 @@ impl LiveHerdr<RealRunner> {
 
 impl<R: CommandRunner> LiveHerdr<R> {
     pub fn with_runner(program: impl Into<OsString>, runner: R) -> Self {
-        Self { program: program.into(), runner }
+        Self {
+            program: program.into(),
+            runner,
+        }
     }
 }
 
@@ -87,21 +90,39 @@ mod tests {
 
     #[test]
     fn run_json_returns_stdout_on_success() {
-        let h = LiveHerdr::with_runner("herdr", Fake { stdout: r#"{"ok":true}"#.into(), raw_status: 0 });
+        let h = LiveHerdr::with_runner(
+            "herdr",
+            Fake {
+                stdout: r#"{"ok":true}"#.into(),
+                raw_status: 0,
+            },
+        );
         assert_eq!(h.run_json(&["agent", "list"]).unwrap(), r#"{"ok":true}"#);
     }
 
     #[test]
     fn run_json_errors_on_nonzero_exit() {
         // from_raw(256) => exit code 1 on unix.
-        let h = LiveHerdr::with_runner("herdr", Fake { stdout: String::new(), raw_status: 256 });
+        let h = LiveHerdr::with_runner(
+            "herdr",
+            Fake {
+                stdout: String::new(),
+                raw_status: 256,
+            },
+        );
         assert!(h.run_json(&["agent", "list"]).is_err());
     }
 
     #[test]
     fn resolve_program_falls_back_to_herdr() {
         assert_eq!(resolve_program(None), OsString::from("herdr"));
-        assert_eq!(resolve_program(Some(String::new())), OsString::from("herdr"));
-        assert_eq!(resolve_program(Some("/custom/herdr".into())), OsString::from("/custom/herdr"));
+        assert_eq!(
+            resolve_program(Some(String::new())),
+            OsString::from("herdr")
+        );
+        assert_eq!(
+            resolve_program(Some("/custom/herdr".into())),
+            OsString::from("/custom/herdr")
+        );
     }
 }
