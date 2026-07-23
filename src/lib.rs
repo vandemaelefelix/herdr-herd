@@ -7,6 +7,7 @@ pub mod anim;
 pub mod herd;
 pub mod herdr;
 pub mod identity;
+pub mod lock;
 pub mod palette;
 pub mod pet;
 pub mod place;
