@@ -47,13 +47,23 @@ the `control` watchdog mode, and any config surface.
 |---|---|---|
 | `main.rs` | Bin entry. Parse the subcommand (`render`; plus `--version`). Hand-rolled arg parsing over `std::env::args` — no `clap` for one subcommand. Dispatches into the library. | lib |
 | `herdr.rs` | The herdr query seam. `HerdrCli` trait (`run_json`), `LiveHerdr` implementation that shells out to the `herdr` CLI via `std::process::Command`, and an inner `CommandRunner` seam so tests substitute a recorder/fake and never spawn a real process. Resolves the `herdr` program from `$HERDR_BIN_PATH` or falls back to `"herdr"` on `PATH`. Direct port of file-viewer's pattern. | — |
-| `agent.rs` | `Agent` struct (serde `Deserialize`) for one entry of `herdr agent list --json`: `agent`, `agent_status`, `name`, `cwd`, `foreground_cwd`, `workspace_id`, `tab_id`, `pane_id`, `terminal_id`, `focused`. Plus an `AgentStatus` enum (`Idle`, `Working`, `Blocked`, `Done`, `Unknown`) with an `Unknown` fallback for unrecognised values. | serde |
+| `agent.rs` | Deserialize `herdr agent list` output (see note). An `AgentList` envelope (`result.agents`) plus an `Agent` struct: `agent` (**optional**), `agent_status`, `name` (**optional**), `cwd`, `foreground_cwd`, `workspace_id`, `tab_id`, `pane_id`, `terminal_id`, `revision`, `focused`. Plus an `AgentStatus` enum (`Idle`, `Working`, `Blocked`, `Done`, `Unknown`) with `Unknown` as the `#[serde(other)]` fallback. | serde |
 | `render.rs` | The `render` subcommand. Sets up ratatui + crossterm (alternate screen, raw mode), then a simple loop: fetch agents via `HerdrCli`, draw a **placeholder header + one line per agent** (name + status), poll-redraw every ~1–2s, quit on `q` / Ctrl-C, restore the terminal on exit. No animation, no sprites. | herdr, agent |
 | `socket.rs` | **Spike-A scaffolding only.** A thin raw-socket helper: connect to `$HERDR_SOCKET_PATH`, send a single JSON-RPC request (`layout_export` / `layout_apply`), read the reply. Deliberately minimal and clearly commented as experiment support — it is *not* the Phase 1 event-subscription client. | serde_json |
 
+> **Verified CLI surface (2026-07-23, herdr 0.7.0):** `herdr agent list` takes
+> **no `--json` flag** — it prints a JSON-RPC envelope on stdout by default:
+> `{"id":"cli:agent:list","result":{"agents":[…],"type":"agent_list"}}`. So the
+> render pane runs `herdr agent list` and reads `.result.agents` (not a bare
+> array). Per-agent, `agent` and `name` are **optional** (absent for
+> `unknown`-status panes) and there is a `revision` integer field. `done` is a
+> documented status but `agent wait --status` only accepts
+> `idle|working|blocked|unknown`. The pane is opened with
+> `herdr plugin pane open --plugin herdr-pets --entrypoint pets`.
+
 **Why CLI-first + a thin raw socket** (decision): the file-viewer plugin proves
 the CLI shell-out pattern is sufficient and highly testable for reads
-(`agent list --json`), which is all the Phase 0 render pane needs. The raw
+(`herdr agent list`), which is all the Phase 0 render pane needs. The raw
 socket is required *only* because Spike A's `layout_apply` has no CLI wrapper. A
 full JSON-over-socket client (event subscription, etc.) is deferred to Phase 1,
 where live updates are actually in scope. This is the least code that answers
@@ -112,7 +122,65 @@ tab that *already has multiple panes*?
    existing panes / rejects the request.
 4. Test the fallback: `herdr pane split --direction down` + `herdr pane move`.
 
-**Finding:** _(to be filled in during implementation)_
+**Finding** _(run 2026-07-23, herdr 0.7.0, live macOS session, isolated scratch tab)_:
+
+**The socket `layout.apply` approach works; the CLI-only fallback does not.**
+Use `layout.apply` for Phase 2 full-width injection.
+
+- **CLI fallback — rejected.** On a multi-pane tab, `herdr pane split --direction
+  down <pane>` splits **only that pane's column** (the new pane spanned just the
+  left half; the right pane stayed full-height), never the full tab width. And
+  `herdr pane move <p> --tab <same-tab> --split down` refuses same-tab moves —
+  it returns `{"changed":false,"reason":"same_tab"}` (that command is for
+  cross-tab / cross-workspace moves). So CLI primitives alone **cannot** produce a
+  full-width bottom strip on a tab that already has multiple panes.
+
+- **Socket `layout.apply` — works.** Wrapping the exported tree in a root
+  `down` split whose `second` child is a new command-pane leaf spawned the pane
+  full-width across the bottom. The applied bottom pane had rect
+  `{x:40, y:62, width:277, height:15}` — full tab width — and immediately ran
+  `herdr-pets render`, showing the live herd.
+
+- **Socket protocol (verified).** The control socket at `$HERDR_SOCKET_PATH`
+  speaks **newline-delimited JSON-RPC**: send one line
+  `{"id":...,"method":...,"params":{...}}\n`, read the reply. Method names use
+  dots (`layout.export`, `layout.apply`, not `layout_export`). An unknown method
+  returns an error whose message **enumerates every valid method** — a cheap way
+  to discover the surface (includes `events.subscribe` / `events.wait`, relevant
+  to Spike B / Phase 1).
+
+- **`layout.export`** — `params:{"tab_id":"<id>"}` → returns a recursive tree:
+  split nodes are `{"type":"split","direction":"right|down","ratio":F,"first":…,"second":…}`;
+  leaf panes are `{"type":"pane","pane_id":"…","cwd":"…"}`.
+
+- **`layout.apply`** — `params:{"tab_id":"<id>","root":{…}}`. Pass **`tab_id`
+  XOR `workspace_id`, never both** (both → `invalid_target`); `root` sits directly
+  in `params` (not nested under a `layout` object). To **spawn a new command
+  pane**, give a leaf with a `command` and **no `pane_id`**:
+  `{"type":"pane","command":["<abs>/target/release/herdr-pets","render"],"cwd":"…"}`.
+  Reference existing panes by `{"type":"pane","pane_id":"…"}`.
+
+  ```jsonc
+  // Full-width bottom command pane, existing tree preserved on top (ratio 0.8):
+  {"id":"…","method":"layout.apply","params":{"tab_id":"w1:tXX","root":{
+    "type":"split","direction":"down","ratio":0.8,
+    "first":  { /* the exported root tree, verbatim */ },
+    "second": {"type":"pane","command":["…/target/release/herdr-pets","render"],"cwd":"…"}
+  }}}
+  ```
+
+- **⚠️ Side effect to design around in Phase 2.** `layout.apply` **rebuilds the
+  tab**: after apply, every pane got a **new `pane_id`** (p21/p22/p23 →
+  p24/p26/p27) and the **`tab_id` itself changed** (`w1:t1R` → `w1:t1S`). So apply
+  is not an in-place edit — it re-materialises the tab's panes. Phase 2 must
+  assume existing panes are re-created (running foreground processes may be
+  disturbed), export→mutate→apply as one atomic step, and re-resolve ids
+  afterwards rather than caching them across an apply.
+
+This **confirms** the strip-per-tab / full-width design in `GOAL.md`; no design
+change required. Recommendation for **Phase 2**: build the injector on
+`layout.export` + `layout.apply` over the raw socket (the `socket.rs` scaffold
+from Task 6), not on `pane split`/`pane move`.
 
 Feeds **Phase 2** (full-width placement).
 
@@ -140,9 +208,9 @@ verified by their written findings, not by assertions.
 - `tests/manifest.rs` — parse `herdr-plugin.toml`; assert required fields
   (`id`, `name`, `version`, `min_herdr_version`, `platforms`) and that the
   `[[panes]]` command path is `./target/release/herdr-pets`.
-- `agent.rs` unit tests — deserialize a captured `herdr agent list --json`
-  fixture into `Vec<Agent>`; assert `AgentStatus` parsing incl. the `Unknown`
-  fallback.
+- `agent.rs` unit tests — deserialize a captured `herdr agent list` fixture
+  (the `{result:{agents:[…]}}` envelope) into `Vec<Agent>`; assert optional
+  `agent`/`name` and `AgentStatus` parsing incl. the `Unknown` fallback.
 - `render` snapshot test — inject a fake `CommandRunner` returning the fixture
   JSON; render into a ratatui `TestBackend` and snapshot (`insta`) the buffer
   showing the placeholder header + one line per agent.
