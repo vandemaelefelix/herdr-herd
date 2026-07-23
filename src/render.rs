@@ -180,6 +180,25 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
     }
 }
 
+/// Draw the hover caption on the strip's bottom row: the hovered pet's label,
+/// or nothing when `label` is `None`. It has its own row so hovering never
+/// shifts the herd; the label is truncated to the strip width.
+pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
+    let Some(label) = label else { return };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let y = area.bottom() - 1;
+    let text: String = label.chars().take(area.width as usize).collect();
+    let w = text.chars().count() as u16;
+    frame.buffer_mut().set_span(
+        area.x,
+        y,
+        &Span::styled(text, Style::default().fg(Color::Gray)),
+        w,
+    );
+}
+
 /// The index of the visible pet drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
 /// Only pets that are actually drawn (the visible set on overflow) are
@@ -425,6 +444,20 @@ mod tests {
             herd.pets[hit].terminal_id, "b",
             "later-pushed same-priority pet draws on top, so it wins the hit"
         );
+    }
+
+    #[test]
+    fn caption_shows_the_hovered_name_on_the_bottom_row() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_herd(f, &herd, &species, Theme::Dark);
+                draw_caption(f, f.area(), Some("backend-api"));
+            })
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend());
     }
 
     #[test]
