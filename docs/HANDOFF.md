@@ -24,12 +24,14 @@ alongside, judgment calls in [`docs/decisions.md`](decisions.md) under
 |---|---|---|---|
 | [#6](https://github.com/vandemaelefelix/herdr-pets/pull/6) | `feat/pets-shorter-strip` | `feat/phase-4-config-polish` | Halve the strip: pet band 12→6 px, strip 7→4 rows; sheep/goat recompressed. |
 | [#7](https://github.com/vandemaelefelix/herdr-pets/pull/7) | `feat/pets-hover-label` | `feat/pets-shorter-strip` | Hover shows the herdr sidebar breadcrumb `workspace › tab`, not `claude` (join `workspace list`/`tab list` in the watcher). |
-| [#8](https://github.com/vandemaelefelix/herdr-pets/pull/8) | `feat/pets-new-sprites` | `feat/pets-hover-label` | New side-view sprites + a reserved icon lane so overlays/`+N` never cover a pet (strip 4→5 rows). Review Artifact: https://claude.ai/code/artifact/fac9781a-d0d5-4d04-b0f1-8aaf7aa92f17 |
+| [#8](https://github.com/vandemaelefelix/herdr-pets/pull/8) | `feat/pets-new-sprites` | `feat/pets-hover-label` | The artifact's **animated** sheep/goat (lying idle, walk-cycle working, standing others) + a reserved icon lane so overlays/`+N` never cover a pet. Pet band given room (`PET_PX_H` 14), so this walks back #6's halving for the band; strip = 9 rows. Review Artifact: https://claude.ai/code/artifact/fac9781a-d0d5-4d04-b0f1-8aaf7aa92f17 |
 | [#9](https://github.com/vandemaelefelix/herdr-pets/pull/9) | `feat/pets-every-tab` | `feat/pets-new-sprites` | Controller injects into every tab with a full-width bottom pane (single-pane **and** top+bottom multi-pane), non-destructively — not just single-pane tabs. |
 
 Current working branch: `feat/pets-every-tab` (tip of the whole stack — contains
-everything). Net user-visible strip: **5 rows** (1 icon lane + 3-px-row pet band
-+ 1 caption); `config.strip_rows` default is now **5**.
+everything). Net user-visible strip: **9 rows** (1 icon lane + 7-px-row pet band
++ 1 caption); `config.strip_rows` default is now **9**. (#6 halved the band to
+3 rows, but #8 gave it room back for the artifact's ~14 px animated poses — an
+explicit maintainer call; the icon lane from #8 stays.)
 
 ## Phase stack (below the improvements)
 

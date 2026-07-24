@@ -29,8 +29,9 @@ use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
 
-/// Height of the sprite draw strip in pixels (3 half-block rows).
-pub const PET_PX_H: usize = 6;
+/// Height of the sprite draw strip in pixels (7 half-block rows) — sized to the
+/// artifact's animated sheep frames, whose standing poses are ~13–14 px tall.
+pub const PET_PX_H: usize = 14;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
