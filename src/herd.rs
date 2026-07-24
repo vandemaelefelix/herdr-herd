@@ -53,8 +53,9 @@ impl Herd {
 
     /// Sync `self.pets` to `agents`, keyed by `terminal_id`: add new pets at
     /// a random x within the walkable strip (`[0, strip_w - pet_w]`, the same
-    /// bound `step` clamps to), update survivors' status (preserving
-    /// position and animation phase), and drop pets whose agent has departed.
+    /// bound `step` clamps to), update survivors' status and `focused` flag
+    /// (preserving position and animation phase), and drop pets whose agent
+    /// has departed.
     pub fn reconcile(
         &mut self,
         agents: &[Agent],
@@ -73,6 +74,7 @@ impl Herd {
             {
                 p.status = a.agent_status;
                 p.label = a.display_label();
+                p.focused = a.focused;
             } else {
                 let x = rng.next_unit() * max_x;
                 let mut pet = Pet::new(
@@ -82,6 +84,7 @@ impl Herd {
                     x,
                 );
                 pet.label = a.display_label();
+                pet.focused = a.focused;
                 self.pets.push(pet);
             }
         }
@@ -279,6 +282,33 @@ mod tests {
         a2.name = Some("frontend".into());
         h.reconcile(&[a2], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "frontend");
+    }
+
+    #[test]
+    fn reconcile_carries_the_focused_flag_onto_new_and_surviving_pets() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        let mut a = agent("a", AgentStatus::Idle);
+        a.focused = true;
+        h.reconcile(&[a], 1, 100.0, 16.0, &mut rng);
+        assert!(
+            h.pets[0].focused,
+            "a fresh pet picks up focused from the agent"
+        );
+
+        // Focus moves to a new agent 'b'; 'a' survives but loses focus.
+        let mut a2 = agent("a", AgentStatus::Idle);
+        a2.focused = false;
+        let mut b = agent("b", AgentStatus::Idle);
+        b.focused = true;
+        h.reconcile(&[a2, b], 1, 100.0, 16.0, &mut rng);
+        let a_pet = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
+        let b_pet = h.pets.iter().find(|p| p.terminal_id == "b").unwrap();
+        assert!(
+            !a_pet.focused,
+            "surviving pet loses focus when it moves elsewhere"
+        );
+        assert!(b_pet.focused, "the newly focused agent's pet is focused");
     }
 
     #[test]

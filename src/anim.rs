@@ -67,9 +67,10 @@ pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
         match m {
             Motion::None | Motion::Wander => {}
             Motion::Breathe => o.dy += -0.5 * (1.0 - t.cos()) / 2.0, // gentle rise/settle, <=0.5
-            // Vertical lift is capped at 1 px so it fits the band's headroom:
-            // sprites are <= PET_PX_H - 1 (14 px of a 15 px band, 1 px headroom);
-            // a bigger jump would clip the top.
+            // Vertical lift is capped at 1 px so it fits the sprite's fixed
+            // 1px headroom (sprites are <= 14 px; the render band reserves
+            // that 1px above them, plus more again for the focus hat) — a
+            // bigger jump would clip the top.
             Motion::Hop => o.dy -= (t.sin()).max(0.0), // lifts on the upbeat
             Motion::Shake => {
                 o.dx += 1.2 * (t * 2.0).sin();

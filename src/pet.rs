@@ -28,11 +28,16 @@ pub struct Pet {
     pub target_x: f32,
     pub phase: f32,
     pub facing_left: bool,
+    /// Mirrors `Agent::focused`: this pet's owning agent is the current one,
+    /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
+    /// derived here — `Pet` has no access to the agent snapshot.
+    pub focused: bool,
 }
 
 impl Pet {
     /// Build a pet at rest at `x` (so `target_x` starts equal to `x`) with
-    /// its animation phase at the start of the cycle.
+    /// its animation phase at the start of the cycle, unfocused until
+    /// `Herd::reconcile` says otherwise.
     pub fn new(terminal_id: String, identity: Identity, status: AgentStatus, x: f32) -> Self {
         Self {
             terminal_id,
@@ -43,6 +48,7 @@ impl Pet {
             target_x: x,
             phase: 0.0,
             facing_left: false,
+            focused: false,
         }
     }
 
@@ -92,6 +98,14 @@ mod tests {
 
     fn pet(status: AgentStatus) -> Pet {
         Pet::new("term_x".into(), identity_for("term_x", 3), status, 0.0)
+    }
+
+    #[test]
+    fn new_pet_starts_unfocused() {
+        assert!(
+            !pet(AgentStatus::Idle).focused,
+            "focus is only granted by Herd::reconcile, never by default"
+        );
     }
 
     #[test]

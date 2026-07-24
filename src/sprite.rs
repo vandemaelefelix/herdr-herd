@@ -355,8 +355,8 @@ mod tests {
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
                 assert!(
                     h <= 14,
-                    "{} must be <= 14 px (1 px shorter than the 15 px band) so \
-                     the hop/shake lift never clips",
+                    "{} must be <= 14 px so the render band's reserved 1px \
+                     headroom keeps the hop/shake lift from clipping",
                     sp.name
                 );
                 assert_eq!(

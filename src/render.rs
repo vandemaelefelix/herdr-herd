@@ -27,11 +27,24 @@ use crate::herd::{Herd, Lcg, visible_and_hidden};
 use crate::herdr::HerdrCli;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
-use crate::sprite::Species;
+use crate::sprite::{Frame as SpriteFrame, Role, Species};
+
+/// Rows the focus hat occupies above a pet's head, plus the 1px hop/shake
+/// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
+const HAT_H: usize = 3;
+/// Columns the focus hat occupies, centered over the head anchor.
+const HAT_W: usize = 5;
+/// The hat's pixel grid, top row first: `.` transparent, `#` outline, `r` red
+/// fill. Symmetric, so facing flip never needs to mirror it.
+const HAT_ROWS: [&str; HAT_H] = ["..#..", ".#r#.", "#rrr#"];
+const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
+const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
 
 /// Height of the pet band in pixels. Sprites are 16x14 (see sprites/*.sprite);
-/// the band is the sprite height plus 1px of headroom for the hop/shake lift.
-pub const PET_PX_H: usize = 15;
+/// the band is the sprite height, plus 1px of headroom for the hop/shake
+/// lift, plus [`HAT_H`] rows so the focus hat has room above even the tallest
+/// (standing) pose without clipping.
+pub const PET_PX_H: usize = 15 + HAT_H;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
@@ -60,6 +73,55 @@ impl PixelBuf {
 
 fn to_color(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
+}
+
+/// The (row, drawn-column) of `fr`'s topmost non-transparent pixel, scanned in
+/// already-flipped drawn-space (`flip` mirrors which source column each drawn
+/// column samples, matching the body blit below). This anchors the focus hat
+/// above the head — or, for the idle "dozing" pose with no distinct head,
+/// above the topmost point of the lying-down lump — without any per-species
+/// or per-state table: whichever pixel is highest just is the head. Falls
+/// back to top-center for a fully transparent frame (never hit by real
+/// sprites, all of which paint something).
+fn head_anchor(fr: &SpriteFrame, flip: bool) -> (usize, usize) {
+    for y in 0..fr.h {
+        let mut lo = None;
+        let mut hi = None;
+        for x in 0..fr.w {
+            let sx = if flip { fr.w - 1 - x } else { x };
+            if fr.cells[y * fr.w + sx] != Role::Transparent {
+                lo.get_or_insert(x);
+                hi = Some(x);
+            }
+        }
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            return (y, (lo + hi) / 2);
+        }
+    }
+    (0, fr.w / 2)
+}
+
+/// Blit the focus hat into `buf` above the head anchor `(head_row, head_col)`,
+/// at body-blit offset `(ox, oy)` — the same offset the sprite body was drawn
+/// at, so the hat inherits the identical motion offset, bottom-anchor, and
+/// facing-flip transform and never detaches from the head. `head_row` is in
+/// the sprite's own local coordinates (pre-offset); `head_col` is already in
+/// drawn (post-flip) space, so the hat is not flipped again.
+fn draw_hat(buf: &mut PixelBuf, ox: i32, oy: i32, head_row: usize, head_col: usize) {
+    let top = oy + head_row as i32 - HAT_H as i32;
+    let left = ox + head_col as i32 - (HAT_W / 2) as i32;
+    for (y, row) in HAT_ROWS.iter().enumerate() {
+        for (x, ch) in row.chars().enumerate() {
+            let color = match ch {
+                '#' => Some(HAT_OUTLINE),
+                'r' => Some(HAT_FILL),
+                _ => None,
+            };
+            if let Some(c) = color {
+                buf.set(left + x as i32, top + y as i32, c);
+            }
+        }
+    }
 }
 
 /// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
@@ -91,21 +153,28 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     }
 }
 
-/// Draw the whole strip: visible pets in priority z-order (blocked draws
-/// last, i.e. on top), their overlays (bubbles/badges), and a `+N` marker for
-/// any pets the strip has no room for. Overlays and `+N` live in a reserved top
-/// lane (row 0); the pet band is drawn below it, so an icon never covers a pet.
-pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
-    let area = frame.area();
-    let strip_w = area.width as usize;
+/// Blit every visible pet's body — and, for the focused pet, its focus hat —
+/// into a fresh pixel buffer, in priority z-order (blocked draws last, i.e. on
+/// top). The hat is composited into the same buffer right after its pet's
+/// body, at the same offset, so it shares the body's full transform (motion
+/// offset, bottom-anchor, facing flip) and never detaches during motion.
+/// Returns the buffer plus the visible set's z-order (draw order, lowest
+/// priority first) so the caller can reuse it for overlays without
+/// recomputing the visible/capacity selection.
+fn build_band(
+    herd: &Herd,
+    species: &[Species],
+    strip_w: usize,
+    theme: Theme,
+) -> (PixelBuf, Vec<usize>) {
     let mut buf = PixelBuf::new(strip_w, PET_PX_H);
 
     let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
     let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
-    let (visible, hidden) = visible_and_hidden(&herd.pets, capacity);
+    let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
 
     // z-order: lowest priority first so blocked draws last (on top).
-    let mut order = visible.clone();
+    let mut order = visible;
     order.sort_by_key(|&i| priority(herd.pets[i].status));
 
     for &i in &order {
@@ -140,7 +209,27 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
                 }
             }
         }
+        if pet.focused {
+            let (head_row, head_col) = head_anchor(fr, pet.facing_left);
+            draw_hat(&mut buf, ox, oy, head_row, head_col);
+        }
     }
+    (buf, order)
+}
+
+/// Draw the whole strip: visible pets in priority z-order (blocked draws
+/// last, i.e. on top), their overlays (bubbles/badges), and a `+N` marker for
+/// any pets the strip has no room for. Overlays and `+N` live in a reserved top
+/// lane (row 0); the pet band is drawn below it, so an icon never covers a pet.
+pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
+    let area = frame.area();
+    let strip_w = area.width as usize;
+    let (buf, order) = build_band(herd, species, strip_w, theme);
+
+    let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
+    let (_visible, hidden) = visible_and_hidden(&herd.pets, capacity);
+
     // Bottom-align the whole strip so it reads as a slim status line whatever
     // the pane's height (herdr enforces a minimum pane height, so the pane can be
     // taller than the content needs): the caption is the bottom row, the pet band
@@ -155,7 +244,10 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
         x: area.x,
         y: band_top,
         width: area.width,
-        height: band_rows,
+        // Clamped so a pane shorter than the band (below herdr's enforced
+        // minimum) crops the top of the pets instead of handing
+        // `draw_pixels` a Rect that overruns the real frame buffer.
+        height: band_rows.min(area.height.saturating_sub(band_top)),
     };
     draw_pixels(frame, pet_area, &buf);
 
@@ -544,6 +636,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_a_hat_above_the_focused_pet_and_nothing_above_the_rest() {
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        let agents: Vec<_> = [Working, Idle]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut a = agent(&format!("t{i}"), *s);
+                a.focused = i == 0; // only the first pet is focused
+                a
+            })
+            .collect();
+        h.reconcile(&agents, 1, 120.0, 16.0, &mut rng);
+        for (i, p) in h.pets.iter_mut().enumerate() {
+            p.x = 4.0 + i as f32 * 16.0;
+            p.target_x = p.x;
+            p.phase = 0.0;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &h, &species, Theme::Dark))
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
     fn renders_overflow_counter() {
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
@@ -809,17 +929,201 @@ mod tests {
     fn half_block_renderer_matches_the_free_function() {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
-        let mut via_trait = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut via_trait = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_trait
             .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark))
             .unwrap();
-        let mut via_fn = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut via_fn = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_fn
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();
         assert_eq!(
             format!("{}", via_trait.backend()),
             format!("{}", via_fn.backend())
+        );
+    }
+
+    #[test]
+    fn draw_herd_does_not_panic_in_a_pane_shorter_than_the_band() {
+        // Growing PET_PX_H for the focus hat also grew the band's minimum
+        // height; a pane too short to fit it must crop gracefully instead of
+        // handing draw_pixels a Rect that overruns the real frame buffer.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
+    }
+
+    /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should
+    /// land in the buffer when the hat is drawn with no clipping at all.
+    const HAT_PIXEL_COUNT: usize = 9;
+
+    fn count_hat_pixels(buf: &PixelBuf) -> usize {
+        buf.px
+            .iter()
+            .filter(|p| matches!(p, Some(c) if *c == HAT_OUTLINE || *c == HAT_FILL))
+            .count()
+    }
+
+    #[test]
+    fn build_band_draws_a_hat_only_for_the_focused_pet() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        let mut focused = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Idle, 10.0);
+        focused.focused = true;
+        herd.pets.push(focused);
+        herd.pets.push(Pet::new(
+            "unfocused".into(),
+            identity_for("unfocused", 1),
+            AgentStatus::Idle,
+            30.0,
+        ));
+        let (buf, _order) = build_band(&herd, &species, 50, Theme::Dark);
+        assert_eq!(
+            count_hat_pixels(&buf),
+            HAT_PIXEL_COUNT,
+            "exactly one hat is drawn, for the focused pet"
+        );
+    }
+
+    #[test]
+    fn hat_is_never_clipped_at_the_top_even_when_the_sprite_has_no_headroom_row() {
+        // TestBlob's working frame paints all the way up to row 0 (`MM..`),
+        // the worst case for top clipping: no spare row inside the frame
+        // itself. Freeze the phase at the peak of the hop lift (phase=0.25 =>
+        // dy=-1, the maximum), which pushes the sprite as high as it goes.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working, 10.0);
+        pet.focused = true;
+        pet.phase = 0.25;
+        herd.pets.push(pet);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        assert_eq!(
+            count_hat_pixels(&buf),
+            HAT_PIXEL_COUNT,
+            "every hat pixel survives — none fell off the top of the band"
+        );
+    }
+
+    #[test]
+    fn hat_is_never_clipped_on_the_real_sheep_standing_pose_mid_shake() {
+        // The acceptance criterion's tight case: the real (16x14) standing
+        // pose, which has only ~1 empty row above the head, with the shake
+        // motion at its peak lift (phase=0.125 => dy=-1, the maximum).
+        let species = crate::sprite::embedded_species();
+        let sheep_index = species
+            .iter()
+            .position(|s| s.name == "Sheep")
+            .expect("Sheep is embedded");
+        let mut herd = Herd::new();
+        let mut pet = Pet::new(
+            "f".into(),
+            crate::identity::Identity {
+                species_index: sheep_index,
+                hue: 0,
+            },
+            AgentStatus::Blocked,
+            5.0,
+        );
+        pet.focused = true;
+        pet.phase = 0.125;
+        herd.pets.push(pet);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        assert_eq!(
+            count_hat_pixels(&buf),
+            HAT_PIXEL_COUNT,
+            "the hat fits above the standing pose's head even mid-shake"
+        );
+    }
+
+    #[test]
+    fn hat_renders_on_top_of_the_idle_dozing_lump() {
+        let species = crate::sprite::embedded_species();
+        let sheep_index = species.iter().position(|s| s.name == "Sheep").unwrap();
+        let mut herd = Herd::new();
+        let mut pet = Pet::new(
+            "f".into(),
+            crate::identity::Identity {
+                species_index: sheep_index,
+                hue: 0,
+            },
+            AgentStatus::Idle,
+            5.0,
+        );
+        pet.focused = true;
+        herd.pets.push(pet);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        assert_eq!(
+            count_hat_pixels(&buf),
+            HAT_PIXEL_COUNT,
+            "the hat renders above the dozing lump, not clipped or hidden"
+        );
+    }
+
+    #[test]
+    fn hat_never_clips_on_the_goat_despite_its_taller_horned_silhouette() {
+        // The goat's horns sit a row above the sheep's head, so its head
+        // anchor is one row higher — the generic topmost-opaque-pixel scan
+        // must pick that up on its own, with no per-species table, and the
+        // reserved headroom must still cover it.
+        let species = crate::sprite::embedded_species();
+        let goat_index = species
+            .iter()
+            .position(|s| s.name == "Goat")
+            .expect("Goat is embedded");
+        let mut herd = Herd::new();
+        let mut pet = Pet::new(
+            "f".into(),
+            crate::identity::Identity {
+                species_index: goat_index,
+                hue: 0,
+            },
+            AgentStatus::Blocked,
+            5.0,
+        );
+        pet.focused = true;
+        pet.phase = 0.125; // peak shake lift, same tight case as the sheep test
+        herd.pets.push(pet);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        assert_eq!(
+            count_hat_pixels(&buf),
+            HAT_PIXEL_COUNT,
+            "the hat fits above the goat's horns even mid-shake"
+        );
+    }
+
+    #[test]
+    fn hat_position_flips_with_facing() {
+        // TestBlob's working frame is asymmetric (`MM../MMM./M##./.MM.`), so a
+        // facing flip moves the head anchor's column, which must move the
+        // hat with it.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let render_at = |facing_left: bool| {
+            let mut herd = Herd::new();
+            let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working, 10.0);
+            pet.focused = true;
+            pet.facing_left = facing_left;
+            herd.pets.push(pet);
+            build_band(&herd, &species, 40, Theme::Dark).0
+        };
+        let right = render_at(false);
+        let left = render_at(true);
+        let leftmost_hat_col = |buf: &PixelBuf| {
+            (0..buf.w)
+                .find(|&x| {
+                    (0..buf.h).any(|y| {
+                        matches!(buf.px[y * buf.w + x], Some(c) if c == HAT_OUTLINE || c == HAT_FILL)
+                    })
+                })
+                .expect("a hat was drawn")
+        };
+        assert_ne!(
+            leftmost_hat_col(&right),
+            leftmost_hat_col(&left),
+            "facing flip must move the hat, not just the body"
         );
     }
 }
