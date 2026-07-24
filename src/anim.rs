@@ -67,10 +67,12 @@ pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
         match m {
             Motion::None | Motion::Wander => {}
             Motion::Breathe => o.dy += -0.5 * (1.0 - t.cos()) / 2.0, // gentle rise/settle, <=0.5
-            Motion::Hop => o.dy += -2.0 * (t.sin()).max(0.0),        // lifts on the upbeat
+            // Vertical lift is capped at 1 px so it fits the band's headroom
+            // (sprites are <= PET_PX_H - 1); a bigger jump would clip the top.
+            Motion::Hop => o.dy -= (t.sin()).max(0.0), // lifts on the upbeat
             Motion::Shake => {
                 o.dx += 1.2 * (t * 2.0).sin();
-                o.dy += -1.5 * (t * 2.0).sin().abs();
+                o.dy -= (t * 2.0).sin().abs();
             }
             Motion::Sway => o.dx += 1.0 * t.sin(),
         }
