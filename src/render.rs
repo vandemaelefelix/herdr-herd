@@ -142,13 +142,21 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             }
         }
     }
-    // The pet band sits below a reserved top lane (row 0, for overlays/`+N`) and
-    // above the bottom caption row, so an icon can never cover a pet pixel.
+    // Bottom-align the whole strip so it reads as a slim status line whatever
+    // the pane's height (herdr enforces a minimum pane height, so the pane can be
+    // taller than the content needs): the caption is the bottom row, the pet band
+    // sits just above it, and the icon lane sits just above the band. Any extra
+    // rows fall at the top, blending with the pane above. The icon lane keeps
+    // overlays/`+N` off the pet.
+    let band_rows = PET_PX_H.div_ceil(2) as u16;
+    let caption_row = area.bottom().saturating_sub(1);
+    let band_top = caption_row.saturating_sub(band_rows);
+    let lane_y = band_top.saturating_sub(1);
     let pet_area = Rect {
         x: area.x,
-        y: area.y.saturating_add(1),
+        y: band_top,
         width: area.width,
-        height: area.height.saturating_sub(2),
+        height: band_rows,
     };
     draw_pixels(frame, pet_area, &buf);
 
@@ -180,7 +188,7 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
                 .min(area.width.saturating_sub(glyph.chars().count() as u16));
         frame.buffer_mut().set_span(
             cx,
-            area.y,
+            lane_y,
             &Span::styled(glyph, Style::default().fg(color)),
             area.width,
         );
@@ -190,10 +198,10 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
         let label = format!("+{hidden}");
         let label_w = label.len() as u16;
         let x = area.right().saturating_sub(label_w + 1);
-        // In the reserved top lane (row 0), right-aligned — never over a pet.
+        // In the reserved icon lane (just above the band), right-aligned.
         frame.buffer_mut().set_span(
             x,
-            area.y,
+            lane_y,
             &Span::styled(label, Style::default().fg(Color::DarkGray)),
             label_w,
         );

@@ -1,11 +1,11 @@
 ---
 source: src/render.rs
-assertion_line: 466
+assertion_line: 474
 expression: terminal.backend()
 ---
+"                                        "
 "       Zz              Zz            +7z"
 "                                        "
 "    ▄▀▀▄            ▄▀▀▄            ▄▀▀▄"
 "    ▀▀▀▀            ▀▀▀▀            ▀▀▀▀"
-"                                        "
 "                                        "
