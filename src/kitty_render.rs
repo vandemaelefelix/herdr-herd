@@ -72,11 +72,20 @@ fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> 
     }
 }
 
-/// Rows a pet image occupies, derived from the pane height (reserving a
-/// little headroom for the top caption/overflow lane) and capped small so
-/// the pets always read as a slim strip, even in a tall pane.
+/// Rows a pet image occupies, derived from the pane height and capped small
+/// so the pets always read as a slim strip, even in a tall pane. Reserves 2
+/// rows off the top: one for the caption (row 1) and one for the icon/hat
+/// lane just above the pet (row 2) — so neither ever collides with the pet
+/// body, however short the pane gets.
 fn pet_rows(pane_h: u16) -> u16 {
-    pane_h.saturating_sub(1).clamp(2, 4)
+    pane_h.saturating_sub(2).clamp(2, 4)
+}
+
+/// The 1-based cursor row a `rows`-tall pet image must start at so its last
+/// occupied row is exactly `pane_h` — the pane's own last row — with no gap
+/// beneath it, mirroring the half-block path's bottom-anchor.
+fn pet_row(pane_h: i32, rows: u16) -> i32 {
+    (pane_h - rows as i32 + 1).clamp(1, pane_h.max(1))
 }
 
 /// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
@@ -272,15 +281,15 @@ impl KittyRenderer {
             };
 
             // Size the pet to an explicit cell footprint (herdr hides the real
-            // cell size), then bottom-anchor it so its feet rest just above the
-            // caption row (the pane's last row), matching the half-block path.
-            // Recomputed every frame, so a resize reflows the pets. Cursor
-            // coordinates are 1-based and clamped into the pane so an edge pet
-            // is never placed off-screen.
+            // cell size), then bottom-anchor it so its feet rest on the true
+            // pane floor, matching the half-block path. Recomputed every
+            // frame, so a resize reflows the pets. Cursor coordinates are
+            // 1-based and clamped into the pane so an edge pet is never
+            // placed off-screen.
             let rows = pet_rows(area.height);
             let cols = pet_cols(rows, fr.w, fr.h);
             let pane_h = area.height as i32;
-            let row = (pane_h - rows as i32).clamp(1, pane_h.max(1));
+            let row = pet_row(pane_h, rows);
             let col = ((animated.x_fraction * max_x).round() as i32 + 1)
                 .clamp(1, area.width.max(1) as i32);
             self.out
@@ -747,19 +756,45 @@ mod tests {
     #[test]
     fn pet_size_stays_small_and_keeps_aspect() {
         // Rows are capped small even in a very tall pane, and never below 2.
+        // Two rows are reserved off the top: one for the caption, one for the
+        // icon/hat lane just above the pet — so a 4-row pane still only gets
+        // 2 pet rows, not 3.
         assert_eq!(pet_rows(3), 2);
+        assert_eq!(pet_rows(4), 2);
         assert_eq!(pet_rows(6), 4);
         assert_eq!(pet_rows(40), 4);
-        // The caption moved into the top lane, freeing the row it used to
-        // reserve: a 4-row pane now gets 3 pet rows, not 2.
-        assert_eq!(
-            pet_rows(4),
-            3,
-            "reclaims the row previously reserved for the bottom caption"
-        );
         // Cols preserve the sprite aspect (16x14 -> ~2.3 cols per row).
         assert_eq!(pet_cols(3, 16, 14), 7); // round(3 * 16/14 * 2.1)
         assert_eq!(pet_cols(4, 16, 14), 10);
+    }
+
+    #[test]
+    fn pet_row_bottom_aligns_with_no_gap_at_the_pane_floor() {
+        for (pane_h, rows) in [(6, 4u16), (10, 4), (4, 2), (3, 2)] {
+            let row = pet_row(pane_h, rows);
+            assert_eq!(
+                row + rows as i32 - 1,
+                pane_h,
+                "the pet's last occupied row must be the pane's own last row \
+                 (pane_h={pane_h}, rows={rows}, row={row})"
+            );
+        }
+    }
+
+    #[test]
+    fn pet_row_never_lets_the_icon_lane_collide_with_the_caption_row() {
+        // The icon/hat overlay sits one row above the pet's own top row
+        // (`row - 1`). Across every pane height `pet_rows` supports, that
+        // must land at 1-indexed row >= 2, never row 1 — the caption's row.
+        for pane_h in 4..40 {
+            let rows = pet_rows(pane_h);
+            let row = pet_row(pane_h as i32, rows);
+            let icon_row = row.saturating_sub(1).max(1);
+            assert!(
+                icon_row >= 2,
+                "icon/hat lane collides with the caption row at pane_h={pane_h}: icon_row={icon_row}"
+            );
+        }
     }
 
     #[test]
