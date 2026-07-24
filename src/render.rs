@@ -33,11 +33,13 @@ use crate::sprite::{Frame as SpriteFrame, Role, Species};
 /// Rows the focus hat occupies above a pet's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
 pub(crate) const HAT_H: usize = 3;
-/// Columns the focus hat occupies, centered over the head anchor.
-pub(crate) const HAT_W: usize = 5;
+/// Columns the focus hat occupies, centered over the head anchor. Wider than
+/// the hat's own crown to leave room for the brim.
+pub(crate) const HAT_W: usize = 7;
 /// The hat's pixel grid, top row first: `.` transparent, `#` outline, `r` red
-/// fill. Symmetric, so facing flip never needs to mirror it.
-const HAT_ROWS: [&str; HAT_H] = ["..#..", ".#r#.", "#rrr#"];
+/// fill. A simple fedora — a rounded crown over a flat, full-width brim.
+/// Symmetric, so facing flip never needs to mirror it.
+const HAT_ROWS: [&str; HAT_H] = ["..#r#..", ".#rrr#.", "#rrrrr#"];
 const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
 const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
 
@@ -138,8 +140,8 @@ fn draw_hat(buf: &mut PixelBuf, ox: i32, oy: i32, head_row: usize, head_col: usi
 
 /// Rasterize the focus hat to RGBA at `scale` px per hat-pixel, padded by
 /// `pad` hat-pixels of transparent margin on every side — mirrors
-/// `raster::pad_frame` + `raster::rasterize`, but for the fixed 5x3 hat
-/// bitmap rather than a per-species sprite `Frame`. Used by the kitty
+/// `raster::pad_frame` + `raster::rasterize`, but for the fixed [`HAT_W`]x
+/// [`HAT_H`] hat bitmap rather than a per-species sprite `Frame`. Used by the kitty
 /// backend so the hat can be transmitted once and panned by motion offset
 /// like the body (`kitty_render::crop_rect`), the same trick `icon::
 /// rasterize_icon` uses for overlay icons.
@@ -1131,7 +1133,7 @@ mod tests {
 
     /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should
     /// land in the buffer when the hat is drawn with no clipping at all.
-    const HAT_PIXEL_COUNT: usize = 9;
+    const HAT_PIXEL_COUNT: usize = 15;
 
     fn count_hat_pixels(buf: &PixelBuf) -> usize {
         buf.px
@@ -1165,7 +1167,16 @@ mod tests {
     fn build_band_draws_a_hat_only_for_the_focused_pet() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        let mut focused = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Idle);
+        // "wearer"'s hash-derived rest position sits safely away from either
+        // edge (unlike e.g. "f", which happens to rest flush against the
+        // right edge and would clip the hat there) — this test is about
+        // focused-vs-unfocused, not edge clipping (see the dedicated
+        // clipping tests below).
+        let mut focused = Pet::new(
+            "wearer".into(),
+            identity_for("wearer", 1),
+            AgentStatus::Idle,
+        );
         focused.focused = true;
         herd.pets.push(focused);
         herd.pets.push(Pet::new(
