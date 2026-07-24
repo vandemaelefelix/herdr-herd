@@ -27,6 +27,7 @@ pub struct Pet {
     pub x: f32,
     pub target_x: f32,
     pub phase: f32,
+    pub facing_left: bool,
 }
 
 impl Pet {
@@ -41,6 +42,7 @@ impl Pet {
             x,
             target_x: x,
             phase: 0.0,
+            facing_left: false,
         }
     }
 
@@ -69,6 +71,16 @@ impl Pet {
         // advance proportionally and wrap.
         let cycle_ms = frame_ms as f32 * 2.0; // 2-frame default cadence
         self.phase = (self.phase + dt_ms / cycle_ms).rem_euclid(1.0);
+    }
+
+    /// Update facing from a horizontal delta; zero delta keeps the last facing
+    /// so a pet that stops does not snap back to a default direction.
+    pub fn set_facing_from_dx(&mut self, dx: f32) {
+        if dx > 0.0 {
+            self.facing_left = false;
+        } else if dx < 0.0 {
+            self.facing_left = true;
+        }
     }
 }
 
@@ -113,5 +125,20 @@ mod tests {
         p.phase = 0.7; // start non-zero
         p.advance(1000.0, 0); // frame_ms == 0 => static
         assert_eq!(p.phase, 0.0); // proves it was pinned, not left at 0.7
+    }
+
+    #[test]
+    fn facing_tracks_last_nonzero_direction() {
+        let mut p = pet(AgentStatus::Working);
+        assert!(
+            !p.facing_left,
+            "defaults to facing right (sprite art faces right)"
+        );
+        p.set_facing_from_dx(-2.0);
+        assert!(p.facing_left, "moving left faces left");
+        p.set_facing_from_dx(0.0);
+        assert!(p.facing_left, "no movement keeps the last facing");
+        p.set_facing_from_dx(3.0);
+        assert!(!p.facing_left, "moving right faces right");
     }
 }

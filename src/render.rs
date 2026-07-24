@@ -133,7 +133,8 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
         let oy = floor + off.dy.round() as i32;
         for y in 0..fr.h {
             for x in 0..fr.w {
-                if let Some(c) = role_color(fr.cells[y * fr.w + x], pet.identity.hue, theme, style)
+                let sx = if pet.facing_left { fr.w - 1 - x } else { x };
+                if let Some(c) = role_color(fr.cells[y * fr.w + sx], pet.identity.hue, theme, style)
                 {
                     buf.set(ox + x as i32, oy + y as i32, c);
                 }
@@ -667,6 +668,28 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+    }
+
+    #[test]
+    fn left_facing_pet_is_mirrored() {
+        // Build a herd with one working pet, force facing_left, freeze it, and
+        // assert the rendered band differs from the same pet facing right.
+        use crate::agent::AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut right = fixed_herd(&[Working]);
+        right.pets[0].facing_left = false;
+        let mut left = fixed_herd(&[Working]);
+        left.pets[0].facing_left = true;
+        let render = |h: &Herd| {
+            let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            t.draw(|f| draw_herd(f, h, &species, Theme::Dark)).unwrap();
+            format!("{}", t.backend())
+        };
+        assert_ne!(
+            render(&right),
+            render(&left),
+            "mirroring must change the pixels"
+        );
     }
 
     #[test]

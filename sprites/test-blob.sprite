@@ -12,9 +12,9 @@ M##M
 .MM.
 
 [working] frame_ms=140 motion=hop+wander overlay=none
-.MM.
-MMMM
-MMMM
+MM..
+MMM.
+M##.
 .MM.
 
 [done]    frame_ms=900 motion=hop overlay=badge:! color=accent

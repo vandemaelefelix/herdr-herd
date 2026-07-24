@@ -111,7 +111,9 @@ impl Herd {
                 p.target_x = rng.next_unit() * max_x;
             }
             let dx = p.target_x - p.x;
-            p.x += dx.signum() * dx.abs().min(speed * dt);
+            let applied = dx.signum() * dx.abs().min(speed * dt);
+            p.x += applied;
+            p.set_facing_from_dx(applied);
         }
         // Pairwise separation only nudges working pets — a non-working pet's
         // x must stay exactly at its pre-step value, so it neither pushes
