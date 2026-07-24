@@ -52,15 +52,18 @@ impl Herd {
     }
 
     /// Sync `self.pets` to `agents`, keyed by `terminal_id`: add new pets at
-    /// a random x, update survivors' status (preserving position and
-    /// animation phase), and drop pets whose agent has departed.
+    /// a random x within the walkable strip (`[0, strip_w - pet_w]`, the same
+    /// bound `step` clamps to), update survivors' status (preserving
+    /// position and animation phase), and drop pets whose agent has departed.
     pub fn reconcile(
         &mut self,
         agents: &[Agent],
         species_count: usize,
         strip_w: f32,
+        pet_w: f32,
         rng: &mut dyn Rng,
     ) {
+        let max_x = (strip_w - pet_w).max(0.0);
         // Update survivors / add new.
         for a in agents {
             if let Some(p) = self
@@ -71,7 +74,7 @@ impl Herd {
                 p.status = a.agent_status;
                 p.label = a.display_label();
             } else {
-                let x = rng.next_unit() * strip_w.max(1.0);
+                let x = rng.next_unit() * max_x;
                 let mut pet = Pet::new(
                     a.terminal_id.clone(),
                     identity_for(&a.terminal_id, species_count),
@@ -87,9 +90,11 @@ impl Herd {
             .retain(|p| agents.iter().any(|a| a.terminal_id == p.terminal_id));
     }
 
-    /// Advance the roam simulation by `dt_ms`: pick new wander targets by
-    /// status, ease toward them, apply pairwise separation, and clamp every
-    /// pet to `[0, strip_w - pet_w]`.
+    /// Advance the roam simulation by `dt_ms`: working pets pick new wander
+    /// targets, ease toward them, and separate from other working pets;
+    /// non-working pets hold their `x` exactly. Every pet — working or not —
+    /// is then clamped to `[0, strip_w - pet_w]`, so a pane resize (or any
+    /// pet placed outside that range) can't leave one stuck off-screen.
     pub fn step(&mut self, dt_ms: f32, strip_w: f32, pet_w: f32, rng: &mut dyn Rng) {
         let dt = dt_ms / 1000.0;
         let max_x = (strip_w - pet_w).max(0.0);
@@ -128,13 +133,13 @@ impl Herd {
                 }
             }
         }
-        // Likewise, only clamp pets that can actually move: a stationary
-        // pet's x is untouched even if `reconcile` placed it outside
-        // `[0, max_x]` (bounds only matter once something is roaming).
+        // Unconditional: every pet is clamped to the walkable strip, working
+        // or not. `reconcile` already bounds spawns to `[0, max_x]`, so this
+        // is normally a no-op for non-working pets — it only bites if the
+        // strip shrinks (pane resize) out from under a pet that isn't
+        // actively roaming to correct itself.
         for p in &mut self.pets {
-            if p.status == crate::agent::AgentStatus::Working {
-                p.x = p.x.clamp(0.0, max_x);
-            }
+            p.x = p.x.clamp(0.0, max_x);
         }
     }
 }
@@ -189,6 +194,7 @@ mod tests {
             ],
             2,
             200.0,
+            16.0,
             &mut rng,
         );
         assert_eq!(h.pets.len(), 2);
@@ -202,6 +208,7 @@ mod tests {
             ],
             2,
             200.0,
+            16.0,
             &mut rng,
         );
         let a = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
@@ -221,6 +228,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             2,
             100.0,
+            20.0,
             &mut rng,
         );
         for _ in 0..200 {
@@ -243,6 +251,7 @@ mod tests {
             ],
             1,
             200.0,
+            16.0,
             &mut rng,
         );
         let before: Vec<f32> = h.pets.iter().map(|p| p.x).collect();
@@ -260,13 +269,13 @@ mod tests {
         let mut rng = Lcg::new(1);
         let mut a = agent("a", AgentStatus::Idle);
         a.name = Some("backend".into());
-        h.reconcile(&[a], 1, 100.0, &mut rng);
+        h.reconcile(&[a], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "backend");
 
         // A survivor renamed mid-session picks up the new label.
         let mut a2 = agent("a", AgentStatus::Idle);
         a2.name = Some("frontend".into());
-        h.reconcile(&[a2], 1, 100.0, &mut rng);
+        h.reconcile(&[a2], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "frontend");
     }
 
@@ -277,13 +286,13 @@ mod tests {
         // A fresh pet takes the resolved breadcrumb, not the legacy "claude".
         let mut a = agent("a", AgentStatus::Working);
         a.hover_label = Some("herdr-pets › renderer".into());
-        h.reconcile(&[a], 1, 100.0, &mut rng);
+        h.reconcile(&[a], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "herdr-pets › renderer");
 
         // A survivor whose breadcrumb changes (moved tab) picks up the new one.
         let mut a2 = agent("a", AgentStatus::Working);
         a2.hover_label = Some("herdr-pets › tests".into());
-        h.reconcile(&[a2], 1, 100.0, &mut rng);
+        h.reconcile(&[a2], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "herdr-pets › tests");
     }
 

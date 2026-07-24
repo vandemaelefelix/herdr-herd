@@ -338,6 +338,9 @@ where
 {
     let tick = Duration::from_millis(83); // ~12 fps
     let species_count = species.len().max(1);
+    // Same pet_w feeds both reconcile's spawn bound and step's clamp bound,
+    // so a freshly-spawned pet never lands outside the walkable strip.
+    let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
     let mut herd = Herd::new();
     let mut rng = Lcg::new(0xC0FFEE);
     let mut last = Instant::now();
@@ -345,13 +348,12 @@ where
     loop {
         while let Ok(agents) = rx.try_recv() {
             let w = terminal.size()?.width as f32;
-            herd.reconcile(&agents, species_count, w, &mut rng);
+            herd.reconcile(&agents, species_count, w, pet_w, &mut rng);
         }
         let now = Instant::now();
         let dt_ms = (now - last).as_millis() as f32;
         last = now;
         let w = terminal.size()?.width as f32;
-        let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
         simulate_tick(
             &mut herd,
             species,
@@ -438,7 +440,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| agent(&format!("t{i}"), *s))
             .collect();
-        h.reconcile(&agents, 1, 120.0, &mut rng);
+        h.reconcile(&agents, 1, 120.0, 16.0, &mut rng);
         // Freeze positions + phase for a deterministic snapshot.
         for (i, p) in h.pets.iter_mut().enumerate() {
             p.x = 4.0 + i as f32 * 16.0;
@@ -484,6 +486,7 @@ mod tests {
             &[agent("a", Working), agent("b", Blocked)],
             1,
             60.0,
+            16.0,
             &mut rng,
         );
         for (i, p) in herd.pets.iter_mut().enumerate() {
