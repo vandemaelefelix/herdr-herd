@@ -205,7 +205,7 @@ fn build_band(
         let Some(state) = sp.states.get(&pet.status) else {
             continue;
         };
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
         let fr = &state.frames[animated.frame_index];
         let style = StateStyle {
             dim: state.dim,
@@ -297,7 +297,7 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
             OverlayColor::Default => Color::Gray,
         };
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
         let cx = area.x
             + ((animated.x_fraction * max_x).round() as u16)
                 .saturating_add(3)
@@ -376,7 +376,7 @@ pub fn pet_at_column(
             continue;
         };
         let w = sp.size().0 as i32;
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
         let left = (animated.x_fraction * max_x).round() as i32;
         if x >= left && x < left + w {
             let take = match best {
@@ -553,22 +553,24 @@ where
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
     loop {
-        let mut transitions = Vec::new();
-        while let Ok(agents) = rx.try_recv() {
-            transitions.extend(herd.reconcile(&agents, species_count));
-        }
-        if !transitions.is_empty() {
-            let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
-            crate::sound::play_all(sound_player, &sounds);
-        }
         // Reduced motion freezes every pet at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
-        // so "frozen" falls out for free with no separate code path.
+        // so "frozen" falls out for free with no separate code path. Computed
+        // up front so `herd.reconcile`'s freeze-anchor capture (which pet left
+        // Working, and where) uses the same instant this frame draws at.
         let now_ms = if reduced_motion {
             0
         } else {
             wall_clock_now_ms()
         };
+        let mut transitions = Vec::new();
+        while let Ok(agents) = rx.try_recv() {
+            transitions.extend(herd.reconcile(&agents, species_count, now_ms));
+        }
+        if !transitions.is_empty() {
+            let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
+            crate::sound::play_all(sound_player, &sounds);
+        }
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
         terminal.draw(|f| {
@@ -654,7 +656,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| agent(&format!("t{i}"), *s))
             .collect();
-        h.reconcile(&agents, 1);
+        h.reconcile(&agents, 1, NOW_MS);
         h
     }
 
@@ -684,7 +686,7 @@ mod tests {
                 a
             })
             .collect();
-        h.reconcile(&agents, 1);
+        h.reconcile(&agents, 1, NOW_MS);
         let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &h, &species, Theme::Dark, NOW_MS))
@@ -710,12 +712,46 @@ mod tests {
         use crate::agent::AgentStatus::*;
         let species = vec![crate::sprite::parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1);
+        herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1, NOW_MS);
         let mut terminal = Terminal::new(TestBackend::new(60, 11)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn a_pet_leaving_working_freezes_in_place_instead_of_teleporting_when_drawn() {
+        // End-to-end: reconcile captures the anchor on the Working->Idle
+        // transition, and draw_herd's own animate() call (via pet.anchor)
+        // must actually use it — not just the unit-level animate() tests.
+        use crate::agent::AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        herd.reconcile(&[agent("settling", Working)], 1, 0);
+        herd.reconcile(&[agent("settling", Idle)], 1, 5_000);
+
+        let render_at = |ms: u64| {
+            let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            t.draw(|f| draw_herd(f, &herd, &species, Theme::Dark, ms))
+                .unwrap();
+            format!("{}", t.backend())
+        };
+        // Sampled well after settling; a teleport to the identity rest-x
+        // would very likely differ from the anchored frame (and even if it
+        // coincidentally matched once, holding steady across two more
+        // instants would not).
+        let frozen = render_at(5_000);
+        assert_eq!(
+            frozen,
+            render_at(20_000),
+            "a frozen pet must not drift or teleport as time passes"
+        );
+        assert_eq!(
+            frozen,
+            render_at(90_000),
+            "still frozen well beyond a full wander period"
+        );
     }
 
     #[test]
@@ -744,6 +780,7 @@ mod tests {
             AgentStatus::Idle,
             &sp.states[&AgentStatus::Idle],
             NOW_MS,
+            None,
         )
         .x_fraction
             * max_x)
@@ -753,6 +790,7 @@ mod tests {
             AgentStatus::Blocked,
             &sp.states[&AgentStatus::Blocked],
             NOW_MS,
+            None,
         )
         .x_fraction
             * max_x)
@@ -788,10 +826,10 @@ mod tests {
         let max_x = (strip_w as f32 - 4.0).max(0.0);
         let sp = &species[0];
         let idle_state = &sp.states[&AgentStatus::Idle];
-        let a_left =
-            (animate("a", AgentStatus::Idle, idle_state, NOW_MS).x_fraction * max_x).round() as i32;
-        let b_left =
-            (animate("b", AgentStatus::Idle, idle_state, NOW_MS).x_fraction * max_x).round() as i32;
+        let a_left = (animate("a", AgentStatus::Idle, idle_state, NOW_MS, None).x_fraction * max_x)
+            .round() as i32;
+        let b_left = (animate("b", AgentStatus::Idle, idle_state, NOW_MS, None).x_fraction * max_x)
+            .round() as i32;
         let overlap_col = a_left.max(b_left) as u16;
 
         let hit = pet_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
@@ -910,11 +948,11 @@ mod tests {
         let state = &species[0].states[&Working];
         let right_ms = (0..80_000u64)
             .step_by(97)
-            .find(|&ms| !animate("t0", Working, state, ms).facing_left)
+            .find(|&ms| !animate("t0", Working, state, ms, None).facing_left)
             .expect("some instant facing right");
         let left_ms = (0..80_000u64)
             .step_by(97)
-            .find(|&ms| animate("t0", Working, state, ms).facing_left)
+            .find(|&ms| animate("t0", Working, state, ms, None).facing_left)
             .expect("some instant facing left");
         let render = |ms: u64| {
             let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -1018,8 +1056,8 @@ mod tests {
         (0..period_ms)
             .step_by(37)
             .min_by(|&a, &b| {
-                let dy_a = animate(terminal_id, status, state, a).offset.dy;
-                let dy_b = animate(terminal_id, status, state, b).offset.dy;
+                let dy_a = animate(terminal_id, status, state, a, None).offset.dy;
+                let dy_b = animate(terminal_id, status, state, b, None).offset.dy;
                 dy_a.partial_cmp(&dy_b).unwrap()
             })
             .expect("a non-empty scan range")
