@@ -4,19 +4,39 @@
 
 ## TL;DR
 
-All five phases (0–4) in [`docs/PLAN.md`](PLAN.md) are **Done**. The plugin is
-feature-complete for the planned roadmap: animated pets, on-demand full-width
-strip + mouse interactivity, an always-on non-destructive controller, and a
-config surface + docs + CI. Work is spread across **three stacked, open, green
-PRs that are NOT merged yet** (the harness blocked autonomous merges to `main`).
+All five phases (0–4) in [`docs/PLAN.md`](PLAN.md) are **Done**, and a second
+autonomous run has since delivered **four maintainer-requested improvements**
+(shorter strip, richer hover label, new sprites + never-occluded icons, pets in
+every tab) as a further stacked set of open, green PRs. Nothing is merged yet
+(the harness blocks autonomous merges to `main`).
 
-**The single most important next action: merge the PR stack, in order #3 → #4 → #5.**
+**The single most important next action: merge the whole PR stack in order —
+phases #3 → #4 → #5, then improvements #6 → #7 → #8 → #9.**
 
-## Where the work lives (branches & PRs)
+## Post-roadmap improvements (2026-07-24) — the newest work
+
+Four improvements, each its own stacked PR (base = the branch below it), built
+after the phases. Specs in `docs/superpowers/specs/2026-07-24-*`, plans
+alongside, judgment calls in [`docs/decisions.md`](decisions.md) under
+"Post-roadmap improvements".
+
+| PR | Branch | Base | What |
+|---|---|---|---|
+| [#6](https://github.com/vandemaelefelix/herdr-pets/pull/6) | `feat/pets-shorter-strip` | `feat/phase-4-config-polish` | Halve the strip: pet band 12→6 px, strip 7→4 rows; sheep/goat recompressed. |
+| [#7](https://github.com/vandemaelefelix/herdr-pets/pull/7) | `feat/pets-hover-label` | `feat/pets-shorter-strip` | Hover shows the herdr sidebar breadcrumb `workspace › tab`, not `claude` (join `workspace list`/`tab list` in the watcher). |
+| [#8](https://github.com/vandemaelefelix/herdr-pets/pull/8) | `feat/pets-new-sprites` | `feat/pets-hover-label` | New side-view sprites + a reserved icon lane so overlays/`+N` never cover a pet (strip 4→5 rows). Review Artifact: https://claude.ai/code/artifact/fac9781a-d0d5-4d04-b0f1-8aaf7aa92f17 |
+| [#9](https://github.com/vandemaelefelix/herdr-pets/pull/9) | `feat/pets-every-tab` | `feat/pets-new-sprites` | Controller injects into every tab with a full-width bottom pane (single-pane **and** top+bottom multi-pane), non-destructively — not just single-pane tabs. |
+
+Current working branch: `feat/pets-every-tab` (tip of the whole stack — contains
+everything). Net user-visible strip: **5 rows** (1 icon lane + 3-px-row pet band
++ 1 caption); `config.strip_rows` default is now **5**.
+
+## Phase stack (below the improvements)
 
 The phases were built as a **stack** because this environment blocks merging to
 `main` autonomously (see [`docs/decisions.md`](decisions.md), "Stacked phase
-branches"). Each PR's base is the branch below it:
+branches"). Each PR's base is the branch below it; the improvement PRs above sit
+on top of `feat/phase-4-config-polish`:
 
 | PR | Branch | Base | Tip | Phase |
 |---|---|---|---|---|
@@ -24,12 +44,13 @@ branches"). Each PR's base is the branch below it:
 | [#4](https://github.com/vandemaelefelix/herdr-pets/pull/4) | `feat/phase-3-controller` | `feature/phase-2` | `47deb50` | 3 — Controller / watchdog |
 | [#5](https://github.com/vandemaelefelix/herdr-pets/pull/5) | `feat/phase-4-config-polish` | `feat/phase-3-controller` | `5b1a26b` | 4 — Config & polish |
 
-**Merge order:** #3 first, then #4, then #5. As each lands, GitHub auto-retargets
-the next PR's base to `main` (or retarget manually). All three are green
-(no CI configured for old phases; the gate passes locally — see below). `main`
-currently has only Phases 0–1.
+**Merge order:** #3 → #4 → #5, then the improvements #6 → #7 → #8 → #9. As each
+lands, GitHub auto-retargets the next PR's base to `main` (or retarget manually).
+All are green (the gate passes locally — see below). `main` currently has only
+Phases 0–1.
 
-The current working branch is `feat/phase-4-config-polish` (contains everything).
+The current working branch is `feat/pets-every-tab` — the tip of the full stack
+(phases + all four improvements).
 
 ## Phase status (all Done)
 
@@ -79,7 +100,8 @@ Full log: [`docs/decisions.md`](decisions.md). The load-bearing ones:
 
 ## What's left / next actions
 
-1. **Merge the stack** #3 → #4 → #5 (the only thing between here and "shipped").
+1. **Merge the stack** #3 → #4 → #5, then #6 → #7 → #8 → #9 (the only thing
+   between here and "shipped"). Review the sprite Artifact (linked above) first.
 2. **Stop the controller** if you don't want it running (see above).
 3. **Deferred (documented, not built)** — pick up if/when wanted:
    - `scope` config knob (limit the controller to a workspace/tab instead of the
