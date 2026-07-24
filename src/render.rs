@@ -259,6 +259,43 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
     best
 }
 
+/// A pluggable pet-strip renderer. The simulation is shared; only drawing and
+/// hit-testing differ between backends (half-block vs kitty graphics).
+pub trait PetRenderer {
+    /// Draw the whole strip for this frame (pet band + overlays + `+N`).
+    fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme);
+    /// The visible pet under terminal column `col`, if any (for hover/click).
+    fn pet_at_column(
+        &self,
+        herd: &Herd,
+        species: &[Species],
+        strip_w: usize,
+        col: u16,
+    ) -> Option<usize>;
+    /// Release backend resources (kitty: delete transmitted images). Default no-op.
+    fn teardown(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The universal half-block renderer (ratatui `▀▄` cells).
+pub struct HalfBlockRenderer;
+
+impl PetRenderer for HalfBlockRenderer {
+    fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
+        draw_herd(frame, herd, species, theme);
+    }
+    fn pet_at_column(
+        &self,
+        herd: &Herd,
+        species: &[Species],
+        strip_w: usize,
+        col: u16,
+    ) -> Option<usize> {
+        pet_at_column(herd, species, strip_w, col)
+    }
+}
+
 /// Focus the agent identified by `terminal_id` via `herdr agent focus`.
 /// The caller swallows the error — a failed focus must never crash the strip.
 pub fn focus_agent(cli: &dyn HerdrCli, terminal_id: &str) -> io::Result<()> {
@@ -280,6 +317,7 @@ pub fn run(
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
+    let mut renderer = HalfBlockRenderer;
     let result = run_loop(
         &mut terminal,
         rx,
@@ -287,6 +325,7 @@ pub fn run(
         theme,
         focus.as_ref(),
         reduced_motion,
+        &mut renderer,
     );
 
     disable_raw_mode()?;
@@ -333,6 +372,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     theme: Theme,
     focus: &dyn HerdrCli,
     reduced_motion: bool,
+    renderer: &mut dyn PetRenderer,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -367,7 +407,7 @@ where
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
         terminal.draw(|f| {
-            draw_herd(f, &herd, species, theme);
+            renderer.draw(f, &herd, species, theme);
             draw_caption(f, f.area(), caption.as_deref());
         })?;
 
@@ -383,11 +423,12 @@ where
                 }
                 Event::Mouse(MouseEvent { kind, column, .. }) => match kind {
                     MouseEventKind::Moved => {
-                        hovered = pet_at_column(&herd, species, strip_w, column)
+                        hovered = renderer
+                            .pet_at_column(&herd, species, strip_w, column)
                             .map(|i| herd.pets[i].label.clone());
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(i) = pet_at_column(&herd, species, strip_w, column) {
+                        if let Some(i) = renderer.pet_at_column(&herd, species, strip_w, column) {
                             let tid = herd.pets[i].terminal_id.clone();
                             // Swallow focus errors: the strip must keep running.
                             let _ = focus_agent(focus, &tid);
@@ -703,5 +744,23 @@ mod tests {
         );
         focus_agent(&cli, "term_abc").unwrap();
         assert_eq!(*args.borrow(), vec!["agent", "focus", "term_abc"]);
+    }
+
+    #[test]
+    fn half_block_renderer_matches_the_free_function() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
+        let mut via_trait = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        via_trait
+            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark))
+            .unwrap();
+        let mut via_fn = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        via_fn
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
+        assert_eq!(
+            format!("{}", via_trait.backend()),
+            format!("{}", via_fn.backend())
+        );
     }
 }
