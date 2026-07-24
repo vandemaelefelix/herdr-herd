@@ -129,7 +129,7 @@ impl KittyRenderer {
             };
 
             let col = pet.x.round() as i32 + 1; // 1-based CSI cursor coords
-            let row = 1; // band is bottom-anchored by the caller's cursor position
+            let row = 1; // TODO(B8-live): bottom-anchor the row in the band; placeholder top row for now.
             self.out
                 .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 

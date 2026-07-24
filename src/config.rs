@@ -1,4 +1,4 @@
-//! Plugin configuration: a tiny, tolerant reader for the four opinionated knobs.
+//! Plugin configuration: a tiny, tolerant reader for the six opinionated knobs.
 //! Parsed by hand (no new crate dependency) from `config.toml` in the plugin
 //! config dir; any missing or malformed key degrades to its default.
 
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn from_toml_str_parses_all_four_keys() {
+    fn from_toml_str_parses_the_core_keys() {
         let c = Config::from_toml_str(
             "enabled = false\nstrip_rows = 5\nsweep_interval_ms = 1500\nreduced_motion = true\n",
         );

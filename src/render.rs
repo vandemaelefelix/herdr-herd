@@ -262,7 +262,7 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
 /// A pluggable pet-strip renderer. The simulation is shared; only drawing and
 /// hit-testing differ between backends (half-block vs kitty graphics).
 pub trait PetRenderer {
-    /// Draw the whole strip for this frame (pet band + overlays + `+N`).
+    /// Draw the whole strip for this frame: the pet band, and (where the backend supports it) overlays/`+N`.
     fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme);
     /// The visible pet under terminal column `col`, if any (for hover/click).
     fn pet_at_column(
