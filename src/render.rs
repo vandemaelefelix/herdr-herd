@@ -342,14 +342,17 @@ pub fn run(
     pet_scale: usize,
 ) -> io::Result<()> {
     enable_raw_mode()?;
+
+    // Probe for kitty support BEFORE entering the alternate screen and enabling
+    // mouse capture: the query/DA round-trip then happens on the main screen
+    // with no mouse-event bytes to wade through, and any reply is fully consumed
+    // before rendering starts. Raw mode (enabled above) is all the probe needs.
+    let mut caps = crate::caps::RealCaps::new();
+    let mut renderer = select_renderer(renderer_kind, &mut caps, pet_scale);
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-    // The kitty-graphics probe reads/writes the tty once, here, before the
-    // event loop starts (raw mode must already be enabled for it to work).
-    let mut caps = crate::caps::RealCaps::new();
-    let mut renderer = select_renderer(renderer_kind, &mut caps, pet_scale);
     let result = run_loop(
         &mut terminal,
         rx,

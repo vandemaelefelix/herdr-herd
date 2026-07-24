@@ -22,6 +22,19 @@ pub fn reply_confirms(buf: &[u8], id: u32) -> bool {
     })
 }
 
+/// True if `buf` contains a complete Primary Device Attributes reply
+/// (`ESC [ ? ... c`): the `ESC [ ?` introducer followed by its `c` terminator.
+/// The probe appends a DA request after the kitty query — every terminal
+/// answers DA, so this terminator is the signal that "the terminal has replied,
+/// stop reading" and lets the probe finish without an arbitrary timeout even
+/// when kitty is unsupported (only the DA reply comes back). Pure; unit-tested.
+pub fn da_terminated(buf: &[u8]) -> bool {
+    match buf.windows(3).position(|w| w == b"\x1b[?") {
+        Some(pos) => buf[pos + 3..].contains(&b'c'),
+        None => false,
+    }
+}
+
 /// Reads the real tty. Assumes raw mode is already enabled by the caller
 /// (the render loop enables it); writes the probe and polls stdin briefly.
 pub struct RealCaps {
@@ -46,30 +59,46 @@ impl Default for RealCaps {
 
 impl TerminalCaps for RealCaps {
     fn supports_kitty_graphics(&mut self) -> bool {
+        // Send the kitty graphics query, then a Primary Device Attributes
+        // request (`ESC [ c`). Every terminal answers DA, so a reply always
+        // arrives promptly and the blocking read below never hangs — even when
+        // kitty is unsupported (herdr's flag off swallows the kitty query, but
+        // DA still round-trips), in which case only the DA reply comes back and
+        // we report `false`. A kitty response arrives before the DA terminator
+        // when kitty works.
+        //
+        // We deliberately do NOT use `crossterm::event::poll` here: it drains
+        // the ready bytes into crossterm's own parser buffer, which would leave
+        // a subsequent raw `read` with nothing to read — blocking forever. This
+        // runs once at startup, before the event loop, with raw mode already
+        // enabled by the caller, so reading stdin directly is safe.
+        let mut out = io::stdout();
         let query = crate::kitty::probe_query(self.id);
-        if io::stdout().write_all(query.as_bytes()).is_err() || io::stdout().flush().is_err() {
+        if out.write_all(query.as_bytes()).is_err()
+            || out.write_all(b"\x1b[c").is_err()
+            || out.flush().is_err()
+        {
             return false;
         }
-        // Poll stdin for a reply until the deadline. crossterm's event stream
-        // is already in use by the caller after this returns, so read raw here
-        // before the loop starts.
         let deadline = Instant::now() + self.timeout;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 256];
         let mut stdin = io::stdin();
         while Instant::now() < deadline {
-            // Non-blocking-ish: rely on crossterm::event::poll for readiness.
-            if crossterm::event::poll(Duration::from_millis(20)).unwrap_or(false) {
-                // Drain available bytes via a raw read.
-                if let Ok(n) = stdin.read(&mut chunk) {
+            match stdin.read(&mut chunk) {
+                Ok(0) | Err(_) => break, // EOF or read error: give up (unsupported)
+                Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     if reply_confirms(&buf, self.id) {
-                        return true;
+                        return true; // kitty response seen, before the DA reply
+                    }
+                    if da_terminated(&buf) {
+                        return false; // terminal answered DA with no kitty reply
                     }
                 }
             }
         }
-        false
+        reply_confirms(&buf, self.id)
     }
 }
 
@@ -102,5 +131,21 @@ mod tests {
         assert!(reply_confirms(b"\x1b_Gi=31,OK\x1b\\", 31));
         assert!(!reply_confirms(b"\x1b_Gi=99;OK\x1b\\", 31));
         assert!(!reply_confirms(b"garbage", 31));
+    }
+
+    #[test]
+    fn da_terminated_detects_the_device_attributes_reply() {
+        // The probe appends a DA request; its reply (`ESC [ ? ... c`) is the
+        // "terminal has answered" signal so the read loop can stop.
+        assert!(!da_terminated(b""), "empty buffer");
+        assert!(
+            !da_terminated(b"\x1b[?1;2"),
+            "introducer but no terminator yet"
+        );
+        assert!(da_terminated(b"\x1b[?1;2c"), "full DA reply");
+        // A kitty reply followed by the DA reply still terminates.
+        assert!(da_terminated(b"\x1b_Gi=1;OK\x1b\\\x1b[?62;c"));
+        // A bare 'c' with no DA introducer must not count.
+        assert!(!da_terminated(b"a c in prose"), "no ESC [ ? introducer");
     }
 }
