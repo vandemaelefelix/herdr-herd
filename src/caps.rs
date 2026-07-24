@@ -10,6 +10,32 @@ use std::time::{Duration, Instant};
 /// Whether the current terminal supports the kitty graphics protocol.
 pub trait TerminalCaps {
     fn supports_kitty_graphics(&mut self) -> bool;
+
+    /// The terminal's cell size in pixels as `(width, height)`. Used by the
+    /// kitty backend to place images at the right rows and to hit-test hover
+    /// by cell footprint. Defaults to a conservative `(8, 16)`; `RealCaps`
+    /// overrides it with a `CSI 14 t` query.
+    fn cell_px(&mut self) -> (u16, u16) {
+        (8, 16)
+    }
+}
+
+/// Parse a `CSI 14 t` cell-size report — `ESC [ 6 ; <height> ; <width> t` —
+/// into `(width, height)` pixels. Returns `None` if no such report is present
+/// or the numbers are unparseable. Pure; unit-tested.
+pub fn parse_cell_size(buf: &[u8]) -> Option<(u16, u16)> {
+    let text = String::from_utf8_lossy(buf);
+    // The report starts with `ESC [ 6 ;` and ends with `t`.
+    let start = text.find("\x1b[6;")?;
+    let rest = &text[start + 4..];
+    let end = rest.find('t')?;
+    let mut parts = rest[..end].split(';');
+    let height: u16 = parts.next()?.trim().parse().ok()?;
+    let width: u16 = parts.next()?.trim().parse().ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 /// True if `buf` contains a kitty graphics reply naming image id `id`
@@ -57,28 +83,25 @@ impl Default for RealCaps {
     }
 }
 
-impl TerminalCaps for RealCaps {
-    fn supports_kitty_graphics(&mut self) -> bool {
-        // Send the kitty graphics query, then a Primary Device Attributes
-        // request (`ESC [ c`). Every terminal answers DA, so a reply always
-        // arrives promptly and the blocking read below never hangs — even when
-        // kitty is unsupported (herdr's flag off swallows the kitty query, but
-        // DA still round-trips), in which case only the DA reply comes back and
-        // we report `false`. A kitty response arrives before the DA terminator
-        // when kitty works.
-        //
-        // We deliberately do NOT use `crossterm::event::poll` here: it drains
-        // the ready bytes into crossterm's own parser buffer, which would leave
-        // a subsequent raw `read` with nothing to read — blocking forever. This
-        // runs once at startup, before the event loop, with raw mode already
-        // enabled by the caller, so reading stdin directly is safe.
+impl RealCaps {
+    /// Write `query` followed by a Primary Device Attributes request
+    /// (`ESC [ c`) and read stdin until the DA reply terminates the response
+    /// (or the deadline passes), returning everything read. Because every
+    /// terminal answers DA, the blocking read always makes progress even when
+    /// `query` itself elicits no reply.
+    ///
+    /// We deliberately do NOT use `crossterm::event::poll` here: it drains the
+    /// ready bytes into crossterm's own parser buffer, which would leave a
+    /// subsequent raw `read` with nothing to read — blocking forever. This runs
+    /// once at startup, before the event loop, with raw mode already enabled by
+    /// the caller, so reading stdin directly is safe.
+    fn query_with_da(&self, query: &[u8]) -> Vec<u8> {
         let mut out = io::stdout();
-        let query = crate::kitty::probe_query(self.id);
-        if out.write_all(query.as_bytes()).is_err()
+        if out.write_all(query).is_err()
             || out.write_all(b"\x1b[c").is_err()
             || out.flush().is_err()
         {
-            return false;
+            return Vec::new();
         }
         let deadline = Instant::now() + self.timeout;
         let mut buf = Vec::new();
@@ -86,19 +109,32 @@ impl TerminalCaps for RealCaps {
         let mut stdin = io::stdin();
         while Instant::now() < deadline {
             match stdin.read(&mut chunk) {
-                Ok(0) | Err(_) => break, // EOF or read error: give up (unsupported)
+                Ok(0) | Err(_) => break, // EOF or read error: stop
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if reply_confirms(&buf, self.id) {
-                        return true; // kitty response seen, before the DA reply
-                    }
                     if da_terminated(&buf) {
-                        return false; // terminal answered DA with no kitty reply
+                        break; // terminal has answered; nothing more is coming
                     }
                 }
             }
         }
-        reply_confirms(&buf, self.id)
+        buf
+    }
+}
+
+impl TerminalCaps for RealCaps {
+    fn supports_kitty_graphics(&mut self) -> bool {
+        let query = crate::kitty::probe_query(self.id);
+        let reply = self.query_with_da(query.as_bytes());
+        reply_confirms(&reply, self.id)
+    }
+
+    fn cell_px(&mut self) -> (u16, u16) {
+        // `CSI 14 t` asks for the text-area cell size in pixels; Ghostty (and
+        // kitty) answer `ESC [ 6 ; <height> ; <width> t`. Fall back to the
+        // conservative default if the terminal does not report it.
+        let reply = self.query_with_da(b"\x1b[14t");
+        parse_cell_size(&reply).unwrap_or((8, 16))
     }
 }
 
@@ -131,6 +167,20 @@ mod tests {
         assert!(reply_confirms(b"\x1b_Gi=31,OK\x1b\\", 31));
         assert!(!reply_confirms(b"\x1b_Gi=99;OK\x1b\\", 31));
         assert!(!reply_confirms(b"garbage", 31));
+    }
+
+    #[test]
+    fn parse_cell_size_reads_width_and_height() {
+        // Ghostty answers CSI 14 t with `ESC [ 6 ; height ; width t`.
+        assert_eq!(parse_cell_size(b"\x1b[6;32;15t"), Some((15, 32)));
+        // Embedded in a larger buffer (e.g. after a kitty/DA reply).
+        assert_eq!(
+            parse_cell_size(b"\x1b_Gi=1;OK\x1b\\\x1b[6;34;16t\x1b[?62;c"),
+            Some((16, 34))
+        );
+        assert_eq!(parse_cell_size(b""), None);
+        assert_eq!(parse_cell_size(b"\x1b[?62;c"), None); // DA only, no size
+        assert_eq!(parse_cell_size(b"\x1b[6;0;0t"), None); // zero is invalid
     }
 
     #[test]

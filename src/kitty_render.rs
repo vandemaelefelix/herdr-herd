@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 
 use ratatui::Frame;
+use ratatui::layout::Rect;
 
 use crate::agent::AgentStatus;
 use crate::herd::{Herd, visible_and_hidden};
@@ -42,6 +43,12 @@ pub struct KittyRenderer {
     /// a `HashMap<String, u32>` of placement ids alone cannot recover.
     placements: HashMap<String, (u32, u32)>,
     next_id: u32,
+    /// The pane area the last frame was drawn against. When it changes (a
+    /// resize), the terminal may have dropped our transmitted images, so we
+    /// invalidate the cache and clear the screen state to force a fresh
+    /// transmit — otherwise `place` would reference images that no longer
+    /// exist and the strip would go permanently blank after a resize.
+    last_area: Option<Rect>,
 }
 
 impl KittyRenderer {
@@ -57,14 +64,8 @@ impl KittyRenderer {
             cache: HashMap::new(),
             placements: HashMap::new(),
             next_id: 1,
+            last_area: None,
         }
-    }
-
-    /// Convenience constructor for production wiring: writes straight to
-    /// stdout with a conservative default cell size. Real cell-size detection
-    /// (`CSI 14 t`) is wired by the caller, not here.
-    pub fn new_stdout(scale: usize) -> Self {
-        Self::new(scale, (8, 16), Box::new(io::stdout()))
     }
 
     /// Write all escapes for the current frame's visible pets to `self.out`,
@@ -74,9 +75,21 @@ impl KittyRenderer {
         &mut self,
         herd: &Herd,
         species: &[Species],
-        strip_w: usize,
+        area: Rect,
         theme: Theme,
     ) -> io::Result<()> {
+        // On a geometry change (resize), the terminal may have dropped our
+        // transmitted images. Purge everything and re-transmit fresh this
+        // frame, or `place` would reference gone images and leave the strip
+        // blank. The per-pet positions below already reflow to the new area.
+        if self.last_area != Some(area) {
+            self.out.write_all(delete_all().as_bytes())?;
+            self.cache.clear();
+            self.placements.clear();
+            self.last_area = Some(area);
+        }
+
+        let strip_w = area.width as usize;
         let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
         let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
@@ -128,8 +141,17 @@ impl KittyRenderer {
                 }
             };
 
-            let col = pet.x.round() as i32 + 1; // 1-based CSI cursor coords
-            let row = 1; // TODO(B8-live): bottom-anchor the row in the band; placeholder top row for now.
+            // Bottom-anchor the image so the pet's feet rest just above the
+            // caption row (the pane's last row), matching the half-block path,
+            // and recompute it every frame so a resize reflows the pets instead
+            // of stranding them. Image height in cells = ceil(px / cell height).
+            // Columns and rows are 1-based CSI cursor coordinates, clamped into
+            // the pane so a pet near an edge is never placed off-screen.
+            let image_rows = (fr.h * self.scale).div_ceil(self.cell_px.1 as usize) as i32;
+            let pane_h = area.height as i32;
+            // Caption occupies the last row; feet sit on the row above it.
+            let row = (pane_h - 1 - image_rows + 1).clamp(1, pane_h.max(1));
+            let col = (pet.x.round() as i32 + 1).clamp(1, area.width.max(1) as i32);
             self.out
                 .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 
@@ -176,7 +198,7 @@ impl KittyRenderer {
     /// tolerance for a failed frame.
     #[cfg(test)]
     pub fn draw_to_sink(&mut self, herd: &Herd, species: &[Species], theme: Theme) {
-        let _ = self.render_pets(herd, species, 200, theme);
+        let _ = self.render_pets(herd, species, Rect::new(0, 0, 200, 10), theme);
     }
 }
 
@@ -186,8 +208,7 @@ impl PetRenderer for KittyRenderer {
     /// write degrades to a skipped frame rather than crashing the strip (the
     /// render loop already tolerates this for the half-block path).
     fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
-        let strip_w = frame.area().width as usize;
-        let _ = self.render_pets(herd, species, strip_w, theme);
+        let _ = self.render_pets(herd, species, frame.area(), theme);
     }
 
     /// Hit-test using the same visible set as `render_pets`; a pet's cell
@@ -323,6 +344,27 @@ mod tests {
         );
         assert!(second.contains("a=p"), "still re-places");
         assert!(second.contains("a=d"), "and deletes the previous placement");
+    }
+
+    #[test]
+    fn resize_purges_and_retransmits() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4, (8, 16));
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark);
+        let _ = sink.take();
+        // Same area: image stays cached, no re-transmit.
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark);
+        assert!(
+            !sink.take().contains("a=t"),
+            "unchanged area reuses the cache"
+        );
+        // Changed area (resize): purge everything and re-transmit fresh.
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 120, 8), Theme::Dark);
+        let out = sink.take();
+        assert!(out.contains("a=d,d=A"), "resize deletes all prior images");
+        assert!(out.contains("a=t"), "resize re-transmits the image");
     }
 
     #[test]
