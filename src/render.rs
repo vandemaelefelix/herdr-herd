@@ -29,9 +29,11 @@ use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
 
-/// Height of the sprite draw strip in pixels (7 half-block rows) — sized to the
-/// artifact's animated sheep frames, whose standing poses are ~13–14 px tall.
-pub const PET_PX_H: usize = 14;
+/// Height of the pet band in pixels (3 half-block rows). Sprites are drawn a
+/// little shorter than this (see the `h <= 5` guard in `sprite.rs`) and
+/// bottom-anchored, so the leftover headroom absorbs the hop/shake lift and the
+/// pet never clips the band's top or bottom edge.
+pub const PET_PX_H: usize = 6;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
@@ -127,7 +129,10 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
         };
         let off = motion_offset(&state.motion, pet.phase);
         let ox = (pet.x + off.dx).round() as i32;
-        let oy = (off.dy).round() as i32; // ground-aligned; dy<=0 lifts
+        // Bottom-anchor: feet rest on the band floor; motion (dy<=0) lifts the
+        // pet up into the headroom above it, so a hop/shake never clips.
+        let floor = PET_PX_H as i32 - fr.h as i32;
+        let oy = floor + off.dy.round() as i32;
         for y in 0..fr.h {
             for x in 0..fr.w {
                 if let Some(c) = role_color(fr.cells[y * fr.w + x], pet.identity.hue, theme, style)
@@ -577,10 +582,8 @@ mod tests {
             !rows[0].contains('▀') && !rows[0].contains('▄'),
             "the top lane holds no pet pixels — nothing to occlude"
         );
-        assert!(
-            rows[1].contains('▀') || rows[1].contains('▄'),
-            "the pet is drawn in the band below the lane"
-        );
+        let band_has_pet = rows[1..].iter().any(|r| r.contains('▀') || r.contains('▄'));
+        assert!(band_has_pet, "the pet is drawn in the band below the lane");
     }
 
     #[test]

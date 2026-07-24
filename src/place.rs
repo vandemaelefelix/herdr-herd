@@ -12,10 +12,11 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: a 1-row badge lane, 7 half-block pet rows
-/// (the artifact's animated poses), and 1 caption row — so overlays/`+N` never
-/// cover a pet.
-pub const TARGET_ROWS: u16 = 9;
+/// Rows the strip should occupy: a 1-row badge lane, 3 half-block pet rows, and
+/// 1 caption row — a slim status strip. Overlays/`+N` live in the lane so they
+/// never cover a pet, and the pet band is short (pets are a glanceable status,
+/// not the focus).
+pub const TARGET_ROWS: u16 = 5;
 
 /// The split ratio that leaves the bottom `target_rows` for the strip on a tab
 /// `tab_rows` tall: `1 - target/tab`. Clamped to `[0.3, 0.95]` so a tiny tab
@@ -129,11 +130,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_rows_covers_lane_pet_band_and_caption() {
-        // 9 rows = 1 badge lane + 7 half-block pixel rows (PET_PX_H = 14, the
-        // artifact's animated poses) + 1 caption row. The lane keeps overlays /
-        // `+N` off the pet.
-        assert_eq!(TARGET_ROWS, 9);
+    fn target_rows_is_a_slim_status_strip() {
+        // 5 rows = 1 badge lane + 3 half-block pixel rows (PET_PX_H = 6) + 1
+        // caption row. Slim on purpose — the pets are a glanceable status line.
+        assert_eq!(TARGET_ROWS, 5);
     }
 
     #[test]

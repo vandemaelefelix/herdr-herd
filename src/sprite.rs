@@ -353,7 +353,12 @@ mod tests {
                     .unwrap_or_else(|| panic!("{} missing state {st:?}", sp.name));
                 assert!(!spec.frames.is_empty(), "{} {st:?} has no frames", sp.name);
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
-                assert!(h <= 14, "{} taller than the 7-row budget", sp.name);
+                assert!(
+                    h <= 5,
+                    "{} must be <= 5 px (1 px shorter than the 6 px band) so \
+                     the hop/shake lift never clips",
+                    sp.name
+                );
                 assert_eq!(
                     (w, h),
                     species_size,
