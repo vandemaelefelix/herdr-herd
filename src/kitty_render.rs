@@ -73,12 +73,13 @@ fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> 
 }
 
 /// Rows a pet image occupies, derived from the pane height and capped small
-/// so the pets always read as a slim strip, even in a tall pane. Reserves 2
-/// rows off the top: one for the caption (row 1) and one for the icon/hat
-/// lane just above the pet (row 2) — so neither ever collides with the pet
-/// body, however short the pane gets.
+/// so the pets always read as a slim strip, even in a tall pane. Reserves 1
+/// row off the top for the shared overlay lane (see [`overlay_lane_row`]) —
+/// the caption and every pet's icon/hat all live there, column-separated,
+/// exactly like the half-block renderer's single `lane_y` row, rather than
+/// each claiming a row of its own.
 fn pet_rows(pane_h: u16) -> u16 {
-    pane_h.saturating_sub(2).clamp(2, 4)
+    pane_h.saturating_sub(1).clamp(2, 4)
 }
 
 /// The 1-based cursor row a `rows`-tall pet image must start at so its last
@@ -86,6 +87,18 @@ fn pet_rows(pane_h: u16) -> u16 {
 /// beneath it, mirroring the half-block path's bottom-anchor.
 fn pet_row(pane_h: i32, rows: u16) -> i32 {
     (pane_h - rows as i32 + 1).clamp(1, pane_h.max(1))
+}
+
+/// The 1-indexed row shared by every overlay in the strip's top lane — the
+/// hover caption (drawn via the ratatui frame in [`KittyRenderer::draw`]) and,
+/// per visible pet, its Zz/!/? icon and (if focused) its hat (drawn one row
+/// above the pet's own top row in `render_pets`). A single shared lane, not
+/// two, keeps the pet band as tall as `pet_rows` allows instead of losing a
+/// second row to a caption that's blank most of the time; column position
+/// (right-aligned caption vs. per-pet-centered icon/hat) keeps them apart.
+fn overlay_lane_row(pane_h: u16) -> u16 {
+    let rows = pet_rows(pane_h);
+    pet_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
 }
 
 /// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
@@ -378,7 +391,7 @@ impl KittyRenderer {
                     );
                     let icon_rows: u16 = 1;
                     let icon_cols = pet_cols(icon_rows, iw, ih);
-                    let icon_row = row.saturating_sub(1).max(1);
+                    let icon_row = overlay_lane_row(area.height) as i32;
                     let icon_col_max = (area.width as i32 - icon_cols as i32 + 1).max(1);
                     let icon_col =
                         (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
@@ -452,7 +465,7 @@ impl KittyRenderer {
                 // sprite-pixel space into this pet's own on-screen footprint.
                 let (_head_row, head_col) = head_anchor(fr, animated.facing_left);
                 let head_frac = head_col as f32 / fr.w.max(1) as f32;
-                let hat_row = row.saturating_sub(1).max(1);
+                let hat_row = overlay_lane_row(area.height) as i32;
                 let hat_col_center = col + (head_frac * cols as f32).round() as i32;
                 let hat_col_max = (area.width as i32 - hat_cols as i32 + 1).max(1);
                 let hat_col = (hat_col_center - (hat_cols as i32) / 2).clamp(1, hat_col_max);
@@ -556,10 +569,12 @@ impl PetRenderer for KittyRenderer {
     ) {
         let area = frame.area();
         let _ = self.render_pets(herd, species, area, theme, now_ms);
-        // Kitty draws pets out of band and never reserves a top lane of its
-        // own for `+N` (it doesn't draw one), so the caption has the whole
-        // top row to itself — no overflow width to dodge.
-        crate::render::draw_caption(frame, area, area.y, hover_label, 0);
+        // Share the same overlay lane every pet's icon/hat uses, not a row of
+        // its own — kitty doesn't draw `+N`, so there's no overflow width to
+        // dodge, but the caption still needs the column-based right-alignment
+        // `draw_caption` already does to avoid a hovered pet's own icon/hat.
+        let lane_y = overlay_lane_row(area.height).saturating_sub(1); // 1-indexed -> 0-indexed
+        crate::render::draw_caption(frame, area, lane_y, hover_label, 0);
     }
 
     /// Hit-test using the same visible set as `render_pets`. A pet's hit range
@@ -756,11 +771,12 @@ mod tests {
     #[test]
     fn pet_size_stays_small_and_keeps_aspect() {
         // Rows are capped small even in a very tall pane, and never below 2.
-        // Two rows are reserved off the top: one for the caption, one for the
-        // icon/hat lane just above the pet — so a 4-row pane still only gets
-        // 2 pet rows, not 3.
+        // Only 1 row is reserved off the top — the caption and the icon/hat
+        // share that single lane (column-separated), exactly like the
+        // half-block renderer's `lane_y` — so a 4-row pane still gets 3 pet
+        // rows, not 2.
         assert_eq!(pet_rows(3), 2);
-        assert_eq!(pet_rows(4), 2);
+        assert_eq!(pet_rows(4), 3);
         assert_eq!(pet_rows(6), 4);
         assert_eq!(pet_rows(40), 4);
         // Cols preserve the sprite aspect (16x14 -> ~2.3 cols per row).
@@ -782,35 +798,37 @@ mod tests {
     }
 
     #[test]
-    fn pet_row_never_lets_the_icon_lane_collide_with_the_caption_row() {
-        // The icon/hat overlay sits one row above the pet's own top row
-        // (`row - 1`). Across every pane height `pet_rows` supports, that
-        // must land at 1-indexed row >= 2, never row 1 — the caption's row.
-        for pane_h in 4..40 {
+    fn overlay_lane_row_is_always_above_the_pet_body_never_inside_it() {
+        for pane_h in 3..40u16 {
             let rows = pet_rows(pane_h);
             let row = pet_row(pane_h as i32, rows);
-            let icon_row = row.saturating_sub(1).max(1);
+            let lane = overlay_lane_row(pane_h);
             assert!(
-                icon_row >= 2,
-                "icon/hat lane collides with the caption row at pane_h={pane_h}: icon_row={icon_row}"
+                (lane as i32) < row,
+                "pane_h={pane_h}: overlay lane {lane} must sit above the pet's own top row {row}"
             );
         }
     }
 
     #[test]
-    fn draw_places_the_hover_caption_top_right_via_the_ratatui_frame() {
+    fn draw_places_the_hover_caption_on_the_shared_overlay_lane() {
+        // The caption shares the icon/hat lane (one row above the pet body),
+        // not a row of its own — so it lands wherever that lane falls for
+        // this pane height, not necessarily row 0.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
         let mut r = KittyRenderer::for_test(SharedSink::default(), 4);
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let pane_h = 10u16;
+        let mut terminal = Terminal::new(TestBackend::new(40, pane_h)).unwrap();
         let completed = terminal
             .draw(|f| {
                 PetRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
             })
             .unwrap();
-        let row0: String = (0..completed.buffer.area.width)
+        let lane_y = overlay_lane_row(pane_h).saturating_sub(1); // 1-indexed -> 0-indexed
+        let row: String = (0..completed.buffer.area.width)
             .map(|x| {
-                completed.buffer[(x, 0)]
+                completed.buffer[(x, lane_y)]
                     .symbol()
                     .chars()
                     .next()
@@ -818,8 +836,8 @@ mod tests {
             })
             .collect();
         assert!(
-            row0.contains("agent-x"),
-            "caption drawn top-right via the ratatui frame: {row0:?}"
+            row.contains("agent-x"),
+            "caption drawn on the shared overlay lane (row {lane_y}): {row:?}"
         );
     }
 
