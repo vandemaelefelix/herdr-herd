@@ -353,7 +353,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{} missing state {st:?}", sp.name));
                 assert!(!spec.frames.is_empty(), "{} {st:?} has no frames", sp.name);
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
-                assert!(h <= 12, "{} taller than the 6-row budget", sp.name);
+                assert!(h <= 6, "{} taller than the 3-row budget", sp.name);
                 assert_eq!(
                     (w, h),
                     species_size,

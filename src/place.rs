@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: pets take 6 half-block rows, plus 1 caption.
-pub const TARGET_ROWS: u16 = 7;
+/// Rows the strip should occupy: pets take 3 half-block rows, plus 1 caption.
+pub const TARGET_ROWS: u16 = 4;
 
 /// The split ratio that leaves the bottom `target_rows` for the strip on a tab
 /// `tab_rows` tall: `1 - target/tab`. Clamped to `[0.3, 0.95]` so a tiny tab
@@ -125,6 +125,12 @@ pub fn place(cli: &dyn HerdrCli, self_exe: &str, cwd: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_rows_is_the_halved_strip_height() {
+        // 4 rows = 3 half-block pixel rows (PET_PX_H = 6) + 1 caption row.
+        assert_eq!(TARGET_ROWS, 4);
+    }
 
     #[test]
     fn slim_ratio_leaves_the_target_rows_for_the_strip() {

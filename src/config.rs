@@ -22,7 +22,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             enabled: true,
-            strip_rows: 7,
+            strip_rows: 4,
             sweep_interval_ms: 3000,
             reduced_motion: false,
         }
@@ -119,7 +119,7 @@ mod tests {
             Config::default(),
             Config {
                 enabled: true,
-                strip_rows: 7,
+                strip_rows: 4,
                 sweep_interval_ms: 3000,
                 reduced_motion: false
             }
@@ -147,7 +147,7 @@ mod tests {
         let c = Config::from_toml_str("# a comment\nreduced_motion = true  # calm\n");
         assert!(c.reduced_motion);
         assert!(c.enabled, "an unspecified key keeps its default");
-        assert_eq!(c.strip_rows, 7);
+        assert_eq!(c.strip_rows, 4);
     }
 
     #[test]

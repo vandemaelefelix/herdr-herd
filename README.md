@@ -92,7 +92,7 @@ an opinionated default:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether the `control` watchdog runs. |
-| `strip_rows` | int | `7` | Strip height, in rows. |
+| `strip_rows` | int | `4` | Strip height, in rows (3 pixel rows + 1 caption). |
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
 
@@ -102,7 +102,7 @@ an opinionated default:
 Example `config.toml`:
 
     reduced_motion = true
-    strip_rows = 6
+    strip_rows = 5
 
 ## Development
 

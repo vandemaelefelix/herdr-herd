@@ -29,8 +29,8 @@ use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
 
-/// Height of the sprite draw strip in pixels (6 half-block rows).
-pub const PET_PX_H: usize = 12;
+/// Height of the sprite draw strip in pixels (3 half-block rows).
+pub const PET_PX_H: usize = 6;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
