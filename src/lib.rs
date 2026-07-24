@@ -12,6 +12,7 @@ pub mod herd;
 pub mod herdr;
 pub mod identity;
 pub mod kitty;
+pub mod kitty_render;
 pub mod lock;
 pub mod palette;
 pub mod pet;
