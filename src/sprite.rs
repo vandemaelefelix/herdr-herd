@@ -280,87 +280,117 @@ mod tests {
     }
 
     #[test]
-    fn working_airborne_frame_is_the_jump_pose_and_grounded_is_the_stand_pose() {
+    fn every_species_working_airborne_frame_is_a_jump_pose_and_grounded_is_the_stand_pose() {
         use crate::anim::motion_offset;
 
-        let sheep = embedded_species()
-            .into_iter()
-            .find(|s| s.name == "Sheep")
-            .expect("sheep species is embedded");
-        let working = &sheep.states[&AgentStatus::Working];
-        assert_eq!(working.frames.len(), 2, "working is a two-frame walk cycle");
+        // Every shipped species must get the real-hop treatment, not just
+        // Sheep — a pet's species is identity-hashed per agent, so any
+        // species left on the old near-duplicate frames silently ships a
+        // broken-looking hop for whichever agents land on it.
+        for species in embedded_species() {
+            let working = &species.states[&AgentStatus::Working];
+            assert_eq!(
+                working.frames.len(),
+                2,
+                "{}: working is a two-frame walk cycle",
+                species.name
+            );
 
-        let airborne = &working.frames[0];
-        let grounded = &working.frames[1];
-        assert_ne!(
-            airborne.cells, grounded.cells,
-            "airborne (jump) and grounded (stand) must be genuinely distinct poses"
-        );
+            let airborne = &working.frames[0];
+            let grounded = &working.frames[1];
+            assert_ne!(
+                airborne.cells, grounded.cells,
+                "{}: airborne (jump) and grounded (stand) must be genuinely distinct poses",
+                species.name
+            );
 
-        // The jump pose lifts the body: more of its silhouette occupies the
-        // frame's top rows than the planted stand pose's, whose head/back
-        // sit lower/narrower in the same headroom.
-        let painted_in_top_rows = |f: &Frame, rows: usize| -> usize {
-            (0..rows.min(f.h))
-                .map(|y| {
-                    (0..f.w)
-                        .filter(|&x| f.cells[y * f.w + x] != Role::Transparent)
-                        .count()
-                })
-                .sum()
-        };
-        assert!(
-            painted_in_top_rows(airborne, 3) > painted_in_top_rows(grounded, 3),
-            "the jump pose's body/head must fill more of the top rows than the planted stand pose"
-        );
+            // The jump pose ideally lifts the body too: more of its
+            // silhouette occupies the frame's top rows than the planted
+            // stand pose's. Only checked for Sheep, whose source art has
+            // spare top headroom to lift into (a blank row above the head);
+            // Goat's horns already occupy that row, so lifting would clip
+            // them — its jump pose relies on the (universally required,
+            // checked below) leg extension alone to read as airborne.
+            let painted_in_top_rows = |f: &Frame, rows: usize| -> usize {
+                (0..rows.min(f.h))
+                    .map(|y| {
+                        (0..f.w)
+                            .filter(|&x| f.cells[y * f.w + x] != Role::Transparent)
+                            .count()
+                    })
+                    .sum()
+            };
+            if species.name == "Sheep" {
+                assert!(
+                    painted_in_top_rows(airborne, 3) > painted_in_top_rows(grounded, 3),
+                    "{}: the jump pose's body/head must fill more of the top rows than the planted stand pose",
+                    species.name
+                );
+            }
 
-        // The jump pose's legs must genuinely extend, not just repeat the
-        // stand pose's legs under a lifted body: the horizontal column span
-        // painted across the leg rows (last 4 rows) must be visibly wider —
-        // a real running stride, not a same-legs-different-head illusion.
-        let leg_span = |f: &Frame| -> usize {
-            let leg_rows = f.h.saturating_sub(4)..f.h;
-            let mut lo = f.w;
-            let mut hi = 0usize;
-            for y in leg_rows {
-                for x in 0..f.w {
-                    if f.cells[y * f.w + x] != Role::Transparent {
-                        lo = lo.min(x);
-                        hi = hi.max(x);
+            // The jump pose's legs must genuinely extend, not just repeat
+            // the stand pose's legs under a lifted body: the horizontal
+            // column span painted across the leg rows (last 4 rows) must be
+            // visibly wider — a real running stride, not a
+            // same-legs-different-head illusion.
+            let leg_span = |f: &Frame| -> usize {
+                let leg_rows = f.h.saturating_sub(4)..f.h;
+                let mut lo = f.w;
+                let mut hi = 0usize;
+                for y in leg_rows {
+                    for x in 0..f.w {
+                        if f.cells[y * f.w + x] != Role::Transparent {
+                            lo = lo.min(x);
+                            hi = hi.max(x);
+                        }
                     }
                 }
-            }
-            hi + 1 - lo
-        };
-        assert!(
-            leg_span(airborne) > leg_span(grounded) + 2,
-            "the jump pose's legs (span {}) must extend visibly wider than the stand pose's (span {})",
-            leg_span(airborne),
-            leg_span(grounded)
-        );
-
-        // Mirrors `motion::animate`'s frame-select formula exactly.
-        let frame_for_phase = |phase: f32| -> usize {
-            ((phase * working.frames.len() as f32) as usize).min(working.frames.len() - 1)
-        };
-        assert_eq!(
-            frame_for_phase(0.0),
-            0,
-            "phase 0.0 selects the airborne frame"
-        );
-        assert_eq!(
-            frame_for_phase(0.5),
-            1,
-            "phase 0.5 selects the grounded frame"
-        );
-
-        // Sanity: whenever the hop is actually lifting, it must be within the
-        // airborne (frame 0) half of the cycle (never the grounded half).
-        for phase in [0.1, 0.25, 0.4] {
+                hi + 1 - lo
+            };
             assert!(
-                motion_offset(&working.motion, phase).dy < 0.0,
-                "phase {phase} should be airborne"
+                leg_span(airborne) > leg_span(grounded) + 2,
+                "{}: the jump pose's legs (span {}) must extend visibly wider than the stand pose's (span {})",
+                species.name,
+                leg_span(airborne),
+                leg_span(grounded)
             );
+
+            // Mirrors `motion::animate`'s frame-select formula exactly.
+            let frame_for_phase = |phase: f32| -> usize {
+                ((phase * working.frames.len() as f32) as usize).min(working.frames.len() - 1)
+            };
+            assert_eq!(
+                frame_for_phase(0.0),
+                0,
+                "{}: phase 0.0 selects the airborne frame",
+                species.name
+            );
+            assert_eq!(
+                frame_for_phase(0.5),
+                1,
+                "{}: phase 0.5 selects the grounded frame",
+                species.name
+            );
+
+            // Sanity: whenever the hop is actually lifting, it must be
+            // within the airborne (frame 0) half of the cycle (never the
+            // grounded half) — and must use the WalkHop amplitude, not the
+            // generic (shallower) Hop.
+            assert!(
+                working
+                    .motion
+                    .motions
+                    .contains(&crate::anim::Motion::WalkHop),
+                "{}: working must use the walkhop motion for the full-amplitude running lift",
+                species.name
+            );
+            for phase in [0.1, 0.25, 0.4] {
+                assert!(
+                    motion_offset(&working.motion, phase).dy < 0.0,
+                    "{}: phase {phase} should be airborne",
+                    species.name
+                );
+            }
         }
     }
 
