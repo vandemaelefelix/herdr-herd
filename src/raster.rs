@@ -2,7 +2,7 @@
 //! the same role->color palette as the half-block path so both look identical.
 
 use crate::palette::{StateStyle, Theme, role_color};
-use crate::sprite::Frame;
+use crate::sprite::{Frame, Role};
 
 /// An RGBA pixel buffer, row-major, 4 bytes per pixel.
 pub struct Rgba {
@@ -44,6 +44,21 @@ pub fn rasterize(
     Rgba { w, h, px }
 }
 
+/// Embed `frame` in a larger, fully-transparent canvas padded by `pad` sprite
+/// pixels on every side. Used by the kitty backend so a motion offset can be
+/// animated by panning a same-size crop window over this bigger, once-
+/// transmitted image instead of retransmitting a shifted image every frame.
+pub fn pad_frame(frame: &Frame, pad: usize) -> Frame {
+    let (w, h) = (frame.w + pad * 2, frame.h + pad * 2);
+    let mut cells = vec![Role::Transparent; w * h];
+    for y in 0..frame.h {
+        for x in 0..frame.w {
+            cells[(y + pad) * w + (x + pad)] = frame.cells[y * frame.w + x];
+        }
+    }
+    Frame { w, h, cells }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +98,21 @@ mod tests {
             "some pixel is transparent"
         );
         assert!(r.px.chunks(4).any(|p| p[3] == 255), "some pixel is opaque");
+    }
+
+    #[test]
+    fn pad_frame_grows_by_pad_on_every_side_and_keeps_content_centered() {
+        let f = frame0();
+        let padded = pad_frame(&f, 2);
+        assert_eq!((padded.w, padded.h), (f.w + 4, f.h + 4));
+        // The original top-left cell now lives at (2, 2) in the padded frame.
+        assert_eq!(
+            padded.cells[2 * padded.w + 2],
+            f.cells[0],
+            "original content is embedded at the pad offset"
+        );
+        // A corner of the new canvas is padding: must be transparent.
+        assert_eq!(padded.cells[0], Role::Transparent);
     }
 
     #[test]
