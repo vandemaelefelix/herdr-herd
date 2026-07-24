@@ -64,6 +64,30 @@ pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16, z: i32) -> String {
     )
 }
 
+/// A source-image crop rectangle, in raster pixels (kitty's `x=`/`y=`/`w=`/`h=`
+/// placement keys): show only this `w`x`h` region starting at `(x, y)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Place transmitted image `id` as placement `pid`, showing only `crop`'s
+/// source rectangle, stretched to `cols`x`rows` terminal cells exactly like
+/// [`place_sized`]. This is how motion is animated without retransmitting a
+/// new image every frame: the source image is transmitted once, padded with
+/// a transparent margin, and each frame crops a different sub-window of it —
+/// panning the "camera" over a static, larger canvas.
+pub fn place_cropped(id: u32, pid: u32, crop: Crop, cols: u16, rows: u16, z: i32) -> String {
+    let Crop { x, y, w, h } = crop;
+    apc(
+        &format!("a=p,i={id},p={pid},x={x},y={y},w={w},h={h},c={cols},r={rows},z={z},q=2"),
+        "",
+    )
+}
+
 /// Delete placement `pid` of image `id` (removes it from screen; keeps data).
 pub fn delete_placement(id: u32, pid: u32) -> String {
     apc(&format!("a=d,d=i,i={id},p={pid},q=2"), "")
@@ -122,5 +146,31 @@ mod tests {
         assert!(delete_placement(7, 3).contains("a=d") && delete_placement(7, 3).contains("i=7"));
         assert_eq!(delete_all(), "\x1b_Ga=d,d=A\x1b\\");
         assert!(probe_query(9).contains("a=q") && probe_query(9).contains("i=9"));
+    }
+
+    #[test]
+    fn place_cropped_carries_the_source_rectangle_and_cell_footprint() {
+        let pc = place_cropped(
+            7,
+            3,
+            Crop {
+                x: 12,
+                y: 8,
+                w: 40,
+                h: 28,
+            },
+            9,
+            4,
+            5,
+        );
+        assert!(pc.contains("a=p") && pc.contains("i=7") && pc.contains("p=3"));
+        assert!(
+            pc.contains("x=12") && pc.contains("y=8") && pc.contains("w=40") && pc.contains("h=28"),
+            "source crop rectangle"
+        );
+        assert!(
+            pc.contains("c=9") && pc.contains("r=4") && pc.contains("z=5"),
+            "destination cell footprint + stacking index, same as place_sized"
+        );
     }
 }
