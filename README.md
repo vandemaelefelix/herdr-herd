@@ -104,6 +104,9 @@ an opinionated default:
 | `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
 | `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw pets with. |
 | `pet_scale` | int | `7` | Kitty-backend sprite scale (image px per sprite px); ignored by half-block. |
+| `sounds_enabled` | bool | `false` | Master switch for notification sounds. Off out of the box. |
+| `sound_<status>_enabled` | bool | `true` for `blocked`, else `false` | Per-status toggle. `<status>` is `idle`, `working`, `blocked`, or `done`. |
+| `sound_<status>_path` | string | unset | Sound file to play on that status's transition. No bundled sounds ship, so a status plays nothing until you point it at a file. |
 
 `strip_rows` applies to the always-on `control` watchdog; the on-demand
 `herdr-pets place` uses a fixed height.
@@ -112,6 +115,30 @@ Example `config.toml`:
 
     reduced_motion = true
     strip_rows = 6
+
+### Notification sounds
+
+A sound plays when a pet's status *transitions* into a notifying state — not
+on every render tick, and not for the initial snapshot when the strip first
+picks up an agent that's already `blocked`. Only surviving agents that
+actually change status trigger a sound.
+
+Sounds are off by default (`sounds_enabled = false`); `blocked` is pre-armed
+so turning on the master switch and pointing it at a file is enough to hear
+it:
+
+    sounds_enabled = true
+    sound_blocked_path = /path/to/blocked.wav
+
+`sound_done_path`, `sound_working_path`, and `sound_idle_path` work the same
+way but stay off (`sound_<status>_enabled = false`) until you opt in.
+
+Playback shells out to the platform's native player (`afplay` on macOS,
+`paplay`/`aplay` on Linux) rather than pulling in an audio crate, matching
+the minimal-dependency approach `src/herdr.rs` already uses for the `herdr`
+CLI. A missing file or unavailable player is silently ignored — it never
+crashes or blocks the strip. If several agents transition to the same status
+in one tick, that status's sound plays once, not once per agent.
 
 ## Rendering
 

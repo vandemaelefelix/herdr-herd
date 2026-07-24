@@ -486,6 +486,7 @@ pub fn focus_agent(cli: &dyn HerdrCli, terminal_id: &str) -> io::Result<()> {
 /// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
 /// draws, handles mouse hover/click, and quits on `q`/Ctrl-C. Restores the
 /// terminal (raw mode, alternate screen, mouse capture) on exit.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     rx: Receiver<Vec<Agent>>,
     species: Vec<Species>,
@@ -494,6 +495,8 @@ pub fn run(
     reduced_motion: bool,
     renderer_kind: crate::config::RendererKind,
     pet_scale: usize,
+    sound_cfg: crate::config::SoundConfig,
+    sound_player: Box<dyn crate::sound::SoundPlayer>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
 
@@ -515,6 +518,8 @@ pub fn run(
         focus.as_ref(),
         reduced_motion,
         renderer.as_mut(),
+        &sound_cfg,
+        sound_player.as_ref(),
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
@@ -528,6 +533,7 @@ pub fn run(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     rx: Receiver<Vec<Agent>>,
@@ -536,6 +542,8 @@ fn run_loop<B: ratatui::backend::Backend>(
     focus: &dyn HerdrCli,
     reduced_motion: bool,
     renderer: &mut dyn PetRenderer,
+    sound_cfg: &crate::config::SoundConfig,
+    sound_player: &dyn crate::sound::SoundPlayer,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -545,8 +553,13 @@ where
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
     loop {
+        let mut transitions = Vec::new();
         while let Ok(agents) = rx.try_recv() {
-            herd.reconcile(&agents, species_count);
+            transitions.extend(herd.reconcile(&agents, species_count));
+        }
+        if !transitions.is_empty() {
+            let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
+            crate::sound::play_all(sound_player, &sounds);
         }
         // Reduced motion freezes every pet at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,

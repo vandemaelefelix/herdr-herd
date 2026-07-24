@@ -23,5 +23,6 @@ pub mod raster;
 pub mod render;
 pub mod sidebar;
 pub mod socket;
+pub mod sound;
 pub mod sprite;
 pub mod watcher;
