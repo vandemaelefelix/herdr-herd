@@ -8,34 +8,14 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 /// Whether the current terminal supports the kitty graphics protocol.
+///
+/// Note: we intentionally do NOT expose the terminal cell size here. herdr
+/// swallows the `CSI 14 t`/`CSI 16 t` pixel-size queries (only the DA reply
+/// comes back) and its API reports no pixel dimensions, so the cell size is
+/// unobtainable through herdr. The kitty backend instead places images with an
+/// explicit cell footprint (`c=`/`r=`), which needs no cell-size query.
 pub trait TerminalCaps {
     fn supports_kitty_graphics(&mut self) -> bool;
-
-    /// The terminal's cell size in pixels as `(width, height)`. Used by the
-    /// kitty backend to place images at the right rows and to hit-test hover
-    /// by cell footprint. Defaults to a conservative `(8, 16)`; `RealCaps`
-    /// overrides it with a `CSI 14 t` query.
-    fn cell_px(&mut self) -> (u16, u16) {
-        (8, 16)
-    }
-}
-
-/// Parse a `CSI 14 t` cell-size report — `ESC [ 6 ; <height> ; <width> t` —
-/// into `(width, height)` pixels. Returns `None` if no such report is present
-/// or the numbers are unparseable. Pure; unit-tested.
-pub fn parse_cell_size(buf: &[u8]) -> Option<(u16, u16)> {
-    let text = String::from_utf8_lossy(buf);
-    // The report starts with `ESC [ 6 ;` and ends with `t`.
-    let start = text.find("\x1b[6;")?;
-    let rest = &text[start + 4..];
-    let end = rest.find('t')?;
-    let mut parts = rest[..end].split(';');
-    let height: u16 = parts.next()?.trim().parse().ok()?;
-    let width: u16 = parts.next()?.trim().parse().ok()?;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some((width, height))
 }
 
 /// True if `buf` contains a kitty graphics reply naming image id `id`
@@ -128,14 +108,6 @@ impl TerminalCaps for RealCaps {
         let reply = self.query_with_da(query.as_bytes());
         reply_confirms(&reply, self.id)
     }
-
-    fn cell_px(&mut self) -> (u16, u16) {
-        // `CSI 14 t` asks for the text-area cell size in pixels; Ghostty (and
-        // kitty) answer `ESC [ 6 ; <height> ; <width> t`. Fall back to the
-        // conservative default if the terminal does not report it.
-        let reply = self.query_with_da(b"\x1b[14t");
-        parse_cell_size(&reply).unwrap_or((8, 16))
-    }
 }
 
 /// Test double: reports a fixed, configured support value with no tty I/O.
@@ -167,20 +139,6 @@ mod tests {
         assert!(reply_confirms(b"\x1b_Gi=31,OK\x1b\\", 31));
         assert!(!reply_confirms(b"\x1b_Gi=99;OK\x1b\\", 31));
         assert!(!reply_confirms(b"garbage", 31));
-    }
-
-    #[test]
-    fn parse_cell_size_reads_width_and_height() {
-        // Ghostty answers CSI 14 t with `ESC [ 6 ; height ; width t`.
-        assert_eq!(parse_cell_size(b"\x1b[6;32;15t"), Some((15, 32)));
-        // Embedded in a larger buffer (e.g. after a kitty/DA reply).
-        assert_eq!(
-            parse_cell_size(b"\x1b_Gi=1;OK\x1b\\\x1b[6;34;16t\x1b[?62;c"),
-            Some((16, 34))
-        );
-        assert_eq!(parse_cell_size(b""), None);
-        assert_eq!(parse_cell_size(b"\x1b[?62;c"), None); // DA only, no size
-        assert_eq!(parse_cell_size(b"\x1b[6;0;0t"), None); // zero is invalid
     }
 
     #[test]

@@ -13,12 +13,58 @@ use ratatui::layout::Rect;
 
 use crate::agent::AgentStatus;
 use crate::herd::{Herd, visible_and_hidden};
-use crate::kitty::{delete_all, delete_placement, place, transmit_rgba};
-use crate::palette::{StateStyle, Theme};
+use crate::kitty::{delete_all, delete_placement, place_sized, transmit_rgba};
+use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::raster::rasterize;
 use crate::render::PetRenderer;
-use crate::sprite::Species;
+use crate::sprite::{Frame as SpriteFrame, Species};
+
+/// Rows a pet image occupies, derived from the pane height (reserving the
+/// caption row plus a little headroom) and capped small so the pets always
+/// read as a slim strip, even in a tall pane.
+fn pet_rows(pane_h: u16) -> u16 {
+    pane_h.saturating_sub(2).clamp(2, 4)
+}
+
+/// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
+/// the sprite's aspect under an assumed ~1:2.1 cell width:height ratio. herdr
+/// hides the real cell size, so we approximate it; the worst case is a slight
+/// horizontal stretch, imperceptible for pixel art. Placing with explicit
+/// `c=`/`r=` (rather than native pixels) makes the on-screen footprint exact,
+/// which is what lets hover hit-testing line up with the visible sprite.
+fn pet_cols(rows: u16, frame_w: usize, frame_h: usize) -> u16 {
+    ((rows as f32) * (frame_w as f32 / frame_h.max(1) as f32) * 2.1)
+        .round()
+        .max(1.0) as u16
+}
+
+/// The half-open range of columns `[lo, hi)` that carry opaque pixels in
+/// `frame` as it is drawn (mirrored when `flip`), or `None` if the frame is
+/// fully transparent. Transparency is independent of hue/theme/style, so a
+/// fixed palette lookup suffices. Used to trim hover hit-testing to the visible
+/// sprite rather than its full, transparently-padded frame width.
+fn opaque_col_span(frame: &SpriteFrame, flip: bool) -> Option<(usize, usize)> {
+    let (mut lo, mut hi, mut any) = (frame.w, 0usize, false);
+    for y in 0..frame.h {
+        for dx in 0..frame.w {
+            let sx = if flip { frame.w - 1 - dx } else { dx };
+            if role_color(
+                frame.cells[y * frame.w + sx],
+                0,
+                Theme::Dark,
+                StateStyle::none(),
+            )
+            .is_some()
+            {
+                any = true;
+                lo = lo.min(dx);
+                hi = hi.max(dx);
+            }
+        }
+    }
+    any.then_some((lo, hi + 1))
+}
 
 /// Cache key for a transmitted image: species/status/frame/flip/hue fully
 /// determine the rasterized pixels, so two pets sharing all five reuse one
@@ -31,7 +77,6 @@ type ImgKey = (usize, AgentStatus, usize, bool, u16);
 /// to avoid a flicker where the pet briefly vanishes).
 pub struct KittyRenderer {
     scale: usize,
-    cell_px: (u16, u16),
     out: Box<dyn Write + Send>,
     cache: HashMap<ImgKey, u32>,
     /// `terminal_id -> (image_id, placement_id)` of that pet's current
@@ -52,14 +97,13 @@ pub struct KittyRenderer {
 }
 
 impl KittyRenderer {
-    /// Build a renderer that writes to `out` (stdout in production) at sprite
-    /// `scale` with terminal cell size `cell_px` in pixels (from a `CSI 14 t`
-    /// query, or the `(8, 16)` fallback — both resolved by the caller; this
-    /// task does not query).
-    pub fn new(scale: usize, cell_px: (u16, u16), out: Box<dyn Write + Send>) -> Self {
+    /// Build a renderer that writes to `out` (stdout in production). `scale` is
+    /// the pixels-per-sprite-pixel resolution the frames are rasterized at; the
+    /// on-screen size is set separately by the explicit cell footprint
+    /// (`pet_rows`/`pet_cols`) at placement time.
+    pub fn new(scale: usize, out: Box<dyn Write + Send>) -> Self {
         Self {
             scale,
-            cell_px,
             out,
             cache: HashMap::new(),
             placements: HashMap::new(),
@@ -141,23 +185,24 @@ impl KittyRenderer {
                 }
             };
 
-            // Bottom-anchor the image so the pet's feet rest just above the
-            // caption row (the pane's last row), matching the half-block path,
-            // and recompute it every frame so a resize reflows the pets instead
-            // of stranding them. Image height in cells = ceil(px / cell height).
-            // Columns and rows are 1-based CSI cursor coordinates, clamped into
-            // the pane so a pet near an edge is never placed off-screen.
-            let image_rows = (fr.h * self.scale).div_ceil(self.cell_px.1 as usize) as i32;
+            // Size the pet to an explicit cell footprint (herdr hides the real
+            // cell size), then bottom-anchor it so its feet rest just above the
+            // caption row (the pane's last row), matching the half-block path.
+            // Recomputed every frame, so a resize reflows the pets. Cursor
+            // coordinates are 1-based and clamped into the pane so an edge pet
+            // is never placed off-screen.
+            let rows = pet_rows(area.height);
+            let cols = pet_cols(rows, fr.w, fr.h);
             let pane_h = area.height as i32;
-            // Caption occupies the last row; feet sit on the row above it.
-            let row = (pane_h - 1 - image_rows + 1).clamp(1, pane_h.max(1));
+            let row = (pane_h - rows as i32).clamp(1, pane_h.max(1));
             let col = (pet.x.round() as i32 + 1).clamp(1, area.width.max(1) as i32);
             self.out
                 .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 
             let pid = self.next_id;
             self.next_id += 1;
-            self.out.write_all(place(image_id, pid).as_bytes())?;
+            self.out
+                .write_all(place_sized(image_id, pid, cols, rows).as_bytes())?;
 
             if let Some((old_img, old_pid)) = self
                 .placements
@@ -211,9 +256,11 @@ impl PetRenderer for KittyRenderer {
         let _ = self.render_pets(herd, species, frame.area(), theme);
     }
 
-    /// Hit-test using the same visible set as `render_pets`; a pet's cell
-    /// footprint is its rasterized width (in pixels) divided by the terminal
-    /// cell width, rounded up.
+    /// Hit-test using the same visible set as `render_pets`. A pet's hit range
+    /// is the on-screen span of its sprite's *opaque* pixels (transparent frame
+    /// padding is excluded, so hover matches the visible sheep), converted from
+    /// pixels to cells with the queried cell width. Topmost by priority wins an
+    /// overlap, matching the draw z-order.
     fn pet_at_column(
         &self,
         herd: &Herd,
@@ -226,18 +273,33 @@ impl PetRenderer for KittyRenderer {
         let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
 
         let x = col as i32;
+        // The pet footprint depends on the pane height (rows -> cols); use the
+        // last drawn area so the hit range matches what was placed this frame.
+        let pane_h = self.last_area.map(|a| a.height).unwrap_or(8);
+        let rows = pet_rows(pane_h);
         let mut best: Option<usize> = None;
         for &i in &visible {
             let pet = &herd.pets[i];
-            let frame_w = species
+            let Some(sp) = species
                 .get(pet.identity.species_index)
                 .or_else(|| species.first())
-                .map(|s| s.size().0)
-                .unwrap_or(base_w);
-            let footprint_px = frame_w * self.scale;
-            let footprint_cells = footprint_px.div_ceil(self.cell_px.0 as usize).max(1) as i32;
+            else {
+                continue;
+            };
+            let Some(state) = sp.states.get(&pet.status) else {
+                continue;
+            };
+            let fi = pet.frame_index(state.frames.len());
+            let fr = &state.frames[fi];
+            // The image occupies `cols` cells from `pet.x`; the visible sprite
+            // is the opaque span scaled into those cols, so hover matches the
+            // sheep, not its transparent padding.
+            let cols = pet_cols(rows, fr.w, fr.h) as usize;
+            let (lo, hi) = opaque_col_span(fr, pet.facing_left).unwrap_or((0, fr.w));
+            let left_cell = lo * cols / fr.w;
+            let right_cell = (hi * cols).div_ceil(fr.w).max(left_cell + 1);
             let left = pet.x.round() as i32;
-            if x >= left && x < left + footprint_cells {
+            if x >= left + left_cell as i32 && x < left + right_cell as i32 {
                 let take = match best {
                     None => true,
                     Some(b) => priority(pet.status) >= priority(herd.pets[b].status),
@@ -295,8 +357,8 @@ impl Write for SharedSink {
 impl KittyRenderer {
     /// Test constructor: boxes a clone of `sink` as the write target so the
     /// caller's `sink` handle keeps observing everything written.
-    pub fn for_test(sink: SharedSink, scale: usize, cell_px: (u16, u16)) -> Self {
-        Self::new(scale, cell_px, Box::new(sink))
+    pub fn for_test(sink: SharedSink, scale: usize) -> Self {
+        Self::new(scale, Box::new(sink))
     }
 }
 
@@ -329,7 +391,7 @@ mod tests {
     #[test]
     fn draw_transmits_then_places_and_second_frame_reuses_the_image() {
         let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4, (8, 16));
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
         r.draw_to_sink(&herd, &species, Theme::Dark); // test-only wrapper (no ratatui)
@@ -349,7 +411,7 @@ mod tests {
     #[test]
     fn resize_purges_and_retransmits() {
         let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4, (8, 16));
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
         let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark);
@@ -370,16 +432,38 @@ mod tests {
     #[test]
     fn teardown_deletes_all_images() {
         let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4, (8, 16));
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         r.teardown().unwrap();
         assert_eq!(sink.take(), "\x1b_Ga=d,d=A\x1b\\");
+    }
+
+    #[test]
+    fn pet_size_stays_small_and_keeps_aspect() {
+        // Rows are capped small even in a very tall pane, and never below 2.
+        assert_eq!(pet_rows(3), 2);
+        assert_eq!(pet_rows(6), 4);
+        assert_eq!(pet_rows(40), 4);
+        // Cols preserve the sprite aspect (16x14 -> ~2.3 cols per row).
+        assert_eq!(pet_cols(3, 16, 14), 7); // round(3 * 16/14 * 2.1)
+        assert_eq!(pet_cols(4, 16, 14), 10);
+    }
+
+    #[test]
+    fn opaque_col_span_trims_transparent_padding() {
+        let species = parse_species(BLOB).unwrap();
+        let fr = &species.states[&AgentStatus::Working].frames[0];
+        // working frame `MM../MMM./M##./.MM.`: cols 0,1,2 opaque, col 3 empty.
+        assert_eq!(opaque_col_span(fr, false), Some((0, 3)));
+        // flipped: drawn col d shows source (w-1-d), so opaque source cols
+        // 0,1,2 land on drawn cols 1,2,3.
+        assert_eq!(opaque_col_span(fr, true), Some((1, 4)));
     }
 
     #[test]
     fn hit_test_uses_the_cell_footprint() {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let r = KittyRenderer::for_test(SharedSink::default(), 4, (8, 16));
+        let r = KittyRenderer::for_test(SharedSink::default(), 4);
         // pet at x=4, footprint = ceil(frame_w*scale / cell_w) columns wide.
         assert_eq!(r.pet_at_column(&herd, &species, 200, 4), Some(0));
         assert_eq!(r.pet_at_column(&herd, &species, 200, 190), None);

@@ -51,6 +51,14 @@ pub fn place(id: u32, pid: u32) -> String {
     apc(&format!("a=p,i={id},p={pid},q=2"), "")
 }
 
+/// Place transmitted image `id` as placement `pid`, scaled to exactly `cols` x
+/// `rows` terminal cells (`c=`/`r=`). This makes the on-screen footprint known
+/// without querying the cell pixel size (which herdr does not report), so the
+/// backend can size, bottom-anchor, and hit-test images exactly.
+pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16) -> String {
+    apc(&format!("a=p,i={id},p={pid},c={cols},r={rows},q=2"), "")
+}
+
 /// Delete placement `pid` of image `id` (removes it from screen; keeps data).
 pub fn delete_placement(id: u32, pid: u32) -> String {
     apc(&format!("a=d,d=i,i={id},p={pid},q=2"), "")
@@ -99,6 +107,12 @@ mod tests {
             place(7, 3).contains("a=p")
                 && place(7, 3).contains("i=7")
                 && place(7, 3).contains("p=3")
+        );
+        let ps = place_sized(7, 3, 9, 4);
+        assert!(ps.contains("a=p") && ps.contains("i=7") && ps.contains("p=3"));
+        assert!(
+            ps.contains("c=9") && ps.contains("r=4"),
+            "explicit cell footprint"
         );
         assert!(delete_placement(7, 3).contains("a=d") && delete_placement(7, 3).contains("i=7"));
         assert_eq!(delete_all(), "\x1b_Ga=d,d=A\x1b\\");

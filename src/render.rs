@@ -317,12 +317,8 @@ pub fn select_renderer(
         Auto => caps.supports_kitty_graphics(),
     };
     if use_kitty {
-        // Query the real cell size so images anchor to the right rows and
-        // hover hit-tests by the correct footprint (falls back to (8, 16)).
-        let cell_px = caps.cell_px();
         Box::new(crate::kitty_render::KittyRenderer::new(
             scale,
-            cell_px,
             Box::new(io::stdout()),
         ))
     } else {
