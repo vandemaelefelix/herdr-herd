@@ -32,6 +32,14 @@ pub fn identity_for(terminal_id: &str, species_count: usize) -> Identity {
     Identity { species_index, hue }
 }
 
+/// A deterministic value in `0.0..1.0`, keyed by `(salt, terminal_id)`. Used to
+/// derive an agent's stable "personality" constants (wander phase/speed, rest
+/// position, animation offset) — every process computes the same value for the
+/// same agent, with no shared state or coordination required.
+pub fn unit_hash(salt: &str, terminal_id: &str) -> f32 {
+    (hash_salted(salt, terminal_id) as f64 / u64::MAX as f64) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +84,20 @@ mod tests {
         // Degenerate input must not panic (divide-by-zero guard).
         let id = identity_for("term_a", 0);
         assert_eq!(id.species_index, 0);
+    }
+
+    #[test]
+    fn unit_hash_is_deterministic_and_bounded() {
+        for _ in 0..3 {
+            let v = unit_hash("wphase", "term_x");
+            assert!((0.0..1.0).contains(&v));
+            assert_eq!(v, unit_hash("wphase", "term_x"), "same inputs, same output");
+        }
+    }
+
+    #[test]
+    fn unit_hash_varies_by_salt_and_by_id() {
+        assert_ne!(unit_hash("a", "term_x"), unit_hash("b", "term_x"));
+        assert_ne!(unit_hash("a", "term_x"), unit_hash("a", "term_y"));
     }
 }
