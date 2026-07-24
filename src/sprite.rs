@@ -280,6 +280,64 @@ mod tests {
     }
 
     #[test]
+    fn working_frame_leg_pose_matches_hop_airborne_window() {
+        use crate::anim::motion_offset;
+
+        let sheep = embedded_species()
+            .into_iter()
+            .find(|s| s.name == "Sheep")
+            .expect("sheep species is embedded");
+        let working = &sheep.states[&AgentStatus::Working];
+        assert_eq!(working.frames.len(), 2, "working is a two-frame walk cycle");
+
+        let leg_rows = |cells: &[Role], w: usize, h: usize| cells[(h - 2) * w..].to_vec();
+        let legend = |rows: &[&str]| -> Vec<Role> {
+            rows.iter()
+                .flat_map(|r| r.chars())
+                .map(|c| role_from_char(c).expect("legend char"))
+                .collect()
+        };
+        let diagonal_legs = legend(&[".#MM#..#MS#.....", "..##....##......"]);
+        let straight_legs = legend(&["..#MM#..#MM#....", "...##....##....."]);
+
+        // Mirrors `motion::animate`'s frame-select formula exactly.
+        let frame_for_phase = |phase: f32| -> usize {
+            ((phase * working.frames.len() as f32) as usize).min(working.frames.len() - 1)
+        };
+
+        // phase 0.0 is the start of the hop's rise (sin == 0 there too, but
+        // it's still inside the airborne half of the cycle) — see Motion::Hop.
+        for &(phase, want_diagonal) in &[(0.0, true), (0.25, true), (0.5, false), (0.75, false)] {
+            let frame = &working.frames[frame_for_phase(phase)];
+            let got = leg_rows(&frame.cells, frame.w, frame.h);
+            let expected = if want_diagonal {
+                &diagonal_legs
+            } else {
+                &straight_legs
+            };
+            assert_eq!(
+                &got,
+                expected,
+                "phase {phase}: expected {} legs",
+                if want_diagonal {
+                    "diagonal"
+                } else {
+                    "straight"
+                }
+            );
+        }
+
+        // Sanity: whenever the hop is actually lifting, it must be within the
+        // diagonal-leg half of the cycle (never the straight-leg half).
+        for phase in [0.1, 0.25, 0.4] {
+            assert!(
+                motion_offset(&working.motion, phase).dy < 0.0,
+                "phase {phase} should be airborne"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_state_carries_ghost_and_overlay_config() {
         let sp = parse_species(BLOB).unwrap();
         let u = &sp.states[&AgentStatus::Unknown];
@@ -356,7 +414,7 @@ mod tests {
                 assert!(
                     h <= 14,
                     "{} must be <= 14 px so the render band's reserved 1px \
-                     headroom keeps the hop/shake lift from clipping",
+                     headroom keeps the hop/bounce lift from clipping",
                     sp.name
                 );
                 assert_eq!(

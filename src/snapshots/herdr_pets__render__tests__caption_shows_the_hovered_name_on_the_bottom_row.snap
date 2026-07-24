@@ -3,7 +3,7 @@ source: src/render.rs
 expression: terminal.backend()
 ---
 "                                        "
-"                       Zz               "
+"                            Zz          "
 "                                        "
 "                                        "
 "                                        "
@@ -11,6 +11,6 @@ expression: terminal.backend()
 "                                        "
 "                                        "
 "                                        "
-"    ▀▀▄             ▄▀▀▄                "
-"    ▀▀▀             ▀▀▀▀                "
+"                         ▄▀▀▄      ▄▀▀  "
+"                         ▀▀▀▀      ▀▀▀  "
 "backend-api                             "

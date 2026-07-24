@@ -4,7 +4,7 @@
 
 use std::io;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
@@ -22,14 +22,15 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use crate::agent::Agent;
-use crate::anim::{Overlay, OverlayColor, Rgb, motion_offset};
-use crate::herd::{Herd, Lcg, visible_and_hidden};
+use crate::anim::{Overlay, OverlayColor, Rgb};
+use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
+use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::{Frame as SpriteFrame, Role, Species};
 
-/// Rows the focus hat occupies above a pet's head, plus the 1px hop/shake
+/// Rows the focus hat occupies above a pet's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
 const HAT_H: usize = 3;
 /// Columns the focus hat occupies, centered over the head anchor.
@@ -40,8 +41,19 @@ const HAT_ROWS: [&str; HAT_H] = ["..#..", ".#r#.", "#rrr#"];
 const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
 const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
 
+/// Milliseconds since the Unix epoch — the same absolute reference on every
+/// process on this machine (all `herdr-pets render` panes run server-side, so
+/// there's no cross-machine clock-skew concern even under `herdr --remote`).
+/// This is what makes `motion::animate` agree across every independent pane.
+fn wall_clock_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Height of the pet band in pixels. Sprites are 16x14 (see sprites/*.sprite);
-/// the band is the sprite height, plus 1px of headroom for the hop/shake
+/// the band is the sprite height, plus 1px of headroom for the hop/bounce
 /// lift, plus [`HAT_H`] rows so the focus hat has room above even the tallest
 /// (standing) pose without clipping.
 pub const PET_PX_H: usize = 15 + HAT_H;
@@ -158,6 +170,9 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
 /// top). The hat is composited into the same buffer right after its pet's
 /// body, at the same offset, so it shares the body's full transform (motion
 /// offset, bottom-anchor, facing flip) and never detaches during motion.
+/// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
+/// reduced motion) drives every pet's position/pose via `motion::animate` — a
+/// pure function, so this is fully deterministic given the same inputs.
 /// Returns the buffer plus the visible set's z-order (draw order, lowest
 /// priority first) so the caller can reuse it for overlays without
 /// recomputing the visible/capacity selection.
@@ -166,10 +181,12 @@ fn build_band(
     species: &[Species],
     strip_w: usize,
     theme: Theme,
+    now_ms: u64,
 ) -> (PixelBuf, Vec<usize>) {
     let mut buf = PixelBuf::new(strip_w, PET_PX_H);
 
     let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let max_x = (strip_w as f32 - pet_w as f32).max(0.0);
     let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
     let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
 
@@ -188,21 +205,24 @@ fn build_band(
         let Some(state) = sp.states.get(&pet.status) else {
             continue;
         };
-        let fi = pet.frame_index(state.frames.len());
-        let fr = &state.frames[fi];
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+        let fr = &state.frames[animated.frame_index];
         let style = StateStyle {
             dim: state.dim,
             ghost: state.ghost,
         };
-        let off = motion_offset(&state.motion, pet.phase);
-        let ox = (pet.x + off.dx).round() as i32;
+        let ox = (animated.x_fraction * max_x + animated.offset.dx).round() as i32;
         // Bottom-anchor: feet rest on the band floor; motion (dy<=0) lifts the
-        // pet up into the headroom above it, so a hop/shake never clips.
+        // pet up into the headroom above it, so a hop/bounce never clips.
         let floor = PET_PX_H as i32 - fr.h as i32;
-        let oy = floor + off.dy.round() as i32;
+        let oy = floor + animated.offset.dy.round() as i32;
         for y in 0..fr.h {
             for x in 0..fr.w {
-                let sx = if pet.facing_left { fr.w - 1 - x } else { x };
+                let sx = if animated.facing_left {
+                    fr.w - 1 - x
+                } else {
+                    x
+                };
                 if let Some(c) = role_color(fr.cells[y * fr.w + sx], pet.identity.hue, theme, style)
                 {
                     buf.set(ox + x as i32, oy + y as i32, c);
@@ -210,7 +230,7 @@ fn build_band(
             }
         }
         if pet.focused {
-            let (head_row, head_col) = head_anchor(fr, pet.facing_left);
+            let (head_row, head_col) = head_anchor(fr, animated.facing_left);
             draw_hat(&mut buf, ox, oy, head_row, head_col);
         }
     }
@@ -221,12 +241,16 @@ fn build_band(
 /// last, i.e. on top), their overlays (bubbles/badges), and a `+N` marker for
 /// any pets the strip has no room for. Overlays and `+N` live in a reserved top
 /// lane (row 0); the pet band is drawn below it, so an icon never covers a pet.
-pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
+/// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
+/// reduced motion) drives every pet's position/pose via `motion::animate` — a
+/// pure function, so this is fully deterministic given the same inputs.
+pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme, now_ms: u64) {
     let area = frame.area();
     let strip_w = area.width as usize;
-    let (buf, order) = build_band(herd, species, strip_w, theme);
+    let (buf, order) = build_band(herd, species, strip_w, theme, now_ms);
 
     let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let max_x = (strip_w as f32 - pet_w as f32).max(0.0);
     let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
     let (_visible, hidden) = visible_and_hidden(&herd.pets, capacity);
 
@@ -273,8 +297,9 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
             OverlayColor::Default => Color::Gray,
         };
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
         let cx = area.x
-            + (pet.x.round() as u16)
+            + ((animated.x_fraction * max_x).round() as u16)
                 .saturating_add(3)
                 .min(area.width.saturating_sub(glyph.chars().count() as u16));
         frame.buffer_mut().set_span(
@@ -322,9 +347,18 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
 /// Only pets that are actually drawn (the visible set on overflow) are
 /// hit-testable; when pets overlap, the topmost — highest `priority`, matching
-/// the draw z-order — wins. Returns `None` over a gap or out of range.
-pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16) -> Option<usize> {
+/// the draw z-order — wins. Returns `None` over a gap or out of range. `now_ms`
+/// must match whatever was passed to `draw_herd` this frame, so hit-testing
+/// agrees with what's actually on screen.
+pub fn pet_at_column(
+    herd: &Herd,
+    species: &[Species],
+    strip_w: usize,
+    col: u16,
+    now_ms: u64,
+) -> Option<usize> {
     let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let max_x = (strip_w as f32 - base_w as f32).max(0.0);
     let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
     let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
 
@@ -332,12 +366,18 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
     let mut best: Option<usize> = None;
     for &i in &visible {
         let pet = &herd.pets[i];
-        let w = species
+        let Some(sp) = species
             .get(pet.identity.species_index)
             .or_else(|| species.first())
-            .map(|s| s.size().0)
-            .unwrap_or(base_w) as i32;
-        let left = pet.x.round() as i32;
+        else {
+            continue;
+        };
+        let Some(state) = sp.states.get(&pet.status) else {
+            continue;
+        };
+        let w = sp.size().0 as i32;
+        let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+        let left = (animated.x_fraction * max_x).round() as i32;
         if x >= left && x < left + w {
             let take = match best {
                 None => true,
@@ -354,15 +394,26 @@ pub fn pet_at_column(herd: &Herd, species: &[Species], strip_w: usize, col: u16)
 /// A pluggable pet-strip renderer. The simulation is shared; only drawing and
 /// hit-testing differ between backends (half-block vs kitty graphics).
 pub trait PetRenderer {
-    /// Draw the whole strip for this frame: the pet band, and (where the backend supports it) overlays/`+N`.
-    fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme);
+    /// Draw the whole strip for this frame: the pet band, and (where the
+    /// backend supports it) overlays/`+N`. `now_ms` drives every pet's
+    /// position/pose (see `motion::animate`).
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        now_ms: u64,
+    );
     /// The visible pet under terminal column `col`, if any (for hover/click).
+    /// `now_ms` must match the value passed to `draw` this frame.
     fn pet_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
         strip_w: usize,
         col: u16,
+        now_ms: u64,
     ) -> Option<usize>;
     /// Release backend resources (kitty: delete transmitted images). Default no-op.
     fn teardown(&mut self) -> io::Result<()> {
@@ -377,8 +428,15 @@ pub trait PetRenderer {
 pub struct HalfBlockRenderer;
 
 impl PetRenderer for HalfBlockRenderer {
-    fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
-        draw_herd(frame, herd, species, theme);
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        now_ms: u64,
+    ) {
+        draw_herd(frame, herd, species, theme, now_ms);
     }
     fn pet_at_column(
         &self,
@@ -386,8 +444,9 @@ impl PetRenderer for HalfBlockRenderer {
         species: &[Species],
         strip_w: usize,
         col: u16,
+        now_ms: u64,
     ) -> Option<usize> {
-        pet_at_column(herd, species, strip_w, col)
+        pet_at_column(herd, species, strip_w, col, now_ms)
     }
     fn backend_name(&self) -> &'static str {
         "half-block"
@@ -469,33 +528,6 @@ pub fn run(
     result
 }
 
-/// Advance the herd one tick: roam + animation phase. A no-op under
-/// `reduced_motion`, which freezes both horizontal wander and the per-frame
-/// bounce/shake/breathe (phase stays 0, so `motion_offset` stays zero).
-fn simulate_tick(
-    herd: &mut Herd,
-    species: &[Species],
-    dt_ms: f32,
-    w: f32,
-    pet_w: f32,
-    rng: &mut dyn crate::herd::Rng,
-    reduced_motion: bool,
-) {
-    if reduced_motion {
-        return;
-    }
-    herd.step(dt_ms, w, pet_w, rng);
-    for p in herd.pets.iter_mut() {
-        let fm = species
-            .get(p.identity.species_index)
-            .or_else(|| species.first())
-            .and_then(|s| s.states.get(&p.status))
-            .map(|st| st.frame_ms)
-            .unwrap_or(0);
-        p.advance(dt_ms, fm);
-    }
-}
-
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     rx: Receiver<Vec<Agent>>,
@@ -510,35 +542,24 @@ where
 {
     let tick = Duration::from_millis(83); // ~12 fps
     let species_count = species.len().max(1);
-    // Same pet_w feeds both reconcile's spawn bound and step's clamp bound,
-    // so a freshly-spawned pet never lands outside the walkable strip.
-    let pet_w = species.first().map(|s| s.size().0).unwrap_or(12) as f32;
     let mut herd = Herd::new();
-    let mut rng = Lcg::new(0xC0FFEE);
-    let mut last = Instant::now();
     let mut hovered: Option<String> = None;
     loop {
         while let Ok(agents) = rx.try_recv() {
-            let w = terminal.size()?.width as f32;
-            herd.reconcile(&agents, species_count, w, pet_w, &mut rng);
+            herd.reconcile(&agents, species_count);
         }
-        let now = Instant::now();
-        let dt_ms = (now - last).as_millis() as f32;
-        last = now;
-        let w = terminal.size()?.width as f32;
-        simulate_tick(
-            &mut herd,
-            species,
-            dt_ms,
-            w,
-            pet_w,
-            &mut rng,
-            reduced_motion,
-        );
+        // Reduced motion freezes every pet at one fixed instant (0) instead of
+        // the live clock — `motion::animate` is a pure function of this value,
+        // so "frozen" falls out for free with no separate code path.
+        let now_ms = if reduced_motion {
+            0
+        } else {
+            wall_clock_now_ms()
+        };
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
         terminal.draw(|f| {
-            renderer.draw(f, &herd, species, theme);
+            renderer.draw(f, &herd, species, theme, now_ms);
             draw_caption(f, f.area(), caption.as_deref());
         })?;
 
@@ -555,11 +576,13 @@ where
                 Event::Mouse(MouseEvent { kind, column, .. }) => match kind {
                     MouseEventKind::Moved => {
                         hovered = renderer
-                            .pet_at_column(&herd, species, strip_w, column)
+                            .pet_at_column(&herd, species, strip_w, column, now_ms)
                             .map(|i| herd.pets[i].label.clone());
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(i) = renderer.pet_at_column(&herd, species, strip_w, column) {
+                        if let Some(i) =
+                            renderer.pet_at_column(&herd, species, strip_w, column, now_ms)
+                        {
                             let tid = herd.pets[i].terminal_id.clone();
                             // Swallow focus errors: the strip must keep running.
                             let _ = focus_agent(focus, &tid);
@@ -577,8 +600,10 @@ where
 mod tests {
     use super::*;
     use crate::agent::{Agent, AgentStatus};
-    use crate::herd::{Herd, Lcg};
+    use crate::herd::Herd;
+    use crate::identity::identity_for;
     use crate::palette::Theme;
+    use crate::pet::Pet;
     use crate::sprite::parse_species;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -587,6 +612,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/sprites/test-blob.sprite"
     ));
+
+    /// An arbitrary fixed instant: snapshot tests just need *some* stable
+    /// value, since `motion::animate` is pure (same inputs, same pixels).
+    const NOW_MS: u64 = 1_700_000_000_000;
 
     fn agent(tid: &str, s: AgentStatus) -> Agent {
         Agent {
@@ -607,19 +636,12 @@ mod tests {
 
     fn fixed_herd(states: &[AgentStatus]) -> Herd {
         let mut h = Herd::new();
-        let mut rng = Lcg::new(1);
         let agents: Vec<_> = states
             .iter()
             .enumerate()
             .map(|(i, s)| agent(&format!("t{i}"), *s))
             .collect();
-        h.reconcile(&agents, 1, 120.0, 16.0, &mut rng);
-        // Freeze positions + phase for a deterministic snapshot.
-        for (i, p) in h.pets.iter_mut().enumerate() {
-            p.x = 4.0 + i as f32 * 16.0;
-            p.target_x = p.x;
-            p.phase = 0.0;
-        }
+        h.reconcile(&agents, 1);
         h
     }
 
@@ -630,7 +652,7 @@ mod tests {
         let herd = fixed_herd(&[Idle, Working, Done, Blocked, Unknown]);
         let mut terminal = Terminal::new(TestBackend::new(90, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -640,7 +662,6 @@ mod tests {
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
         let mut h = Herd::new();
-        let mut rng = Lcg::new(1);
         let agents: Vec<_> = [Working, Idle]
             .iter()
             .enumerate()
@@ -650,15 +671,10 @@ mod tests {
                 a
             })
             .collect();
-        h.reconcile(&agents, 1, 120.0, 16.0, &mut rng);
-        for (i, p) in h.pets.iter_mut().enumerate() {
-            p.x = 4.0 + i as f32 * 16.0;
-            p.target_x = p.x;
-            p.phase = 0.0;
-        }
+        h.reconcile(&agents, 1);
         let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &h, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &h, &species, Theme::Dark, NOW_MS))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -670,7 +686,7 @@ mod tests {
         let herd = fixed_herd(&[Idle; 20]);
         let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -679,49 +695,59 @@ mod tests {
     fn reconcile_then_draw_shows_the_incoming_herd() {
         // A focused integration check: feed one snapshot, reconcile, draw, snapshot.
         use crate::agent::AgentStatus::*;
-        use crate::herd::{Herd, Lcg};
         let species = vec![crate::sprite::parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        let mut rng = Lcg::new(3);
-        herd.reconcile(
-            &[agent("a", Working), agent("b", Blocked)],
-            1,
-            60.0,
-            16.0,
-            &mut rng,
-        );
-        for (i, p) in herd.pets.iter_mut().enumerate() {
-            p.x = 4.0 + i as f32 * 18.0;
-            p.target_x = p.x;
-        }
+        herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1);
         let mut terminal = Terminal::new(TestBackend::new(60, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
-
-    use crate::identity::identity_for;
-    use crate::pet::Pet;
 
     #[test]
     fn pet_at_column_returns_the_topmost_pet_when_they_overlap() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        // Two overlapping pets near x=10: idle (low priority) and blocked (high).
         herd.pets.push(Pet::new(
             "idle".into(),
             identity_for("idle", 1),
             AgentStatus::Idle,
-            10.0,
         ));
         herd.pets.push(Pet::new(
             "blk".into(),
             identity_for("blk", 1),
             AgentStatus::Blocked,
-            12.0,
         ));
-        let hit = pet_at_column(&herd, &species, 200, 13).expect("a pet under column 13");
+        // A strip narrower than 2x the pet width (test-blob is 4px wide)
+        // guarantees any two pets' hit ranges intersect, however their
+        // identity-derived rest positions land — no need to know the exact
+        // hash values.
+        let strip_w = 7usize;
+        let max_x = (strip_w as f32 - 4.0).max(0.0);
+        let sp = &species[0];
+        let idle_left = (animate(
+            "idle",
+            AgentStatus::Idle,
+            &sp.states[&AgentStatus::Idle],
+            NOW_MS,
+        )
+        .x_fraction
+            * max_x)
+            .round() as i32;
+        let blk_left = (animate(
+            "blk",
+            AgentStatus::Blocked,
+            &sp.states[&AgentStatus::Blocked],
+            NOW_MS,
+        )
+        .x_fraction
+            * max_x)
+            .round() as i32;
+        let overlap_col = idle_left.max(blk_left) as u16;
+
+        let hit = pet_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
+            .expect("a pet under the overlap column");
         assert_eq!(
             herd.pets[hit].terminal_id, "blk",
             "blocked draws on top, so it wins the hit"
@@ -733,20 +759,30 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
         // Same-priority overlap: "b" is pushed later, so the stable sort in
-        // draw_herd keeps it later in z-order and it draws on top.
+        // draw_herd keeps it later in z-order and it draws on top. Same
+        // narrow-strip trick as above forces the overlap.
         herd.pets.push(Pet::new(
             "a".into(),
             identity_for("a", 1),
             AgentStatus::Idle,
-            10.0,
         ));
         herd.pets.push(Pet::new(
             "b".into(),
             identity_for("b", 1),
             AgentStatus::Idle,
-            12.0,
         ));
-        let hit = pet_at_column(&herd, &species, 200, 13).expect("a pet under column 13");
+        let strip_w = 7usize;
+        let max_x = (strip_w as f32 - 4.0).max(0.0);
+        let sp = &species[0];
+        let idle_state = &sp.states[&AgentStatus::Idle];
+        let a_left =
+            (animate("a", AgentStatus::Idle, idle_state, NOW_MS).x_fraction * max_x).round() as i32;
+        let b_left =
+            (animate("b", AgentStatus::Idle, idle_state, NOW_MS).x_fraction * max_x).round() as i32;
+        let overlap_col = a_left.max(b_left) as u16;
+
+        let hit = pet_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
+            .expect("a pet under the overlap column");
         assert_eq!(
             herd.pets[hit].terminal_id, "b",
             "later-pushed same-priority pet draws on top, so it wins the hit"
@@ -760,7 +796,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|f| {
-                draw_herd(f, &herd, &species, Theme::Dark);
+                draw_herd(f, &herd, &species, Theme::Dark, NOW_MS);
                 draw_caption(f, f.area(), Some("backend-api"));
             })
             .unwrap();
@@ -784,7 +820,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Done]);
         let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         let rows = rows_of(terminal.backend());
         assert!(rows[0].contains('!'), "badge sits in the top lane (row 0)");
@@ -804,7 +840,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Idle; 30]);
         let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         let rows = rows_of(terminal.backend());
         assert!(rows[0].contains('+'), "the +N marker is in the top lane");
@@ -818,34 +854,13 @@ mod tests {
             "a".into(),
             identity_for("a", 1),
             AgentStatus::Idle,
-            4.0,
         ));
+        // A pet's occupied range never reaches past `strip_w` itself (its
+        // rest fraction is in [0,1] of the walkable width), so the column
+        // right at the strip's edge is a gap regardless of the identity hash.
         assert!(
-            pet_at_column(&herd, &species, 200, 150).is_none(),
-            "column far past the pet is empty"
-        );
-    }
-
-    #[test]
-    fn simulate_tick_freezes_position_and_phase_under_reduced_motion() {
-        let species = vec![parse_species(BLOB).unwrap()];
-        let mut herd = Herd::new();
-        herd.pets.push(Pet::new(
-            "a".into(),
-            identity_for("a", 1),
-            AgentStatus::Working,
-            10.0,
-        ));
-        let mut rng = Lcg::new(1);
-        let (x0, ph0) = (herd.pets[0].x, herd.pets[0].phase);
-        simulate_tick(&mut herd, &species, 500.0, 200.0, 12.0, &mut rng, true);
-        assert_eq!(herd.pets[0].x, x0, "reduced motion freezes x");
-        assert_eq!(herd.pets[0].phase, ph0, "reduced motion freezes phase");
-        // Motion on: phase advances (Working has frame_ms > 0).
-        simulate_tick(&mut herd, &species, 500.0, 200.0, 12.0, &mut rng, false);
-        assert!(
-            herd.pets[0].phase != ph0,
-            "phase advances when motion is on"
+            pet_at_column(&herd, &species, 200, 200, NOW_MS).is_none(),
+            "column past the strip's edge is empty"
         );
     }
 
@@ -872,22 +887,31 @@ mod tests {
 
     #[test]
     fn left_facing_pet_is_mirrored() {
-        // Build a herd with one working pet, force facing_left, freeze it, and
-        // assert the rendered band differs from the same pet facing right.
-        use crate::agent::AgentStatus::*;
+        // A working pet's facing flips as it wanders back and forth. Find two
+        // instants where the same agent faces opposite ways (motion::animate
+        // as an oracle, rather than forcing the field directly — it's derived
+        // now, not stored), and assert the rendered band differs between them.
+        use crate::agent::AgentStatus::Working;
         let species = vec![parse_species(BLOB).unwrap()];
-        let mut right = fixed_herd(&[Working]);
-        right.pets[0].facing_left = false;
-        let mut left = fixed_herd(&[Working]);
-        left.pets[0].facing_left = true;
-        let render = |h: &Herd| {
+        let herd = fixed_herd(&[Working]);
+        let state = &species[0].states[&Working];
+        let right_ms = (0..80_000u64)
+            .step_by(97)
+            .find(|&ms| !animate("t0", Working, state, ms).facing_left)
+            .expect("some instant facing right");
+        let left_ms = (0..80_000u64)
+            .step_by(97)
+            .find(|&ms| animate("t0", Working, state, ms).facing_left)
+            .expect("some instant facing left");
+        let render = |ms: u64| {
             let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
-            t.draw(|f| draw_herd(f, h, &species, Theme::Dark)).unwrap();
+            t.draw(|f| draw_herd(f, &herd, &species, Theme::Dark, ms))
+                .unwrap();
             format!("{}", t.backend())
         };
         assert_ne!(
-            render(&right),
-            render(&left),
+            render(right_ms),
+            render(left_ms),
             "mirroring must change the pixels"
         );
     }
@@ -931,11 +955,11 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut via_trait = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_trait
-            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark))
+            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         let mut via_fn = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_fn
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
         assert_eq!(
             format!("{}", via_trait.backend()),
@@ -952,7 +976,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
             .unwrap();
     }
 
@@ -967,20 +991,40 @@ mod tests {
             .count()
     }
 
+    /// Scan `now_ms` in `[0, period_ms)` for the instant where `state`'s
+    /// motion lifts `terminal_id` highest (most negative `offset.dy`) — the
+    /// tightest case for top-clipping. Uses `motion::animate` as an oracle
+    /// (same trick as `left_facing_pet_is_mirrored` below) rather than
+    /// reverse-engineering `identity::unit_hash`.
+    fn peak_lift_ms(
+        terminal_id: &str,
+        status: AgentStatus,
+        state: &crate::sprite::StateSpec,
+        period_ms: u64,
+    ) -> u64 {
+        (0..period_ms)
+            .step_by(37)
+            .min_by(|&a, &b| {
+                let dy_a = animate(terminal_id, status, state, a).offset.dy;
+                let dy_b = animate(terminal_id, status, state, b).offset.dy;
+                dy_a.partial_cmp(&dy_b).unwrap()
+            })
+            .expect("a non-empty scan range")
+    }
+
     #[test]
     fn build_band_draws_a_hat_only_for_the_focused_pet() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        let mut focused = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Idle, 10.0);
+        let mut focused = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Idle);
         focused.focused = true;
         herd.pets.push(focused);
         herd.pets.push(Pet::new(
             "unfocused".into(),
             identity_for("unfocused", 1),
             AgentStatus::Idle,
-            30.0,
         ));
-        let (buf, _order) = build_band(&herd, &species, 50, Theme::Dark);
+        let (buf, _order) = build_band(&herd, &species, 50, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -992,15 +1036,16 @@ mod tests {
     fn hat_is_never_clipped_at_the_top_even_when_the_sprite_has_no_headroom_row() {
         // TestBlob's working frame paints all the way up to row 0 (`MM..`),
         // the worst case for top clipping: no spare row inside the frame
-        // itself. Freeze the phase at the peak of the hop lift (phase=0.25 =>
-        // dy=-1, the maximum), which pushes the sprite as high as it goes.
+        // itself. Scan for the instant of peak hop lift, which pushes the
+        // sprite as high as it ever goes.
         let species = vec![parse_species(BLOB).unwrap()];
+        let state = &species[0].states[&AgentStatus::Working];
+        let peak_ms = peak_lift_ms("f", AgentStatus::Working, state, 20_000);
         let mut herd = Herd::new();
-        let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working, 10.0);
+        let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working);
         pet.focused = true;
-        pet.phase = 0.25;
         herd.pets.push(pet);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1009,15 +1054,16 @@ mod tests {
     }
 
     #[test]
-    fn hat_is_never_clipped_on_the_real_sheep_standing_pose_mid_shake() {
+    fn hat_is_never_clipped_on_the_real_sheep_standing_pose_mid_bounce() {
         // The acceptance criterion's tight case: the real (16x14) standing
-        // pose, which has only ~1 empty row above the head, with the shake
-        // motion at its peak lift (phase=0.125 => dy=-1, the maximum).
+        // pose, which has only ~1 empty row above the head, at peak bounce lift.
         let species = crate::sprite::embedded_species();
         let sheep_index = species
             .iter()
             .position(|s| s.name == "Sheep")
             .expect("Sheep is embedded");
+        let state = &species[sheep_index].states[&AgentStatus::Blocked];
+        let peak_ms = peak_lift_ms("f", AgentStatus::Blocked, state, 20_000);
         let mut herd = Herd::new();
         let mut pet = Pet::new(
             "f".into(),
@@ -1026,16 +1072,14 @@ mod tests {
                 hue: 0,
             },
             AgentStatus::Blocked,
-            5.0,
         );
         pet.focused = true;
-        pet.phase = 0.125;
         herd.pets.push(pet);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
-            "the hat fits above the standing pose's head even mid-shake"
+            "the hat fits above the standing pose's head even mid-bounce"
         );
     }
 
@@ -1051,11 +1095,10 @@ mod tests {
                 hue: 0,
             },
             AgentStatus::Idle,
-            5.0,
         );
         pet.focused = true;
         herd.pets.push(pet);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1068,12 +1111,14 @@ mod tests {
         // The goat's horns sit a row above the sheep's head, so its head
         // anchor is one row higher — the generic topmost-opaque-pixel scan
         // must pick that up on its own, with no per-species table, and the
-        // reserved headroom must still cover it.
+        // reserved headroom must still cover it, even at peak bounce lift.
         let species = crate::sprite::embedded_species();
         let goat_index = species
             .iter()
             .position(|s| s.name == "Goat")
             .expect("Goat is embedded");
+        let state = &species[goat_index].states[&AgentStatus::Blocked];
+        let peak_ms = peak_lift_ms("f", AgentStatus::Blocked, state, 20_000);
         let mut herd = Herd::new();
         let mut pet = Pet::new(
             "f".into(),
@@ -1082,48 +1127,26 @@ mod tests {
                 hue: 0,
             },
             AgentStatus::Blocked,
-            5.0,
         );
         pet.focused = true;
-        pet.phase = 0.125; // peak shake lift, same tight case as the sheep test
         herd.pets.push(pet);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark);
+        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
-            "the hat fits above the goat's horns even mid-shake"
+            "the hat fits above the goat's horns even mid-bounce"
         );
     }
 
     #[test]
-    fn hat_position_flips_with_facing() {
+    fn head_anchor_column_flips_with_facing() {
         // TestBlob's working frame is asymmetric (`MM../MMM./M##./.MM.`), so a
-        // facing flip moves the head anchor's column, which must move the
-        // hat with it.
-        let species = vec![parse_species(BLOB).unwrap()];
-        let render_at = |facing_left: bool| {
-            let mut herd = Herd::new();
-            let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working, 10.0);
-            pet.focused = true;
-            pet.facing_left = facing_left;
-            herd.pets.push(pet);
-            build_band(&herd, &species, 40, Theme::Dark).0
-        };
-        let right = render_at(false);
-        let left = render_at(true);
-        let leftmost_hat_col = |buf: &PixelBuf| {
-            (0..buf.w)
-                .find(|&x| {
-                    (0..buf.h).any(|y| {
-                        matches!(buf.px[y * buf.w + x], Some(c) if c == HAT_OUTLINE || c == HAT_FILL)
-                    })
-                })
-                .expect("a hat was drawn")
-        };
-        assert_ne!(
-            leftmost_hat_col(&right),
-            leftmost_hat_col(&left),
-            "facing flip must move the hat, not just the body"
-        );
+        // facing flip must move the head anchor's column — otherwise the hat
+        // would stay put while the body mirrors underneath it.
+        let species = parse_species(BLOB).unwrap();
+        let fr = &species.states[&AgentStatus::Working].frames[0];
+        let (_row_right, col_right) = head_anchor(fr, false);
+        let (_row_left, col_left) = head_anchor(fr, true);
+        assert_ne!(col_right, col_left, "facing flip must move the head anchor");
     }
 }

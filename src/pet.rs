@@ -1,5 +1,9 @@
-//! One pet: identity, live status, horizontal position, and an animation phase.
-//! Priority drives both draw order (z-index) and overflow selection.
+//! One pet: identity, live status, label, and focus. Priority drives both
+//! draw order (z-index) and overflow selection. Position and animation are
+//! *not* stored here — they're resolved fresh every draw by
+//! `motion::animate`, a pure function of `(terminal_id, status, wall-clock
+//! time)`, so every pane's independent process renders the exact same agent
+//! identically.
 
 use crate::agent::AgentStatus;
 use crate::identity::Identity;
@@ -16,18 +20,14 @@ pub fn priority(status: AgentStatus) -> u8 {
     }
 }
 
-/// One pet: a stable identity plus the live, mutable state the renderer and
-/// herd simulation update every tick.
+/// One pet: a stable identity plus the live status/label the herd simulation
+/// updates on reconcile.
 #[derive(Debug, Clone)]
 pub struct Pet {
     pub terminal_id: String,
     pub identity: Identity,
     pub status: AgentStatus,
     pub label: String,
-    pub x: f32,
-    pub target_x: f32,
-    pub phase: f32,
-    pub facing_left: bool,
     /// Mirrors `Agent::focused`: this pet's owning agent is the current one,
     /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
     /// derived here — `Pet` has no access to the agent snapshot.
@@ -35,19 +35,14 @@ pub struct Pet {
 }
 
 impl Pet {
-    /// Build a pet at rest at `x` (so `target_x` starts equal to `x`) with
-    /// its animation phase at the start of the cycle, unfocused until
-    /// `Herd::reconcile` says otherwise.
-    pub fn new(terminal_id: String, identity: Identity, status: AgentStatus, x: f32) -> Self {
+    /// Build a pet with an empty label (filled in by `reconcile`), unfocused
+    /// until `Herd::reconcile` says otherwise.
+    pub fn new(terminal_id: String, identity: Identity, status: AgentStatus) -> Self {
         Self {
             terminal_id,
             identity,
             status,
             label: String::new(),
-            x,
-            target_x: x,
-            phase: 0.0,
-            facing_left: false,
             focused: false,
         }
     }
@@ -55,38 +50,6 @@ impl Pet {
     /// This pet's current draw/overflow priority, from its live status.
     pub fn z_priority(&self) -> u8 {
         priority(self.status)
-    }
-
-    /// Which of `frame_count` sprite frames the current phase selects.
-    pub fn frame_index(&self, frame_count: usize) -> usize {
-        if frame_count <= 1 {
-            0
-        } else {
-            ((self.phase * frame_count as f32) as usize).min(frame_count - 1)
-        }
-    }
-
-    /// Advance the animation phase by `dt_ms`, wrapping at 1.0.
-    /// `frame_ms == 0` means a single static frame: phase stays pinned to 0.
-    pub fn advance(&mut self, dt_ms: f32, frame_ms: u32) {
-        if frame_ms == 0 {
-            self.phase = 0.0;
-            return;
-        }
-        // One full phase cycle spans `frame_ms` per implied frame; keep it simple:
-        // advance proportionally and wrap.
-        let cycle_ms = frame_ms as f32 * 2.0; // 2-frame default cadence
-        self.phase = (self.phase + dt_ms / cycle_ms).rem_euclid(1.0);
-    }
-
-    /// Update facing from a horizontal delta; zero delta keeps the last facing
-    /// so a pet that stops does not snap back to a default direction.
-    pub fn set_facing_from_dx(&mut self, dx: f32) {
-        if dx > 0.0 {
-            self.facing_left = false;
-        } else if dx < 0.0 {
-            self.facing_left = true;
-        }
     }
 }
 
@@ -97,7 +60,7 @@ mod tests {
     use crate::identity::identity_for;
 
     fn pet(status: AgentStatus) -> Pet {
-        Pet::new("term_x".into(), identity_for("term_x", 3), status, 0.0)
+        Pet::new("term_x".into(), identity_for("term_x", 3), status)
     }
 
     #[test]
@@ -117,42 +80,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_index_cycles_with_phase() {
-        let mut p = pet(AgentStatus::Working);
-        p.phase = 0.0;
-        assert_eq!(p.frame_index(2), 0);
-        p.phase = 0.75;
-        assert_eq!(p.frame_index(2), 1);
-    }
-
-    #[test]
-    fn advance_wraps_phase() {
-        let mut p = pet(AgentStatus::Idle);
-        p.phase = 0.9;
-        p.advance(600.0, 500); // cycle_ms = 500*2 = 1000; 0.9 + 600/1000 = 1.5 -> wraps to 0.5
-        assert_eq!(p.phase, 0.5);
-    }
-
-    #[test]
-    fn static_state_pins_phase_to_zero() {
-        let mut p = pet(AgentStatus::Unknown);
-        p.phase = 0.7; // start non-zero
-        p.advance(1000.0, 0); // frame_ms == 0 => static
-        assert_eq!(p.phase, 0.0); // proves it was pinned, not left at 0.7
-    }
-
-    #[test]
-    fn facing_tracks_last_nonzero_direction() {
-        let mut p = pet(AgentStatus::Working);
-        assert!(
-            !p.facing_left,
-            "defaults to facing right (sprite art faces right)"
+    fn z_priority_matches_the_free_function() {
+        assert_eq!(
+            pet(AgentStatus::Blocked).z_priority(),
+            priority(AgentStatus::Blocked)
         );
-        p.set_facing_from_dx(-2.0);
-        assert!(p.facing_left, "moving left faces left");
-        p.set_facing_from_dx(0.0);
-        assert!(p.facing_left, "no movement keeps the last facing");
-        p.set_facing_from_dx(3.0);
-        assert!(!p.facing_left, "moving right faces right");
     }
 }

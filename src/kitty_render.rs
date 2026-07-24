@@ -12,13 +12,60 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::agent::AgentStatus;
+use crate::anim::{Overlay, OverlayColor};
 use crate::herd::{Herd, visible_and_hidden};
-use crate::kitty::{delete_all, delete_placement, place_sized, transmit_rgba};
+use crate::icon::{IconKind, icon_size, rasterize_icon};
+use crate::kitty::{Crop, delete_all, delete_placement, place_cropped, transmit_rgba};
+use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
-use crate::raster::rasterize;
+use crate::raster::{pad_frame, rasterize};
 use crate::render::PetRenderer;
 use crate::sprite::{Frame as SpriteFrame, Species};
+
+/// Sprite-pixel margin padded around a transmitted pet image, so a motion
+/// offset can be animated by panning a crop window instead of retransmitting.
+/// 2px comfortably covers every motion's max amplitude (breathe <=0.5, hop/
+/// bounce <=1.0, sway <=1.0).
+const MOTION_PAD: usize = 2;
+
+/// Icon-pixel margin padded around a transmitted overlay icon image, for the
+/// same crop-panning trick. `ICON_PAD - ICON_MARGIN` is the pan range each
+/// side of the displayed (bitmap + margin) crop actually gets, so it must
+/// clear `icon_wave_offset`'s max amplitude (dy <= 1.0) with room to spare —
+/// otherwise the wave's rise pans the crop straight into the bitmap itself,
+/// clipping the glyph's top edge during motion.
+const ICON_PAD: usize = 6;
+
+/// Extra transparent framing (icon-pixels, on top of the bitmap's own size)
+/// included in the *displayed* crop, so the glyph doesn't fill its on-screen
+/// cell edge-to-edge — the bitmaps themselves are full-bleed (e.g. `Sleep`'s
+/// top/bottom rows are solid ink), so without this margin the icon reads as
+/// a big, blocky mark rather than a small floating one.
+const ICON_MARGIN: usize = 2;
+
+/// Stacking index floor for overlay icons: always above every pet body, which
+/// draw at `z = 0..order.len()`.
+const Z_ICON_BASE: i32 = 1000;
+
+/// The source rectangle (in raster pixels) that shows an unpadded `w`x`h`
+/// (at `scale` px/unit) region shifted by `(dx, dy)` units within a canvas
+/// padded by `pad` units on every side — panning a same-size "camera" over a
+/// larger, static image to fake motion without retransmitting it. Clamped so
+/// a same-size larger offset pins to the padding edge instead of overflowing.
+fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> Crop {
+    let scale_f = scale as f32;
+    let max_x = (2 * pad * scale) as i32;
+    let max_y = (2 * pad * scale) as i32;
+    let x = (((pad as f32 - dx) * scale_f).round() as i32).clamp(0, max_x);
+    let y = (((pad as f32 - dy) * scale_f).round() as i32).clamp(0, max_y);
+    Crop {
+        x: x as u32,
+        y: y as u32,
+        w: (w * scale) as u32,
+        h: (h * scale) as u32,
+    }
+}
 
 /// Rows a pet image occupies, derived from the pane height (reserving the
 /// caption row plus a little headroom) and capped small so the pets always
@@ -87,6 +134,16 @@ pub struct KittyRenderer {
     /// on-screen placement requires the image id it was placed under, which
     /// a `HashMap<String, u32>` of placement ids alone cannot recover.
     placements: HashMap<String, (u32, u32)>,
+    /// Transmitted overlay icon images, cached by (icon kind, is-dark-theme,
+    /// resolved overlay color) since an icon's pixels don't depend on
+    /// species/hue/facing, but `done` and `blocked` share `IconKind::Alert`
+    /// (both use `!`) and must render as distinct images (accent vs. red).
+    icon_cache: HashMap<(IconKind, bool, OverlayColor), u32>,
+    /// `terminal_id -> (image_id, placement_id)` of that pet's current icon
+    /// placement, if its state has an overlay. Tracked separately from
+    /// `placements` because a pet can lose its overlay (e.g. idle -> working)
+    /// while staying visible, which must delete the icon but keep the pet.
+    icon_placements: HashMap<String, (u32, u32)>,
     next_id: u32,
     /// The pane area the last frame was drawn against. When it changes (a
     /// resize), the terminal may have dropped our transmitted images, so we
@@ -107,6 +164,8 @@ impl KittyRenderer {
             out,
             cache: HashMap::new(),
             placements: HashMap::new(),
+            icon_cache: HashMap::new(),
+            icon_placements: HashMap::new(),
             next_id: 1,
             last_area: None,
         }
@@ -121,6 +180,7 @@ impl KittyRenderer {
         species: &[Species],
         area: Rect,
         theme: Theme,
+        now_ms: u64,
     ) -> io::Result<()> {
         // On a geometry change (resize), the terminal may have dropped our
         // transmitted images. Purge everything and re-transmit fresh this
@@ -130,11 +190,14 @@ impl KittyRenderer {
             self.out.write_all(delete_all().as_bytes())?;
             self.cache.clear();
             self.placements.clear();
+            self.icon_cache.clear();
+            self.icon_placements.clear();
             self.last_area = Some(area);
         }
 
         let strip_w = area.width as usize;
         let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
+        let max_x = (strip_w as f32 - pet_w as f32).max(0.0);
         let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
         let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
 
@@ -152,13 +215,13 @@ impl KittyRenderer {
             let Some(state) = sp.states.get(&pet.status) else {
                 continue;
             };
-            let fi = pet.frame_index(state.frames.len());
-            let fr = &state.frames[fi];
+            let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+            let fr = &state.frames[animated.frame_index];
             let key: ImgKey = (
                 pet.identity.species_index,
                 pet.status,
-                fi,
-                pet.facing_left,
+                animated.frame_index,
+                animated.facing_left,
                 pet.identity.hue,
             );
             let image_id = match self.cache.get(&key) {
@@ -168,13 +231,17 @@ impl KittyRenderer {
                         dim: state.dim,
                         ghost: state.ghost,
                     };
+                    // Transmit a padded canvas (once per key), so this state's
+                    // motion can be animated below by panning a crop window
+                    // over it instead of retransmitting every frame.
+                    let padded = pad_frame(fr, MOTION_PAD);
                     let rgba = rasterize(
-                        fr,
+                        &padded,
                         pet.identity.hue,
                         theme,
                         style,
                         self.scale,
-                        pet.facing_left,
+                        animated.facing_left,
                     );
                     let id = self.next_id;
                     self.next_id += 1;
@@ -195,16 +262,29 @@ impl KittyRenderer {
             let cols = pet_cols(rows, fr.w, fr.h);
             let pane_h = area.height as i32;
             let row = (pane_h - rows as i32).clamp(1, pane_h.max(1));
-            let col = (pet.x.round() as i32 + 1).clamp(1, area.width.max(1) as i32);
+            let col = ((animated.x_fraction * max_x).round() as i32 + 1)
+                .clamp(1, area.width.max(1) as i32);
             self.out
                 .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 
             let pid = self.next_id;
             self.next_id += 1;
+            // Pan the crop window by this state's motion offset (breathe/hop/
+            // bounce/sway) — the same offset the half-block path bakes
+            // straight into its pixel buffer — so the body actually animates
+            // instead of sitting dead still.
+            let crop = crop_rect(
+                MOTION_PAD,
+                self.scale,
+                fr.w,
+                fr.h,
+                animated.offset.dx,
+                animated.offset.dy,
+            );
             // z = draw-order index: later-drawn (higher priority) stacks on top,
             // so kitty's visual stacking matches the hit-test's last-wins order.
             self.out
-                .write_all(place_sized(image_id, pid, cols, rows, zi as i32).as_bytes())?;
+                .write_all(place_cropped(image_id, pid, crop, cols, rows, zi as i32).as_bytes())?;
 
             if let Some((old_img, old_pid)) = self
                 .placements
@@ -214,6 +294,98 @@ impl KittyRenderer {
                 // before the old one disappears, so there is no blank frame.
                 self.out
                     .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+            }
+
+            // Overlay icon: a small pixel-art Zz/!/? floating just above the
+            // pet, on its own wave motion (`pet.icon_phase`), independent of
+            // the body's own state. No overlay this state -> drop any
+            // lingering icon placement from a previous status.
+            let glyph = match &state.overlay.kind {
+                Overlay::Bubble(g) | Overlay::Badge(g) => Some(g.as_str()),
+                Overlay::None => None,
+            };
+            match glyph.and_then(IconKind::from_glyph) {
+                Some(kind) => {
+                    let icon_key = (kind, theme == Theme::Dark, state.overlay.color);
+                    let icon_image_id = match self.icon_cache.get(&icon_key) {
+                        Some(&id) => id,
+                        None => {
+                            let rgba = rasterize_icon(
+                                kind,
+                                theme,
+                                state.overlay.color,
+                                self.scale,
+                                ICON_PAD,
+                            );
+                            let id = self.next_id;
+                            self.next_id += 1;
+                            self.out.write_all(
+                                transmit_rgba(id, rgba.w, rgba.h, &rgba.px).as_bytes(),
+                            )?;
+                            self.icon_cache.insert(icon_key, id);
+                            id
+                        }
+                    };
+                    let (iw, ih) = icon_size(kind);
+                    // Crop a slightly larger window than the bitmap itself, so
+                    // the on-screen cell keeps transparent framing around the
+                    // glyph instead of the (full-bleed) bitmap filling it edge
+                    // to edge — see `ICON_MARGIN`. `crop_rect` centers its
+                    // crop window `pad` units in from the transmitted
+                    // canvas's edge; since this crop window is itself
+                    // `ICON_MARGIN` units larger than the bitmap it's
+                    // centered on, the pad passed here must shrink by that
+                    // same margin, or the "rest" position ends up flush
+                    // against the bitmap's own top-left edge (no framing
+                    // above/left at all) instead of framing it symmetrically —
+                    // which is exactly what previously let the wave's rise
+                    // crop straight into the glyph's top row.
+                    let icon_crop = crop_rect(
+                        ICON_PAD - ICON_MARGIN,
+                        self.scale,
+                        iw + ICON_MARGIN * 2,
+                        ih + ICON_MARGIN * 2,
+                        animated.icon_offset.dx,
+                        animated.icon_offset.dy,
+                    );
+                    let icon_rows: u16 = 1;
+                    let icon_cols = pet_cols(icon_rows, iw, ih);
+                    let icon_row = row.saturating_sub(1).max(1);
+                    let icon_col_max = (area.width as i32 - icon_cols as i32 + 1).max(1);
+                    let icon_col =
+                        (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
+                    self.out
+                        .write_all(format!("\x1b[{icon_row};{icon_col}H").as_bytes())?;
+                    let icon_pid = self.next_id;
+                    self.next_id += 1;
+                    self.out.write_all(
+                        place_cropped(
+                            icon_image_id,
+                            icon_pid,
+                            icon_crop,
+                            icon_cols,
+                            icon_rows,
+                            Z_ICON_BASE + zi as i32,
+                        )
+                        .as_bytes(),
+                    )?;
+                    if let Some((old_img, old_pid)) = self
+                        .icon_placements
+                        .insert(pet.terminal_id.clone(), (icon_image_id, icon_pid))
+                    {
+                        self.out
+                            .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+                    }
+                }
+                None => {
+                    if let Some((old_img, old_pid)) = self.icon_placements.remove(&pet.terminal_id)
+                    {
+                        // This status has no overlay (e.g. working) — drop any
+                        // icon left over from a previous status (e.g. idle).
+                        self.out
+                            .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+                    }
+                }
             }
         }
 
@@ -235,6 +407,17 @@ impl KittyRenderer {
                 self.out.write_all(delete_placement(img, pid).as_bytes())?;
             }
         }
+        let departed_icons: Vec<String> = self
+            .icon_placements
+            .keys()
+            .filter(|tid| !visible_ids.contains(tid.as_str()))
+            .cloned()
+            .collect();
+        for tid in departed_icons {
+            if let Some((img, pid)) = self.icon_placements.remove(&tid) {
+                self.out.write_all(delete_placement(img, pid).as_bytes())?;
+            }
+        }
 
         Ok(())
     }
@@ -244,8 +427,8 @@ impl KittyRenderer {
     /// tests (200 columns). Errors are swallowed, mirroring `draw`'s
     /// tolerance for a failed frame.
     #[cfg(test)]
-    pub fn draw_to_sink(&mut self, herd: &Herd, species: &[Species], theme: Theme) {
-        let _ = self.render_pets(herd, species, Rect::new(0, 0, 200, 10), theme);
+    pub fn draw_to_sink(&mut self, herd: &Herd, species: &[Species], theme: Theme, now_ms: u64) {
+        let _ = self.render_pets(herd, species, Rect::new(0, 0, 200, 10), theme, now_ms);
     }
 }
 
@@ -254,8 +437,15 @@ impl PetRenderer for KittyRenderer {
     /// the ratatui buffer — `frame` is only consulted for its width. A failed
     /// write degrades to a skipped frame rather than crashing the strip (the
     /// render loop already tolerates this for the half-block path).
-    fn draw(&mut self, frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
-        let _ = self.render_pets(herd, species, frame.area(), theme);
+    fn draw(
+        &mut self,
+        frame: &mut Frame,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        now_ms: u64,
+    ) {
+        let _ = self.render_pets(herd, species, frame.area(), theme, now_ms);
     }
 
     /// Hit-test using the same visible set as `render_pets`. A pet's hit range
@@ -264,15 +454,19 @@ impl PetRenderer for KittyRenderer {
     /// pixels to cells. We iterate in the SAME z-order `render_pets` draws
     /// (priority-sorted, stable) and let the LAST covering pet win — the one
     /// drawn on top — so hover selects the sprite that is visually in front when
-    /// pets overlap, instead of one hidden behind it.
+    /// pets overlap, instead of one hidden behind it. `now_ms` must match the
+    /// value passed to `draw` this frame, so the hit region lines up with what
+    /// was actually placed.
     fn pet_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
         strip_w: usize,
         col: u16,
+        now_ms: u64,
     ) -> Option<usize> {
         let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
+        let max_x = (strip_w as f32 - base_w as f32).max(0.0);
         let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
         let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
         // Match render_pets' z-order exactly: lowest priority first, so the
@@ -297,19 +491,19 @@ impl PetRenderer for KittyRenderer {
             let Some(state) = sp.states.get(&pet.status) else {
                 continue;
             };
-            let fi = pet.frame_index(state.frames.len());
-            let fr = &state.frames[fi];
-            // The image occupies `cols` cells from `pet.x`; the visible sprite
-            // is the opaque span scaled into those cols, so hover matches the
-            // sheep, not its transparent padding.
+            let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+            let fr = &state.frames[animated.frame_index];
+            // The image occupies `cols` cells from the pet's x; the visible
+            // sprite is the opaque span scaled into those cols, so hover
+            // matches the sheep, not its transparent padding.
             let cols = pet_cols(rows, fr.w, fr.h) as usize;
-            let (lo, hi) = opaque_col_span(fr, pet.facing_left).unwrap_or((0, fr.w));
+            let (lo, hi) = opaque_col_span(fr, animated.facing_left).unwrap_or((0, fr.w));
             // Round each opaque edge to the nearest cell (rather than
             // floor-left/ceil-right) so the hit region hugs the visible sprite
             // instead of over-reaching into a barely-touched edge cell.
             let left_cell = (lo * cols + fr.w / 2) / fr.w;
             let right_cell = ((hi * cols + fr.w / 2) / fr.w).max(left_cell + 1);
-            let left = pet.x.round() as i32;
+            let left = (animated.x_fraction * max_x).round() as i32;
             if x >= left + left_cell as i32 && x < left + right_cell as i32 {
                 // Later in draw order = drawn on top → overwrite so the
                 // frontmost covering pet wins.
@@ -390,7 +584,6 @@ mod tests {
             "t1".into(),
             identity_for("t1", 1),
             AgentStatus::Working,
-            4.0,
         ));
         h
     }
@@ -401,11 +594,11 @@ mod tests {
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        r.draw_to_sink(&herd, &species, Theme::Dark); // test-only wrapper (no ratatui)
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0); // test-only wrapper (no ratatui)
         let first = sink.take();
         assert!(first.contains("a=t"), "first draw transmits the image");
         assert!(first.contains("a=p"), "and places it");
-        r.draw_to_sink(&herd, &species, Theme::Dark);
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0);
         let second = sink.take();
         assert!(
             !second.contains("a=t"),
@@ -421,16 +614,16 @@ mod tests {
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark);
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
         let _ = sink.take();
         // Same area: image stays cached, no re-transmit.
-        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark);
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
         assert!(
             !sink.take().contains("a=t"),
             "unchanged area reuses the cache"
         );
         // Changed area (resize): purge everything and re-transmit fresh.
-        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 120, 8), Theme::Dark);
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 120, 8), Theme::Dark, 0);
         let out = sink.take();
         assert!(out.contains("a=d,d=A"), "resize deletes all prior images");
         assert!(out.contains("a=t"), "resize re-transmits the image");
@@ -470,9 +663,192 @@ mod tests {
     fn hit_test_uses_the_cell_footprint() {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let r = KittyRenderer::for_test(SharedSink::default(), 4);
-        // pet at x=4, footprint = ceil(frame_w*scale / cell_w) columns wide.
-        assert_eq!(r.pet_at_column(&herd, &species, 200, 4), Some(0));
-        assert_eq!(r.pet_at_column(&herd, &species, 200, 190), None);
+        let mut r = KittyRenderer::for_test(SharedSink::default(), 4);
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for pet_rows
+        let hit = (0..200u16).find_map(|c| r.pet_at_column(&herd, &species, 200, c, 0));
+        assert_eq!(hit, Some(0), "some column under the pet hits it");
+        assert_eq!(
+            r.pet_at_column(&herd, &species, 200, 200, 0),
+            None,
+            "column past the strip's edge is empty"
+        );
+    }
+
+    fn one_idle_herd() -> Herd {
+        let mut h = Herd::new();
+        h.pets.push(Pet::new(
+            "t1".into(),
+            identity_for("t1", 1),
+            AgentStatus::Idle,
+        ));
+        h
+    }
+
+    #[test]
+    fn icon_crop_never_pans_into_the_bitmap_across_the_full_wave() {
+        // Regression: the displayed icon crop is `ICON_MARGIN` icon-pixels
+        // larger than the bitmap on every side so the glyph doesn't fill its
+        // cell edge to edge. That crop must center on the bitmap at rest and
+        // never pan far enough to cut into it — the earlier version passed
+        // `ICON_PAD` (instead of `ICON_PAD - ICON_MARGIN`) as the centering
+        // reference, which put zero margin above/left of the bitmap at rest,
+        // so the wave's rise cropped straight into the glyph's top row.
+        let scale = 7; // production default (`Config::default().pet_scale`)
+        for kind in [IconKind::Sleep, IconKind::Alert, IconKind::Question] {
+            let (iw, ih) = icon_size(kind);
+            let canvas_w = (iw + 2 * ICON_PAD) * scale;
+            let canvas_h = (ih + 2 * ICON_PAD) * scale;
+            let bitmap_top = (ICON_PAD * scale) as u32;
+            let bitmap_left = (ICON_PAD * scale) as u32;
+            let bitmap_bottom = ((ICON_PAD + ih) * scale) as u32;
+            let bitmap_right = ((ICON_PAD + iw) * scale) as u32;
+
+            for i in 0..=100 {
+                let phase = i as f32 / 100.0;
+                let offset = crate::anim::icon_wave_offset(phase);
+                let crop = crop_rect(
+                    ICON_PAD - ICON_MARGIN,
+                    scale,
+                    iw + ICON_MARGIN * 2,
+                    ih + ICON_MARGIN * 2,
+                    offset.dx,
+                    offset.dy,
+                );
+                assert!(
+                    crop.y <= bitmap_top,
+                    "{kind:?} phase {phase}: crop top {} panned past the bitmap's top edge {bitmap_top}",
+                    crop.y
+                );
+                assert!(
+                    crop.x <= bitmap_left,
+                    "{kind:?} phase {phase}: crop left {} panned past the bitmap's left edge {bitmap_left}",
+                    crop.x
+                );
+                assert!(
+                    crop.y + crop.h >= bitmap_bottom,
+                    "{kind:?} phase {phase}: crop bottom panned past the bitmap's bottom edge"
+                );
+                assert!(
+                    crop.x + crop.w >= bitmap_right,
+                    "{kind:?} phase {phase}: crop right panned past the bitmap's right edge"
+                );
+                assert!(
+                    crop.y + crop.h <= canvas_h as u32 && crop.x + crop.w <= canvas_w as u32,
+                    "{kind:?} phase {phase}: crop read past the transmitted canvas"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn working_has_no_overlay_so_no_icon_is_transmitted() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_working_herd(), &species, Theme::Dark, 0);
+        let out = sink.take();
+        // Exactly one transmit (the pet's own padded image), no second icon image.
+        assert_eq!(out.matches("a=t").count(), 1, "working carries no icon");
+    }
+
+    #[test]
+    fn idle_transmits_and_places_both_the_pet_and_its_zz_icon() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_idle_herd(), &species, Theme::Dark, 0);
+        let out = sink.take();
+        assert_eq!(
+            out.matches("a=t").count(),
+            2,
+            "the pet image and the Zz icon image"
+        );
+        assert_eq!(
+            out.matches("a=p").count(),
+            2,
+            "the pet placement and the icon placement"
+        );
+        // Placements are cropped-source (x=/y=/w=/h=), not the old fixed-size form.
+        assert!(out.contains("x=") && out.contains("y="));
+    }
+
+    #[test]
+    fn losing_the_overlay_deletes_the_stale_icon_placement() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let _ = r.render_pets(
+            &one_idle_herd(),
+            &species,
+            Rect::new(0, 0, 200, 10),
+            Theme::Dark,
+            0,
+        );
+        let _ = sink.take();
+        // Same pet, now working (no overlay): the old Zz icon placement must
+        // be torn down, not left as a ghost badge.
+        let _ = r.render_pets(
+            &one_working_herd(),
+            &species,
+            Rect::new(0, 0, 200, 10),
+            Theme::Dark,
+            0,
+        );
+        let out = sink.take();
+        assert!(
+            out.contains("a=d"),
+            "the stale icon placement is deleted when the status stops having an overlay"
+        );
+        // Only one icon was ever transmitted (the Zz from the first, idle
+        // draw) — losing the overlay must not transmit a fresh icon image.
+        assert_eq!(
+            out.matches("a=t").count(),
+            1,
+            "only the new working pet frame is transmitted, no icon"
+        );
+    }
+
+    #[test]
+    fn blocked_pet_placement_pans_as_time_advances() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        herd.pets.push(Pet::new(
+            "t1".into(),
+            identity_for("t1", 1),
+            AgentStatus::Blocked,
+        ));
+
+        // Isolate the PET's placement command (z=0; the icon badge places at
+        // z=1000+ and would otherwise pollute the comparison).
+        let pet_placement = |out: &str| -> String {
+            out.split("\x1b_G")
+                .find(|chunk| chunk.contains("a=p") && chunk.contains(",z=0,"))
+                .expect("the pet's own placement command")
+                .to_string()
+        };
+        let y_field = |chunk: &str| -> String {
+            chunk
+                .split(',')
+                .find(|p| p.starts_with("y="))
+                .expect("a y= field")
+                .to_string()
+        };
+
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let y0 = y_field(&pet_placement(&sink.take()));
+
+        // Some particular pair of instants could coincidentally round to the
+        // same pixel; scan a spread of them so the test isn't tied to one
+        // sample landing on a flat spot in the bounce curve.
+        let panned = (10..500u64).step_by(10).any(|ms| {
+            let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
+            y_field(&pet_placement(&sink.take())) != y0
+        });
+        assert!(
+            panned,
+            "bounce motion must pan the crop window as time advances"
+        );
     }
 }
