@@ -319,7 +319,11 @@ mod tests {
                 &got,
                 expected,
                 "phase {phase}: expected {} legs",
-                if want_diagonal { "diagonal" } else { "straight" }
+                if want_diagonal {
+                    "diagonal"
+                } else {
+                    "straight"
+                }
             );
         }
 
