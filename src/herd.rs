@@ -32,10 +32,10 @@ impl Herd {
     }
 
     /// Sync `self.pets` to `agents`, keyed by `terminal_id`: update survivors'
-    /// status/label, add new pets, and drop pets whose agent has departed.
-    /// Returns the old→new status changes seen on survivors — a freshly
-    /// spawned pet has no prior status, so it never contributes one; this is
-    /// what keeps the initial snapshot silent for sound notifications.
+    /// status/label/`focused` flag, add new pets, and drop pets whose agent
+    /// has departed. Returns the old→new status changes seen on survivors — a
+    /// freshly spawned pet has no prior status, so it never contributes one;
+    /// this is what keeps the initial snapshot silent for sound notifications.
     pub fn reconcile(&mut self, agents: &[Agent], species_count: usize) -> Vec<StatusTransition> {
         let mut transitions = Vec::new();
         for a in agents {
@@ -53,6 +53,7 @@ impl Herd {
                 }
                 p.status = a.agent_status;
                 p.label = a.display_label();
+                p.focused = a.focused;
             } else {
                 let mut pet = Pet::new(
                     a.terminal_id.clone(),
@@ -60,6 +61,7 @@ impl Herd {
                     a.agent_status,
                 );
                 pet.label = a.display_label();
+                pet.focused = a.focused;
                 self.pets.push(pet);
             }
         }
@@ -158,6 +160,32 @@ mod tests {
         a2.name = Some("frontend".into());
         h.reconcile(&[a2], 1);
         assert_eq!(h.pets[0].label, "frontend");
+    }
+
+    #[test]
+    fn reconcile_carries_the_focused_flag_onto_new_and_surviving_pets() {
+        let mut h = Herd::new();
+        let mut a = agent("a", AgentStatus::Idle);
+        a.focused = true;
+        h.reconcile(&[a], 1);
+        assert!(
+            h.pets[0].focused,
+            "a fresh pet picks up focused from the agent"
+        );
+
+        // Focus moves to a new agent 'b'; 'a' survives but loses focus.
+        let mut a2 = agent("a", AgentStatus::Idle);
+        a2.focused = false;
+        let mut b = agent("b", AgentStatus::Idle);
+        b.focused = true;
+        h.reconcile(&[a2, b], 1);
+        let a_pet = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
+        let b_pet = h.pets.iter().find(|p| p.terminal_id == "b").unwrap();
+        assert!(
+            !a_pet.focused,
+            "surviving pet loses focus when it moves elsewhere"
+        );
+        assert!(b_pet.focused, "the newly focused agent's pet is focused");
     }
 
     #[test]

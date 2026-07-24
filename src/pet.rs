@@ -1,8 +1,9 @@
-//! One pet: identity, live status, and label. Priority drives both draw order
-//! (z-index) and overflow selection. Position and animation are *not* stored
-//! here — they're resolved fresh every draw by `motion::animate`, a pure
-//! function of `(terminal_id, status, wall-clock time)`, so every pane's
-//! independent process renders the exact same agent identically.
+//! One pet: identity, live status, label, and focus. Priority drives both
+//! draw order (z-index) and overflow selection. Position and animation are
+//! *not* stored here — they're resolved fresh every draw by
+//! `motion::animate`, a pure function of `(terminal_id, status, wall-clock
+//! time)`, so every pane's independent process renders the exact same agent
+//! identically.
 
 use crate::agent::AgentStatus;
 use crate::identity::Identity;
@@ -27,16 +28,22 @@ pub struct Pet {
     pub identity: Identity,
     pub status: AgentStatus,
     pub label: String,
+    /// Mirrors `Agent::focused`: this pet's owning agent is the current one,
+    /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
+    /// derived here — `Pet` has no access to the agent snapshot.
+    pub focused: bool,
 }
 
 impl Pet {
-    /// Build a pet with an empty label (filled in by `reconcile`).
+    /// Build a pet with an empty label (filled in by `reconcile`), unfocused
+    /// until `Herd::reconcile` says otherwise.
     pub fn new(terminal_id: String, identity: Identity, status: AgentStatus) -> Self {
         Self {
             terminal_id,
             identity,
             status,
             label: String::new(),
+            focused: false,
         }
     }
 
@@ -54,6 +61,14 @@ mod tests {
 
     fn pet(status: AgentStatus) -> Pet {
         Pet::new("term_x".into(), identity_for("term_x", 3), status)
+    }
+
+    #[test]
+    fn new_pet_starts_unfocused() {
+        assert!(
+            !pet(AgentStatus::Idle).focused,
+            "focus is only granted by Herd::reconcile, never by default"
+        );
     }
 
     #[test]
