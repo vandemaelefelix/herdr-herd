@@ -128,6 +128,58 @@ mod tests {
     }
 
     #[test]
+    fn working_frame_leg_pose_matches_hop_airborne_window() {
+        use crate::anim::motion_offset;
+        use crate::sprite::{self, Role};
+
+        let sheep = sprite::embedded_species()
+            .into_iter()
+            .find(|s| s.name == "Sheep")
+            .expect("sheep species is embedded");
+        let working = &sheep.states[&AgentStatus::Working];
+        assert_eq!(working.frames.len(), 2, "working is a two-frame walk cycle");
+
+        let leg_rows = |cells: &[Role], w: usize, h: usize| cells[(h - 2) * w..].to_vec();
+        let legend = |rows: &[&str]| -> Vec<Role> {
+            rows.iter()
+                .flat_map(|r| r.chars())
+                .map(|c| sprite::role_from_char(c).expect("legend char"))
+                .collect()
+        };
+        let diagonal_legs = legend(&[".#MM#..#MS#.....", "..##....##......"]);
+        let straight_legs = legend(&["..#MM#..#MM#....", "...##....##....."]);
+
+        let mut p = pet(AgentStatus::Working);
+        // phase 0.0 is the start of the hop's rise (sin == 0 there too, but it's
+        // still inside the airborne half of the cycle) — see Motion::Hop.
+        for &(phase, want_diagonal) in &[(0.0, true), (0.25, true), (0.5, false), (0.75, false)] {
+            p.phase = phase;
+            let frame = &working.frames[p.frame_index(working.frames.len())];
+            let got = leg_rows(&frame.cells, frame.w, frame.h);
+            let expected = if want_diagonal {
+                &diagonal_legs
+            } else {
+                &straight_legs
+            };
+            assert_eq!(
+                &got,
+                expected,
+                "phase {phase}: expected {} legs",
+                if want_diagonal { "diagonal" } else { "straight" }
+            );
+        }
+
+        // Sanity: whenever the hop is actually lifting, it must be within the
+        // diagonal-leg half of the cycle (never the straight-leg half).
+        for phase in [0.1, 0.25, 0.4] {
+            assert!(
+                motion_offset(&working.motion, phase).dy < 0.0,
+                "phase {phase} should be airborne"
+            );
+        }
+    }
+
+    #[test]
     fn facing_tracks_last_nonzero_direction() {
         let mut p = pet(AgentStatus::Working);
         assert!(
