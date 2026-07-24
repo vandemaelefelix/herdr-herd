@@ -97,16 +97,64 @@ fn wander_segment(u: f64) -> (f32, bool, bool) {
     }
 }
 
+/// Fraction of the walkable width a hop/leg cycle spans, in cumulative
+/// wander-distance units (see `cumulative_wander_distance`: one full
+/// there-and-back cycle is `2.0` such units). Chosen to approximate the old
+/// fixed 300ms cadence (`frame_ms * 2`) at an average wander speed, so
+/// working pets don't suddenly look much faster/slower — this is the first
+/// constant to retune if the cadence needs to change, and the whole
+/// speed-linked-cadence approach here is pending Felix's visual confirmation
+/// (see `TASK 2` in the design brief); if it proves too awkward in practice,
+/// fall back to a fixed `now_ms`-driven cycle like the one still used below
+/// for non-Working states.
+const HOP_STRIDE_FRACTION: f64 = 0.011;
+
+/// Cumulative fractional distance a wandering pet has travelled, as a
+/// function of the *unwrapped* cycle position `u_total` (same units
+/// `wander_segment` takes, but not reduced mod 1 — so distance keeps
+/// accumulating across cycle boundaries instead of resetting). A path length
+/// (unsigned), not a displacement: it keeps increasing on the walk-back leg
+/// even though `x_fraction` itself is decreasing there. One full there-and-back
+/// cycle covers `2.0` units (`1.0` out, `1.0` back). Pure function of
+/// `u_total` alone, so deriving the hop phase from it (see `animate`) adds no
+/// accumulated state.
+fn cumulative_wander_distance(u_total: f64) -> f64 {
+    let full_cycles = u_total.floor();
+    let u = u_total - full_cycles;
+    full_cycles * 2.0 + distance_within_cycle(u)
+}
+
+/// Distance covered within a single `0.0..1.0` wander cycle — mirrors
+/// `wander_segment`'s walk/pause segments, but accumulates unsigned distance
+/// (flat during a pause, still increasing on the walk-back leg) instead of
+/// signed position.
+fn distance_within_cycle(u: f64) -> f64 {
+    let walk_out_ends = WALK_FRACTION;
+    let pause_far_ends = WALK_FRACTION + PAUSE_FRACTION;
+    let walk_back_ends = 2.0 * WALK_FRACTION + PAUSE_FRACTION;
+    if u < walk_out_ends {
+        smoothstep((u / WALK_FRACTION) as f32) as f64
+    } else if u < pause_far_ends {
+        1.0
+    } else if u < walk_back_ends {
+        let local = (u - pause_far_ends) / WALK_FRACTION;
+        1.0 + smoothstep(local as f32) as f64
+    } else {
+        2.0
+    }
+}
+
 /// Resolve `terminal_id`'s animated state for `status`/`state` at `now_ms`
 /// (milliseconds since the Unix epoch, or `0` under reduced motion — see
 /// `render::run_loop`). Pure: same inputs, same output, always.
 pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms: u64) -> Animated {
+    let phase0 = unit_hash("wander-phase", terminal_id) as f64;
+    // +/-25% period variation so working pets don't all sweep in lockstep.
+    let period_ms =
+        WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
+    let u_total = (now_ms as f64 / period_ms) + phase0;
     let (x_fraction, facing_left, moving) = if status == AgentStatus::Working {
-        let phase0 = unit_hash("wander-phase", terminal_id) as f64;
-        // +/-25% period variation so working pets don't all sweep in lockstep.
-        let period_ms =
-            WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
-        let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
+        let u = u_total.rem_euclid(1.0);
         wander_segment(u)
     } else {
         // Not wandering: a fixed, identity-derived resting spot and facing.
@@ -126,6 +174,14 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
     let legs_frozen = state.frame_ms == 0 || working_paused;
     let phase = if legs_frozen {
         0.0
+    } else if status == AgentStatus::Working {
+        // Speed-linked cadence (#12, pending Felix's visual confirmation):
+        // the hop/leg phase advances with cumulative horizontal distance
+        // moved, not a fixed wall-clock period, so faster movement produces
+        // quicker hops and a paused-then-resumed pet never looks like it's
+        // running in place. Still a pure function of `now_ms` alone (no
+        // accumulated per-tick state) via `cumulative_wander_distance`.
+        (cumulative_wander_distance(u_total) / HOP_STRIDE_FRACTION).rem_euclid(1.0) as f32
     } else {
         let cycle_ms = state.frame_ms as f64 * 2.0;
         let offset0 = unit_hash("anim-phase", terminal_id) as f64;
@@ -188,6 +244,61 @@ mod tests {
     /// so a scan of this many ms is guaranteed to cover at least one full
     /// walk/pause cycle for any terminal_id.
     const MAX_PERIOD_MS: u64 = 75_000;
+
+    #[test]
+    fn cumulative_distance_grows_faster_mid_stride_than_right_after_a_pause() {
+        // Smoothstep's derivative is 0 at the start of a walking leg and
+        // peaks halfway through it, so distance (and hence hop cadence)
+        // must accrue faster mid-stride than right as a pet leaves a pause —
+        // this is what gives the speed-linked hop its "faster movement =
+        // quicker hops" feel instead of a fixed cadence.
+        let d = 0.001;
+        let near_start = cumulative_wander_distance(d) - cumulative_wander_distance(0.0);
+        let mid_stride_u = WALK_FRACTION / 2.0;
+        let mid =
+            cumulative_wander_distance(mid_stride_u + d) - cumulative_wander_distance(mid_stride_u);
+        assert!(
+            mid > near_start,
+            "distance must accrue faster mid-stride ({mid}) than right after a pause ({near_start})"
+        );
+    }
+
+    #[test]
+    fn cumulative_distance_is_flat_during_a_pause() {
+        let pause_u = WALK_FRACTION + PAUSE_FRACTION / 2.0; // mid pause-at-far-end
+        let d = cumulative_wander_distance(pause_u + 0.001) - cumulative_wander_distance(pause_u);
+        assert_eq!(d, 0.0, "distance must not accrue while paused");
+    }
+
+    #[test]
+    fn cumulative_distance_keeps_accruing_on_the_walk_back_leg() {
+        // Distance is a path length (unsigned), so it must keep increasing
+        // on the return leg even though x_fraction itself decreases there.
+        let back_u = WALK_FRACTION + PAUSE_FRACTION + 0.01; // just into walk-back
+        let d0 = cumulative_wander_distance(back_u);
+        let d1 = cumulative_wander_distance(back_u + 0.05);
+        assert!(
+            d1 > d0,
+            "distance must keep increasing on the walk-back leg"
+        );
+    }
+
+    #[test]
+    fn cumulative_distance_continues_across_cycle_boundaries() {
+        let just_before = cumulative_wander_distance(0.999);
+        let just_after = cumulative_wander_distance(1.001);
+        assert!(
+            just_after > just_before,
+            "distance must keep accumulating into the next cycle, not reset to 0"
+        );
+    }
+
+    #[test]
+    fn cumulative_distance_covers_two_units_per_full_there_and_back_cycle() {
+        assert_eq!(cumulative_wander_distance(0.0), 0.0);
+        assert_eq!(cumulative_wander_distance(1.0), 2.0);
+        assert_eq!(cumulative_wander_distance(2.0), 4.0);
+    }
 
     #[test]
     fn same_inputs_yield_the_identical_result_every_time() {

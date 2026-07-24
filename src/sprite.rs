@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn working_frame_leg_pose_matches_hop_airborne_window() {
+    fn working_airborne_frame_is_the_jump_pose_and_grounded_is_the_stand_pose() {
         use crate::anim::motion_offset;
 
         let sheep = embedded_species()
@@ -290,45 +290,47 @@ mod tests {
         let working = &sheep.states[&AgentStatus::Working];
         assert_eq!(working.frames.len(), 2, "working is a two-frame walk cycle");
 
-        let leg_rows = |cells: &[Role], w: usize, h: usize| cells[(h - 2) * w..].to_vec();
-        let legend = |rows: &[&str]| -> Vec<Role> {
-            rows.iter()
-                .flat_map(|r| r.chars())
-                .map(|c| role_from_char(c).expect("legend char"))
-                .collect()
+        let airborne = &working.frames[0];
+        let grounded = &working.frames[1];
+        assert_ne!(
+            airborne.cells, grounded.cells,
+            "airborne (jump) and grounded (stand) must be genuinely distinct poses"
+        );
+
+        // The jump pose lifts the body: more of its silhouette occupies the
+        // frame's top rows than the planted stand pose's, whose head/back
+        // sit lower/narrower in the same headroom.
+        let painted_in_top_rows = |f: &Frame, rows: usize| -> usize {
+            (0..rows.min(f.h))
+                .map(|y| {
+                    (0..f.w)
+                        .filter(|&x| f.cells[y * f.w + x] != Role::Transparent)
+                        .count()
+                })
+                .sum()
         };
-        let diagonal_legs = legend(&[".#MM#..#MS#.....", "..##....##......"]);
-        let straight_legs = legend(&["..#MM#..#MM#....", "...##....##....."]);
+        assert!(
+            painted_in_top_rows(airborne, 3) > painted_in_top_rows(grounded, 3),
+            "the jump pose's body/head must fill more of the top rows than the planted stand pose"
+        );
 
         // Mirrors `motion::animate`'s frame-select formula exactly.
         let frame_for_phase = |phase: f32| -> usize {
             ((phase * working.frames.len() as f32) as usize).min(working.frames.len() - 1)
         };
-
-        // phase 0.0 is the start of the hop's rise (sin == 0 there too, but
-        // it's still inside the airborne half of the cycle) — see Motion::Hop.
-        for &(phase, want_diagonal) in &[(0.0, true), (0.25, true), (0.5, false), (0.75, false)] {
-            let frame = &working.frames[frame_for_phase(phase)];
-            let got = leg_rows(&frame.cells, frame.w, frame.h);
-            let expected = if want_diagonal {
-                &diagonal_legs
-            } else {
-                &straight_legs
-            };
-            assert_eq!(
-                &got,
-                expected,
-                "phase {phase}: expected {} legs",
-                if want_diagonal {
-                    "diagonal"
-                } else {
-                    "straight"
-                }
-            );
-        }
+        assert_eq!(
+            frame_for_phase(0.0),
+            0,
+            "phase 0.0 selects the airborne frame"
+        );
+        assert_eq!(
+            frame_for_phase(0.5),
+            1,
+            "phase 0.5 selects the grounded frame"
+        );
 
         // Sanity: whenever the hop is actually lifting, it must be within the
-        // diagonal-leg half of the cycle (never the straight-leg half).
+        // airborne (frame 0) half of the cycle (never the grounded half).
         for phase in [0.1, 0.25, 0.4] {
             assert!(
                 motion_offset(&working.motion, phase).dy < 0.0,

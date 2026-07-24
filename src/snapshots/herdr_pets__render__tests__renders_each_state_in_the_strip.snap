@@ -1,5 +1,6 @@
 ---
 source: src/render.rs
+assertion_line: 670
 expression: terminal.backend()
 ---
 "                                   Zz!                              !      ?              "
@@ -9,7 +10,7 @@ expression: terminal.backend()
 "                                                                                          "
 "                                                                                          "
 "                                                                                          "
-"            ▄▄                     ▄▄                                                     "
-"           ▀▀▀                  ▄▀▀▀▀▀                           ▄▀▀▄   ▄▀▀▄              "
-"           ▀▀                   ▀▀▀▀▀                            ▀▀▀▀   ▀▀▀▀              "
+"                                   ▄▄                                                     "
+"           ▄▀▀                  ▄▀▀▀▀▀                           ▄▀▀▄   ▄▀▀▄              "
+"           ▀▀▀                  ▀▀▀▀▀                            ▀▀▀▀   ▀▀▀▀              "
 "                                                                                          "

@@ -18,6 +18,7 @@ pub enum Motion {
     Bounce,
     Sway,
     Wander,
+    WalkHop,
 }
 
 /// One or more `Motion`s composed together (e.g. `"hop+wander"`).
@@ -37,6 +38,7 @@ pub fn parse_motion(s: &str) -> Result<MotionSpec, String> {
             "bounce" => Motion::Bounce,
             "sway" => Motion::Sway,
             "wander" => Motion::Wander,
+            "walkhop" => Motion::WalkHop,
             other => return Err(format!("unknown motion '{other}'")),
         };
         motions.push(m);
@@ -58,6 +60,15 @@ pub struct Offset {
     pub dx: f32,
     pub dy: f32,
 }
+
+/// Peak vertical lift, in sprite pixels, of the walking hop (`Motion::WalkHop`,
+/// used by `working`'s hop+wander). Kept modest so the amble doesn't read as
+/// bouncy — deliberately separate from `Motion::Hop`'s <=1px cap (used by e.g.
+/// `done`) so retuning one never moves the other. A future *stationary* jump
+/// behavior (not in scope here) is expected to want a taller 3-4px lift; this
+/// constant is what it should introduce a third amplitude next to, not what it
+/// should overwrite.
+const WALKING_HOP_AMPLITUDE_PX: f32 = 2.0;
 
 /// Sum the local (non-wander) motions at `phase` (0.0..1.0).
 pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
@@ -81,6 +92,7 @@ pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
                 o.dx += 0.3 * (t * 0.5).sin();
             }
             Motion::Sway => o.dx += 1.0 * t.sin(),
+            Motion::WalkHop => o.dy -= WALKING_HOP_AMPLITUDE_PX * t.sin().max(0.0),
         }
     }
     o
@@ -171,6 +183,47 @@ mod tests {
     #[test]
     fn parse_motion_rejects_unknown() {
         assert!(parse_motion("moonwalk").is_err());
+    }
+
+    #[test]
+    fn parse_motion_reads_walkhop() {
+        assert_eq!(
+            parse_motion("walkhop").unwrap().motions,
+            vec![Motion::WalkHop]
+        );
+        let m = parse_motion("walkhop+wander").unwrap().motions;
+        assert!(m.contains(&Motion::WalkHop) && m.contains(&Motion::Wander));
+    }
+
+    #[test]
+    fn walkhop_offset_never_goes_below_ground() {
+        let spec = parse_motion("walkhop").unwrap();
+        for p in [0.0, 0.5, 1.0] {
+            assert!(
+                motion_offset(&spec, p).dy <= 0.0,
+                "walkhop only lifts (negative = up)"
+            );
+        }
+    }
+
+    #[test]
+    fn walkhop_lifts_higher_than_the_generic_hop() {
+        // The walking hop is a distinct, modest-but-taller amplitude from the
+        // generic `Hop` motion (used by e.g. `done`), so retuning one never
+        // moves the other — see `WALKING_HOP_AMPLITUDE_PX`.
+        let hop = parse_motion("hop").unwrap();
+        let walkhop = parse_motion("walkhop").unwrap();
+        let peak = 0.25; // sin peaks at t = TAU/4 -> phase 0.25
+        let hop_peak = motion_offset(&hop, peak).dy;
+        let walkhop_peak = motion_offset(&walkhop, peak).dy;
+        assert!(
+            walkhop_peak.abs() > hop_peak.abs(),
+            "walkhop ({walkhop_peak}) must lift higher than hop ({hop_peak})"
+        );
+        assert!(
+            hop_peak.abs() <= 1.0 + f32::EPSILON,
+            "the generic hop must keep its existing <=1px cap"
+        );
     }
 
     #[test]
