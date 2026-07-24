@@ -5,7 +5,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The four opinionated knobs. Sensible defaults; a config file overrides them.
+/// Which rendering backend to use. `Auto` probes for kitty support and falls
+/// back to half-blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererKind {
+    Auto,
+    Kitty,
+    HalfBlock,
+}
+
+/// The six opinionated knobs. Sensible defaults; a config file overrides them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Whether the `control` watchdog runs at all.
@@ -16,6 +25,10 @@ pub struct Config {
     pub sweep_interval_ms: u64,
     /// Calm pets — no wandering or bounce.
     pub reduced_motion: bool,
+    /// Which renderer backend to use.
+    pub renderer: RendererKind,
+    /// Pet sprite scale factor (clamped to 1..=24).
+    pub pet_scale: usize,
 }
 
 impl Default for Config {
@@ -25,6 +38,8 @@ impl Default for Config {
             strip_rows: 5,
             sweep_interval_ms: 3000,
             reduced_motion: false,
+            renderer: RendererKind::Auto,
+            pet_scale: 7,
         }
     }
 }
@@ -65,6 +80,18 @@ impl Config {
                 "reduced_motion" => {
                     if let Ok(v) = val.parse() {
                         cfg.reduced_motion = v;
+                    }
+                }
+                "renderer" => {
+                    cfg.renderer = match val {
+                        "kitty" => RendererKind::Kitty,
+                        "half-block" | "half_block" | "halfblock" => RendererKind::HalfBlock,
+                        _ => RendererKind::Auto, // "auto" or anything unrecognized
+                    };
+                }
+                "pet_scale" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        cfg.pet_scale = v.clamp(1, 24);
                     }
                 }
                 _ => {}
@@ -121,7 +148,9 @@ mod tests {
                 enabled: true,
                 strip_rows: 5,
                 sweep_interval_ms: 3000,
-                reduced_motion: false
+                reduced_motion: false,
+                renderer: RendererKind::Auto,
+                pet_scale: 7,
             }
         );
     }
@@ -137,7 +166,9 @@ mod tests {
                 enabled: false,
                 strip_rows: 5,
                 sweep_interval_ms: 1500,
-                reduced_motion: true
+                reduced_motion: true,
+                renderer: RendererKind::Auto,
+                pet_scale: 7,
             }
         );
     }
@@ -177,5 +208,25 @@ mod tests {
             std::env::temp_dir().join(format!("herdr-pets-cfg-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load_from_dir(&dir), Config::default());
+    }
+
+    #[test]
+    fn parses_renderer_and_scale() {
+        let c = Config::from_toml_str("renderer = kitty\npet_scale = 5\n");
+        assert_eq!(c.renderer, RendererKind::Kitty);
+        assert_eq!(c.pet_scale, 5);
+    }
+
+    #[test]
+    fn renderer_defaults_to_auto_and_scale_to_seven() {
+        let c = Config::default();
+        assert_eq!(c.renderer, RendererKind::Auto);
+        assert_eq!(c.pet_scale, 7);
+    }
+
+    #[test]
+    fn unknown_renderer_value_falls_back_to_auto() {
+        let c = Config::from_toml_str("renderer = hologram\n");
+        assert_eq!(c.renderer, RendererKind::Auto);
     }
 }
