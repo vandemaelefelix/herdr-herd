@@ -23,7 +23,7 @@ MMMM
 MMMM
 .MM.
 
-[blocked] frame_ms=110 motion=shake overlay=badge:! color=#e62d23
+[blocked] frame_ms=110 motion=bounce overlay=badge:! color=#e62d23
 .MM.
 M##M
 MMMM
