@@ -6,7 +6,7 @@
 use std::f32::consts::TAU;
 
 /// An 8-bit-per-channel color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 /// A named motion primitive a sprite can combine into a `MotionSpec`.
@@ -15,7 +15,7 @@ pub enum Motion {
     None,
     Breathe,
     Hop,
-    Shake,
+    Bounce,
     Sway,
     Wander,
 }
@@ -34,7 +34,7 @@ pub fn parse_motion(s: &str) -> Result<MotionSpec, String> {
             "none" => Motion::None,
             "breathe" => Motion::Breathe,
             "hop" => Motion::Hop,
-            "shake" => Motion::Shake,
+            "bounce" => Motion::Bounce,
             "sway" => Motion::Sway,
             "wander" => Motion::Wander,
             other => return Err(format!("unknown motion '{other}'")),
@@ -71,14 +71,31 @@ pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
             // sprites are <= PET_PX_H - 1 (14 px of a 15 px band, 1 px headroom);
             // a bigger jump would clip the top.
             Motion::Hop => o.dy -= (t.sin()).max(0.0), // lifts on the upbeat
-            Motion::Shake => {
-                o.dx += 1.2 * (t * 2.0).sin();
-                o.dy -= (t * 2.0).sin().abs();
+            // Dock-icon-style jump: a steeper takeoff/landing than `Hop`'s
+            // plain sine (springier), plus a small lateral wobble at the peak.
+            // Still capped at 1px (t.sin().max(0.0) <= 1.0) so it fits the
+            // same headroom as `Hop`.
+            Motion::Bounce => {
+                o.dy -= t.sin().max(0.0).powf(0.6);
+                o.dx += 0.3 * (t * 0.5).sin();
             }
             Motion::Sway => o.dx += 1.0 * t.sin(),
         }
     }
     o
+}
+
+/// The overlay icon's own float: independent of the body's `MotionSpec`, so it
+/// keeps drifting even when the pet itself is static (e.g. `done`'s slow hop,
+/// or `unknown`'s frozen phase). A full sine (not clamped like `Hop`) so it
+/// rises, then genuinely comes back down, plus a slower lateral drift — "floats
+/// up in a wavy pattern, then goes back", per the design brief.
+pub fn icon_wave_offset(phase: f32) -> Offset {
+    let t = phase * TAU;
+    Offset {
+        dx: 0.5 * (t * 0.5).sin(),
+        dy: -t.sin(),
+    }
 }
 
 /// What an overlay renders: a speech/thought bubble or a status badge.
@@ -90,7 +107,7 @@ pub enum Overlay {
 }
 
 /// The color an overlay renders in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverlayColor {
     Default,
     Accent,
@@ -182,6 +199,36 @@ mod tests {
         assert!(has_wander(&spec));
         let o = motion_offset(&spec, 0.5);
         assert_eq!((o.dx, o.dy), (0.0, 0.0));
+    }
+
+    #[test]
+    fn bounce_offset_never_goes_below_ground() {
+        let spec = parse_motion("bounce").unwrap();
+        for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!(
+                motion_offset(&spec, p).dy <= 0.0,
+                "bounce only lifts (negative = up), like hop"
+            );
+        }
+    }
+
+    #[test]
+    fn bounce_is_steeper_than_hop_off_the_ground() {
+        // Same peak (both cap at 1.0 lift), but bounce's powf(0.6) takes off
+        // faster than hop's plain sine early in the upswing.
+        let hop = motion_offset(&parse_motion("hop").unwrap(), 0.05).dy;
+        let bounce = motion_offset(&parse_motion("bounce").unwrap(), 0.05).dy;
+        assert!(bounce.abs() > hop.abs(), "bounce snaps up quicker than hop");
+    }
+
+    #[test]
+    fn icon_wave_rises_then_returns() {
+        // Starts and ends a cycle at rest, rises (negative dy) at the quarter
+        // mark, and comes back down (positive dy) at the three-quarter mark —
+        // "floats up in a wavy pattern, then goes back".
+        assert_eq!(icon_wave_offset(0.0).dy, 0.0);
+        assert!(icon_wave_offset(0.25).dy < 0.0, "rises partway through");
+        assert!(icon_wave_offset(0.75).dy > 0.0, "settles back down");
     }
 
     #[test]
