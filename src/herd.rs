@@ -94,24 +94,23 @@ impl Herd {
         let dt = dt_ms / 1000.0;
         let max_x = (strip_w - pet_w).max(0.0);
         for p in &mut self.pets {
-            // Working roams widely; idle/done drift a little; blocked holds.
-            let roam = match p.status {
-                crate::agent::AgentStatus::Working => 1.0,
-                crate::agent::AgentStatus::Blocked => 0.0,
-                _ => 0.35,
+            // Only working pets roam horizontally; everyone else holds position
+            // (they still animate in place via motion_offset). The amble is a
+            // gentle "I'm working" signal — slow enough to stay easily
+            // clickable.
+            let (roam, speed) = match p.status {
+                crate::agent::AgentStatus::Working => (1.0_f32, 9.0_f32),
+                _ => (0.0_f32, 0.0_f32),
             };
-            if rng.next_unit() < roam * dt * 0.6 {
+            if roam > 0.0 && rng.next_unit() < roam * dt * 0.4 {
                 p.target_x = rng.next_unit() * max_x;
             }
-            let speed = if p.status == crate::agent::AgentStatus::Working {
-                22.0
-            } else {
-                7.0
-            };
             let dx = p.target_x - p.x;
             p.x += dx.signum() * dx.abs().min(speed * dt);
         }
-        // Pairwise separation.
+        // Pairwise separation only nudges working pets — a non-working pet's
+        // x must stay exactly at its pre-step value, so it neither pushes
+        // nor gets pushed.
         let min_gap = pet_w * 0.55;
         let n = self.pets.len();
         for i in 0..n {
@@ -120,13 +119,22 @@ impl Herd {
                 if gap.abs() < min_gap {
                     let push = (min_gap - gap.abs()) * 0.5 * dt;
                     let dir = if gap >= 0.0 { 1.0 } else { -1.0 };
-                    self.pets[i].x -= push * dir;
-                    self.pets[j].x += push * dir;
+                    if self.pets[i].status == crate::agent::AgentStatus::Working {
+                        self.pets[i].x -= push * dir;
+                    }
+                    if self.pets[j].status == crate::agent::AgentStatus::Working {
+                        self.pets[j].x += push * dir;
+                    }
                 }
             }
         }
+        // Likewise, only clamp pets that can actually move: a stationary
+        // pet's x is untouched even if `reconcile` placed it outside
+        // `[0, max_x]` (bounds only matter once something is roaming).
         for p in &mut self.pets {
-            p.x = p.x.clamp(0.0, max_x);
+            if p.status == crate::agent::AgentStatus::Working {
+                p.x = p.x.clamp(0.0, max_x);
+            }
         }
     }
 }
@@ -220,6 +228,29 @@ mod tests {
         }
         for p in &h.pets {
             assert!(p.x >= 0.0 && p.x <= 80.0, "x={} out of bounds", p.x);
+        }
+    }
+
+    #[test]
+    fn only_working_pets_roam_horizontally() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(11);
+        h.reconcile(
+            &[
+                agent("idle", AgentStatus::Idle),
+                agent("done", AgentStatus::Done),
+                agent("blk", AgentStatus::Blocked),
+            ],
+            1,
+            200.0,
+            &mut rng,
+        );
+        let before: Vec<f32> = h.pets.iter().map(|p| p.x).collect();
+        for _ in 0..200 {
+            h.step(50.0, 200.0, 16.0, &mut rng);
+        }
+        for (p, x0) in h.pets.iter().zip(before) {
+            assert_eq!(p.x, x0, "{} must not roam when not working", p.terminal_id);
         }
     }
 
