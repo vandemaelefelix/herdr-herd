@@ -69,7 +69,7 @@ impl Herd {
                 .find(|p| p.terminal_id == a.terminal_id)
             {
                 p.status = a.agent_status;
-                p.label = a.label();
+                p.label = a.display_label();
             } else {
                 let x = rng.next_unit() * strip_w.max(1.0);
                 let mut pet = Pet::new(
@@ -78,7 +78,7 @@ impl Herd {
                     a.agent_status,
                     x,
                 );
-                pet.label = a.label();
+                pet.label = a.display_label();
                 self.pets.push(pet);
             }
         }
@@ -166,6 +166,7 @@ mod tests {
             terminal_id: tid.into(),
             revision: 0,
             focused: false,
+            hover_label: None,
         }
     }
 
@@ -236,6 +237,23 @@ mod tests {
         a2.name = Some("frontend".into());
         h.reconcile(&[a2], 1, 100.0, &mut rng);
         assert_eq!(h.pets[0].label, "frontend");
+    }
+
+    #[test]
+    fn reconcile_uses_the_resolved_hover_label_when_present() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        // A fresh pet takes the resolved breadcrumb, not the legacy "claude".
+        let mut a = agent("a", AgentStatus::Working);
+        a.hover_label = Some("herdr-pets › renderer".into());
+        h.reconcile(&[a], 1, 100.0, &mut rng);
+        assert_eq!(h.pets[0].label, "herdr-pets › renderer");
+
+        // A survivor whose breadcrumb changes (moved tab) picks up the new one.
+        let mut a2 = agent("a", AgentStatus::Working);
+        a2.hover_label = Some("herdr-pets › tests".into());
+        h.reconcile(&[a2], 1, 100.0, &mut rng);
+        assert_eq!(h.pets[0].label, "herdr-pets › tests");
     }
 
     #[test]

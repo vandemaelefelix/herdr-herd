@@ -404,6 +404,7 @@ mod tests {
             terminal_id: tid.into(),
             revision: 0,
             focused: false,
+            hover_label: None,
         }
     }
 

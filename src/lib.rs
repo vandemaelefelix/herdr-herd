@@ -14,6 +14,7 @@ pub mod palette;
 pub mod pet;
 pub mod place;
 pub mod render;
+pub mod sidebar;
 pub mod socket;
 pub mod sprite;
 pub mod watcher;
