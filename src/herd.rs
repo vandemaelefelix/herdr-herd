@@ -45,6 +45,16 @@ pub struct Herd {
     pub pets: Vec<Pet>,
 }
 
+/// An old→new status change detected for a surviving pet during `reconcile`.
+/// Never emitted for a pet's first appearance — there is no prior status to
+/// transition from, so the initial snapshot never produces one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusTransition {
+    pub terminal_id: String,
+    pub from: crate::agent::AgentStatus,
+    pub to: crate::agent::AgentStatus,
+}
+
 impl Herd {
     /// An empty herd.
     pub fn new() -> Self {
@@ -55,6 +65,9 @@ impl Herd {
     /// a random x within the walkable strip (`[0, strip_w - pet_w]`, the same
     /// bound `step` clamps to), update survivors' status (preserving
     /// position and animation phase), and drop pets whose agent has departed.
+    /// Returns the old→new status changes seen on survivors — a freshly
+    /// spawned pet has no prior status, so it never contributes one; this is
+    /// what keeps the initial snapshot silent for sound notifications.
     pub fn reconcile(
         &mut self,
         agents: &[Agent],
@@ -62,8 +75,9 @@ impl Herd {
         strip_w: f32,
         pet_w: f32,
         rng: &mut dyn Rng,
-    ) {
+    ) -> Vec<StatusTransition> {
         let max_x = (strip_w - pet_w).max(0.0);
+        let mut transitions = Vec::new();
         // Update survivors / add new.
         for a in agents {
             if let Some(p) = self
@@ -71,6 +85,13 @@ impl Herd {
                 .iter_mut()
                 .find(|p| p.terminal_id == a.terminal_id)
             {
+                if p.status != a.agent_status {
+                    transitions.push(StatusTransition {
+                        terminal_id: a.terminal_id.clone(),
+                        from: p.status,
+                        to: a.agent_status,
+                    });
+                }
                 p.status = a.agent_status;
                 p.label = a.display_label();
             } else {
@@ -88,6 +109,7 @@ impl Herd {
         // Remove departed.
         self.pets
             .retain(|p| agents.iter().any(|a| a.terminal_id == p.terminal_id));
+        transitions
     }
 
     /// Advance the roam simulation by `dt_ms`: working pets pick new wander
@@ -296,6 +318,113 @@ mod tests {
         a2.hover_label = Some("herdr-pets › tests".into());
         h.reconcile(&[a2], 1, 100.0, 16.0, &mut rng);
         assert_eq!(h.pets[0].label, "herdr-pets › tests");
+    }
+
+    #[test]
+    fn reconcile_reports_no_transitions_for_the_initial_snapshot() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        let transitions = h.reconcile(
+            &[
+                agent("a", AgentStatus::Blocked),
+                agent("b", AgentStatus::Done),
+            ],
+            2,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        assert!(
+            transitions.is_empty(),
+            "a pet's first appearance is not a transition, even if already blocked"
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_a_transition_when_a_survivor_changes_status() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 200.0, 16.0, &mut rng);
+        let transitions = h.reconcile(
+            &[agent("a", AgentStatus::Blocked)],
+            1,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        assert_eq!(
+            transitions,
+            vec![StatusTransition {
+                terminal_id: "a".into(),
+                from: AgentStatus::Idle,
+                to: AgentStatus::Blocked,
+            }]
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_no_transition_when_status_is_unchanged() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        h.reconcile(
+            &[agent("a", AgentStatus::Working)],
+            1,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        let transitions = h.reconcile(
+            &[agent("a", AgentStatus::Working)],
+            1,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        assert!(transitions.is_empty());
+    }
+
+    #[test]
+    fn reconcile_reports_one_transition_per_surviving_agent_that_changed() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(1);
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Working),
+                agent("b", AgentStatus::Working),
+                agent("c", AgentStatus::Working),
+            ],
+            1,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        let mut transitions = h.reconcile(
+            &[
+                agent("a", AgentStatus::Blocked),
+                agent("b", AgentStatus::Blocked),
+                agent("c", AgentStatus::Working), // unchanged
+            ],
+            1,
+            200.0,
+            16.0,
+            &mut rng,
+        );
+        transitions.sort_by(|x, y| x.terminal_id.cmp(&y.terminal_id));
+        assert_eq!(
+            transitions,
+            vec![
+                StatusTransition {
+                    terminal_id: "a".into(),
+                    from: AgentStatus::Working,
+                    to: AgentStatus::Blocked,
+                },
+                StatusTransition {
+                    terminal_id: "b".into(),
+                    from: AgentStatus::Working,
+                    to: AgentStatus::Blocked,
+                },
+            ]
+        );
     }
 
     #[test]

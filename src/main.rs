@@ -29,6 +29,8 @@ fn main() -> ExitCode {
                 cfg.reduced_motion,
                 cfg.renderer,
                 cfg.pet_scale,
+                cfg.sounds,
+                Box::new(herdr_pets::sound::SystemSoundPlayer),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
