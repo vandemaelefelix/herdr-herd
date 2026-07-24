@@ -351,9 +351,16 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
 #[cfg(feature = "dev-build-marker")]
 const BUILD_MARKER: &str = env!("HERDR_PETS_BUILD_SHA");
 
-/// Draw the dev build marker in the strip's bottom-right corner, dim gray.
-/// Drawn after the caption, so a very long hover label could overwrite its
-/// tail — an acceptable tradeoff for a dev-only aid.
+/// A loud, unmistakable color for the dev build marker — deliberately not
+/// subtle (unlike the rest of the strip's palette) since legibility across
+/// any terminal theme matters more than blending in for a debug aid that
+/// never ships.
+#[cfg(feature = "dev-build-marker")]
+const BUILD_MARKER_COLOR: Color = Color::Rgb(255, 215, 0);
+
+/// Draw the dev build marker in the strip's bottom-right corner. Drawn after
+/// the caption, so a very long hover label could overwrite its tail — an
+/// acceptable tradeoff for a dev-only aid.
 #[cfg(feature = "dev-build-marker")]
 fn draw_build_marker(frame: &mut Frame, area: Rect) {
     if area.height == 0 || area.width == 0 {
@@ -371,7 +378,7 @@ fn draw_build_marker(frame: &mut Frame, area: Rect) {
     frame.buffer_mut().set_span(
         x,
         y,
-        &Span::styled(text, Style::default().fg(Color::DarkGray)),
+        &Span::styled(text, Style::default().fg(BUILD_MARKER_COLOR)),
         w,
     );
 }
@@ -907,6 +914,25 @@ mod tests {
         assert!(
             last_row.trim_end().ends_with(BUILD_MARKER),
             "expected the build marker {BUILD_MARKER:?} at the end of the bottom row, got {last_row:?}"
+        );
+    }
+
+    #[cfg(feature = "dev-build-marker")]
+    #[test]
+    fn build_marker_uses_a_high_contrast_color_not_dark_gray() {
+        // DarkGray on a typical dark terminal background is nearly invisible
+        // at a glance — confirmed live: the marker was present in the cell
+        // buffer (verified via `herdr pane read`) but not actually visible.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| draw_build_marker(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        let last_col = buf.area.width - 1;
+        let last_row = buf.area.height - 1;
+        let cell = &buf[(last_col, last_row)];
+        assert_ne!(
+            cell.style().fg,
+            Some(Color::DarkGray),
+            "the marker must not use low-contrast DarkGray"
         );
     }
 
