@@ -92,7 +92,8 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
 
 /// Draw the whole strip: visible pets in priority z-order (blocked draws
 /// last, i.e. on top), their overlays (bubbles/badges), and a `+N` marker for
-/// any pets the strip has no room for.
+/// any pets the strip has no room for. Overlays and `+N` live in a reserved top
+/// lane (row 0); the pet band is drawn below it, so an icon never covers a pet.
 pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme) {
     let area = frame.area();
     let strip_w = area.width as usize;
@@ -135,7 +136,15 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             }
         }
     }
-    draw_pixels(frame, area, &buf);
+    // The pet band sits below a reserved top lane (row 0, for overlays/`+N`) and
+    // above the bottom caption row, so an icon can never cover a pet pixel.
+    let pet_area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(1),
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    };
+    draw_pixels(frame, pet_area, &buf);
 
     // Overlays (bubbles/badges) as text cells above each visible pet.
     for &i in &order {
@@ -175,9 +184,10 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
         let label = format!("+{hidden}");
         let label_w = label.len() as u16;
         let x = area.right().saturating_sub(label_w + 1);
+        // In the reserved top lane (row 0), right-aligned — never over a pet.
         frame.buffer_mut().set_span(
             x,
-            area.y + area.height / 2,
+            area.y,
             &Span::styled(label, Style::default().fg(Color::DarkGray)),
             label_w,
         );
@@ -539,6 +549,51 @@ mod tests {
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    /// Dump a TestBackend as one `String` per terminal row (symbols only).
+    fn rows_of<B: std::fmt::Display>(backend: &B) -> Vec<String> {
+        format!("{backend}")
+            .lines()
+            .map(|l| l.trim().trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn overlays_never_occlude_the_pet() {
+        // A done pet shows a '!' badge. The badge must live in the top lane
+        // (row 0) with NO pet pixels, and the pet must be drawn in the band
+        // below (row 1+), so the icon can never cover the animal.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Done]);
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        assert!(rows[0].contains('!'), "badge sits in the top lane (row 0)");
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the top lane holds no pet pixels — nothing to occlude"
+        );
+        assert!(
+            rows[1].contains('▀') || rows[1].contains('▄'),
+            "the pet is drawn in the band below the lane"
+        );
+    }
+
+    #[test]
+    fn overflow_counter_lives_in_the_top_lane() {
+        // With many pets, +N must render in the reserved top lane (row 0),
+        // never mid-band on top of a pet.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Idle; 30]);
+        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        assert!(rows[0].contains('+'), "the +N marker is in the top lane");
     }
 
     #[test]

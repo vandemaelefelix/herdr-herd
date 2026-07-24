@@ -12,8 +12,9 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: pets take 3 half-block rows, plus 1 caption.
-pub const TARGET_ROWS: u16 = 4;
+/// Rows the strip should occupy: a 1-row badge lane, 3 half-block pet rows, and
+/// 1 caption row — so overlays/`+N` never cover a pet.
+pub const TARGET_ROWS: u16 = 5;
 
 /// The split ratio that leaves the bottom `target_rows` for the strip on a tab
 /// `tab_rows` tall: `1 - target/tab`. Clamped to `[0.3, 0.95]` so a tiny tab
@@ -128,8 +129,10 @@ mod tests {
 
     #[test]
     fn target_rows_is_the_halved_strip_height() {
-        // 4 rows = 3 half-block pixel rows (PET_PX_H = 6) + 1 caption row.
-        assert_eq!(TARGET_ROWS, 4);
+        // 5 rows = 1 badge lane + 3 half-block pixel rows (PET_PX_H = 6) + 1
+        // caption row. The pixel band is still halved (Improvement 1); the extra
+        // lane keeps overlays/`+N` off the pet (Improvement 3).
+        assert_eq!(TARGET_ROWS, 5);
     }
 
     #[test]
