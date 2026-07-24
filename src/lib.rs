@@ -10,6 +10,7 @@ pub mod control;
 pub mod herd;
 pub mod herdr;
 pub mod identity;
+pub mod kitty;
 pub mod lock;
 pub mod palette;
 pub mod pet;
