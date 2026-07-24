@@ -52,11 +52,16 @@ pub fn place(id: u32, pid: u32) -> String {
 }
 
 /// Place transmitted image `id` as placement `pid`, scaled to exactly `cols` x
-/// `rows` terminal cells (`c=`/`r=`). This makes the on-screen footprint known
-/// without querying the cell pixel size (which herdr does not report), so the
-/// backend can size, bottom-anchor, and hit-test images exactly.
-pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16) -> String {
-    apc(&format!("a=p,i={id},p={pid},c={cols},r={rows},q=2"), "")
+/// `rows` terminal cells (`c=`/`r=`), at stacking index `z` (`z=`; higher =
+/// on top). The explicit cell footprint makes the on-screen size known without
+/// querying the cell pixel size (which herdr does not report); the explicit `z`
+/// makes overlap stacking deterministic and match our draw z-order, so hover
+/// hit-testing agrees with what is visually in front.
+pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16, z: i32) -> String {
+    apc(
+        &format!("a=p,i={id},p={pid},c={cols},r={rows},z={z},q=2"),
+        "",
+    )
 }
 
 /// Delete placement `pid` of image `id` (removes it from screen; keeps data).
@@ -108,11 +113,11 @@ mod tests {
                 && place(7, 3).contains("i=7")
                 && place(7, 3).contains("p=3")
         );
-        let ps = place_sized(7, 3, 9, 4);
+        let ps = place_sized(7, 3, 9, 4, 5);
         assert!(ps.contains("a=p") && ps.contains("i=7") && ps.contains("p=3"));
         assert!(
-            ps.contains("c=9") && ps.contains("r=4"),
-            "explicit cell footprint"
+            ps.contains("c=9") && ps.contains("r=4") && ps.contains("z=5"),
+            "explicit cell footprint + stacking index"
         );
         assert!(delete_placement(7, 3).contains("a=d") && delete_placement(7, 3).contains("i=7"));
         assert_eq!(delete_all(), "\x1b_Ga=d,d=A\x1b\\");

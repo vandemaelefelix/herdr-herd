@@ -141,7 +141,7 @@ impl KittyRenderer {
         let mut order = visible.clone();
         order.sort_by_key(|&i| priority(herd.pets[i].status));
 
-        for &i in &order {
+        for (zi, &i) in order.iter().enumerate() {
             let pet = &herd.pets[i];
             let Some(sp) = species
                 .get(pet.identity.species_index)
@@ -201,8 +201,10 @@ impl KittyRenderer {
 
             let pid = self.next_id;
             self.next_id += 1;
+            // z = draw-order index: later-drawn (higher priority) stacks on top,
+            // so kitty's visual stacking matches the hit-test's last-wins order.
             self.out
-                .write_all(place_sized(image_id, pid, cols, rows).as_bytes())?;
+                .write_all(place_sized(image_id, pid, cols, rows, zi as i32).as_bytes())?;
 
             if let Some((old_img, old_pid)) = self
                 .placements
@@ -259,8 +261,10 @@ impl PetRenderer for KittyRenderer {
     /// Hit-test using the same visible set as `render_pets`. A pet's hit range
     /// is the on-screen span of its sprite's *opaque* pixels (transparent frame
     /// padding is excluded, so hover matches the visible sheep), converted from
-    /// pixels to cells with the queried cell width. Topmost by priority wins an
-    /// overlap, matching the draw z-order.
+    /// pixels to cells. We iterate in the SAME z-order `render_pets` draws
+    /// (priority-sorted, stable) and let the LAST covering pet win — the one
+    /// drawn on top — so hover selects the sprite that is visually in front when
+    /// pets overlap, instead of one hidden behind it.
     fn pet_at_column(
         &self,
         herd: &Herd,
@@ -271,6 +275,10 @@ impl PetRenderer for KittyRenderer {
         let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
         let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
+        // Match render_pets' z-order exactly: lowest priority first, so the
+        // topmost (on-top) pet is the LAST one covering the column.
+        let mut order = visible;
+        order.sort_by_key(|&i| priority(herd.pets[i].status));
 
         let x = col as i32;
         // The pet footprint depends on the pane height (rows -> cols); use the
@@ -278,7 +286,7 @@ impl PetRenderer for KittyRenderer {
         let pane_h = self.last_area.map(|a| a.height).unwrap_or(8);
         let rows = pet_rows(pane_h);
         let mut best: Option<usize> = None;
-        for &i in &visible {
+        for &i in &order {
             let pet = &herd.pets[i];
             let Some(sp) = species
                 .get(pet.identity.species_index)
@@ -296,17 +304,16 @@ impl PetRenderer for KittyRenderer {
             // sheep, not its transparent padding.
             let cols = pet_cols(rows, fr.w, fr.h) as usize;
             let (lo, hi) = opaque_col_span(fr, pet.facing_left).unwrap_or((0, fr.w));
-            let left_cell = lo * cols / fr.w;
-            let right_cell = (hi * cols).div_ceil(fr.w).max(left_cell + 1);
+            // Round each opaque edge to the nearest cell (rather than
+            // floor-left/ceil-right) so the hit region hugs the visible sprite
+            // instead of over-reaching into a barely-touched edge cell.
+            let left_cell = (lo * cols + fr.w / 2) / fr.w;
+            let right_cell = ((hi * cols + fr.w / 2) / fr.w).max(left_cell + 1);
             let left = pet.x.round() as i32;
             if x >= left + left_cell as i32 && x < left + right_cell as i32 {
-                let take = match best {
-                    None => true,
-                    Some(b) => priority(pet.status) >= priority(herd.pets[b].status),
-                };
-                if take {
-                    best = Some(i);
-                }
+                // Later in draw order = drawn on top → overwrite so the
+                // frontmost covering pet wins.
+                best = Some(i);
             }
         }
         best
