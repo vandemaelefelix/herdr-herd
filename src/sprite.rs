@@ -314,6 +314,31 @@ mod tests {
             "the jump pose's body/head must fill more of the top rows than the planted stand pose"
         );
 
+        // The jump pose's legs must genuinely extend, not just repeat the
+        // stand pose's legs under a lifted body: the horizontal column span
+        // painted across the leg rows (last 4 rows) must be visibly wider —
+        // a real running stride, not a same-legs-different-head illusion.
+        let leg_span = |f: &Frame| -> usize {
+            let leg_rows = f.h.saturating_sub(4)..f.h;
+            let mut lo = f.w;
+            let mut hi = 0usize;
+            for y in leg_rows {
+                for x in 0..f.w {
+                    if f.cells[y * f.w + x] != Role::Transparent {
+                        lo = lo.min(x);
+                        hi = hi.max(x);
+                    }
+                }
+            }
+            hi + 1 - lo
+        };
+        assert!(
+            leg_span(airborne) > leg_span(grounded) + 2,
+            "the jump pose's legs (span {}) must extend visibly wider than the stand pose's (span {})",
+            leg_span(airborne),
+            leg_span(grounded)
+        );
+
         // Mirrors `motion::animate`'s frame-select formula exactly.
         let frame_for_phase = |phase: f32| -> usize {
             ((phase * working.frames.len() as f32) as usize).min(working.frames.len() - 1)
