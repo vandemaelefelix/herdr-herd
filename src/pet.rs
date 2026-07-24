@@ -16,6 +16,16 @@ pub fn priority(status: AgentStatus) -> u8 {
     }
 }
 
+/// A working pet's coarse amble rhythm: alternates between walking toward
+/// `target_x` and a short stationary pause, so herd movement reads as
+/// "wander a bit, rest a bit" rather than a jittery random walk. Owned by
+/// `Pet` (like `target_x`) and driven each tick by `Herd::step`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WanderState {
+    Walking,
+    Paused,
+}
+
 /// One pet: a stable identity plus the live, mutable state the renderer and
 /// herd simulation update every tick.
 #[derive(Debug, Clone)]
@@ -28,6 +38,15 @@ pub struct Pet {
     pub target_x: f32,
     pub phase: f32,
     pub facing_left: bool,
+    /// Whether `x` is currently changing tick-to-tick. Drives the working
+    /// walk-cycle gate in `advance`: legs animate only while this is true.
+    pub moving: bool,
+    /// Current phase of the walk/pause amble rhythm (`Herd::step` only).
+    pub wander_state: WanderState,
+    /// Milliseconds remaining in `wander_state` before `Herd::step` rolls the
+    /// next phase. Starts at 0 (`Paused`) so a pet's very first working tick
+    /// immediately rolls into `Walking` with a fresh target and duration.
+    pub wander_timer_ms: f32,
 }
 
 impl Pet {
@@ -43,6 +62,9 @@ impl Pet {
             target_x: x,
             phase: 0.0,
             facing_left: false,
+            moving: false,
+            wander_state: WanderState::Paused,
+            wander_timer_ms: 0.0,
         }
     }
 
@@ -62,8 +84,14 @@ impl Pet {
 
     /// Advance the animation phase by `dt_ms`, wrapping at 1.0.
     /// `frame_ms == 0` means a single static frame: phase stays pinned to 0.
+    /// For `Working`, the walk cycle also pins to 0 while `moving` is false —
+    /// legs hold a single standing frame instead of cycling on a free-running
+    /// clock (see `set_moving_from_dx`, which `Herd::step` drives from actual
+    /// horizontal movement). Other statuses ignore `moving`: their frame_ms
+    /// drives motion (breathe/hop/shake/sway), not a walk cycle.
     pub fn advance(&mut self, dt_ms: f32, frame_ms: u32) {
-        if frame_ms == 0 {
+        let frozen = frame_ms == 0 || (self.status == AgentStatus::Working && !self.moving);
+        if frozen {
             self.phase = 0.0;
             return;
         }
@@ -81,6 +109,13 @@ impl Pet {
         } else if dx < 0.0 {
             self.facing_left = true;
         }
+    }
+
+    /// Update whether this pet is currently moving from a horizontal delta;
+    /// mirrors `set_facing_from_dx` and feeds the working walk-cycle gate in
+    /// `advance`.
+    pub fn set_moving_from_dx(&mut self, dx: f32) {
+        self.moving = dx != 0.0;
     }
 }
 
@@ -140,5 +175,47 @@ mod tests {
         assert!(p.facing_left, "no movement keeps the last facing");
         p.set_facing_from_dx(3.0);
         assert!(!p.facing_left, "moving right faces right");
+    }
+
+    #[test]
+    fn set_moving_from_dx_tracks_zero_and_nonzero_delta() {
+        let mut p = pet(AgentStatus::Working);
+        assert!(!p.moving, "starts stationary");
+        p.set_moving_from_dx(3.0);
+        assert!(p.moving, "nonzero delta is moving");
+        p.set_moving_from_dx(0.0);
+        assert!(!p.moving, "zero delta is stationary");
+        p.set_moving_from_dx(-1.5);
+        assert!(p.moving, "negative delta still counts as moving");
+    }
+
+    #[test]
+    fn working_walk_cycle_freezes_on_a_standing_frame_when_not_moving() {
+        let mut p = pet(AgentStatus::Working);
+        p.phase = 0.3; // mid-cycle, to prove it gets pinned rather than left alone
+        p.set_moving_from_dx(0.0);
+        p.advance(1000.0, 150); // frame_ms > 0, but stationary
+        assert_eq!(p.phase, 0.0, "stationary working pet holds a single frame");
+    }
+
+    #[test]
+    fn working_walk_cycle_animates_while_moving() {
+        let mut p = pet(AgentStatus::Working);
+        p.set_moving_from_dx(3.0);
+        p.phase = 0.0;
+        p.advance(150.0, 150); // cycle_ms = 300; 0 + 150/300 = 0.5
+        assert_eq!(p.phase, 0.5, "moving working pet keeps cycling frames");
+    }
+
+    #[test]
+    fn non_working_states_animate_regardless_of_the_moving_flag() {
+        let mut p = pet(AgentStatus::Idle);
+        p.set_moving_from_dx(0.0); // idle pets never move; must not freeze their motion
+        p.phase = 0.2;
+        p.advance(260.0, 520); // cycle_ms = 1040; 0.2 + 260/1040 = 0.45
+        assert_eq!(
+            p.phase, 0.45,
+            "non-working states are unaffected by the moving gate"
+        );
     }
 }

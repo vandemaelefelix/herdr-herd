@@ -5,7 +5,24 @@
 
 use crate::agent::Agent;
 use crate::identity::identity_for;
-use crate::pet::{Pet, priority};
+use crate::pet::{Pet, WanderState, priority};
+
+/// Horizontal speed while a working pet is actively walking (pixels/sec).
+const WALK_SPEED: f32 = 9.0;
+/// Randomized amble distance range (px) for one walk bout. The bout's
+/// duration is derived from this distance and `WALK_SPEED` (not rolled
+/// independently), so a "Walking" pet is in motion for its entire bout
+/// instead of arriving early and standing idle while still nominally
+/// "walking".
+const WALK_STEP_PX_RANGE: (f32, f32) = (20.0, 90.0);
+/// Randomized pause duration range (ms): short, so a pet never stands still
+/// for long.
+const PAUSE_MS_RANGE: (f32, f32) = (150.0, 450.0);
+
+/// A value in `range.0..range.1`, drawn from the injected `Rng`.
+fn rand_range(rng: &mut dyn Rng, range: (f32, f32)) -> f32 {
+    range.0 + rng.next_unit() * (range.1 - range.0)
+}
 
 /// Minimal injected RNG (no `rand` dependency).
 pub trait Rng {
@@ -90,30 +107,67 @@ impl Herd {
             .retain(|p| agents.iter().any(|a| a.terminal_id == p.terminal_id));
     }
 
-    /// Advance the roam simulation by `dt_ms`: working pets pick new wander
-    /// targets, ease toward them, and separate from other working pets;
-    /// non-working pets hold their `x` exactly. Every pet — working or not —
-    /// is then clamped to `[0, strip_w - pet_w]`, so a pane resize (or any
-    /// pet placed outside that range) can't leave one stuck off-screen.
+    /// Advance the roam simulation by `dt_ms`: working pets alternate between
+    /// walking a randomized short distance and a short pause (an explicit
+    /// walk/pause rhythm, biased toward walking — see `WALK_STEP_PX_RANGE` /
+    /// `PAUSE_MS_RANGE`), and separate from other working pets; non-working
+    /// pets hold their `x` exactly. Every pet — working or not — is then
+    /// clamped to `[0, strip_w - pet_w]`, so a pane resize (or any pet placed
+    /// outside that range) can't leave one stuck off-screen.
     pub fn step(&mut self, dt_ms: f32, strip_w: f32, pet_w: f32, rng: &mut dyn Rng) {
         let dt = dt_ms / 1000.0;
         let max_x = (strip_w - pet_w).max(0.0);
         for p in &mut self.pets {
             // Only working pets roam horizontally; everyone else holds position
-            // (they still animate in place via motion_offset). The amble is a
-            // gentle "I'm working" signal — slow enough to stay easily
-            // clickable.
-            let (roam, speed) = match p.status {
-                crate::agent::AgentStatus::Working => (1.0_f32, 9.0_f32),
-                _ => (0.0_f32, 0.0_f32),
-            };
-            if roam > 0.0 && rng.next_unit() < roam * dt * 0.4 {
-                p.target_x = rng.next_unit() * max_x;
+            // (they still animate in place via motion_offset).
+            if p.status != crate::agent::AgentStatus::Working {
+                continue;
             }
+            p.wander_timer_ms -= dt_ms;
+            if p.wander_timer_ms <= 0.0 {
+                match p.wander_state {
+                    WanderState::Walking => {
+                        p.wander_state = WanderState::Paused;
+                        p.wander_timer_ms = rand_range(rng, PAUSE_MS_RANGE);
+                    }
+                    WanderState::Paused => {
+                        p.wander_state = WanderState::Walking;
+                        // Pick a direction with room to move — at a strip
+                        // edge, a coin-flip direction can point into the
+                        // wall, clamp to zero distance, and disguise another
+                        // pause as a "Walking" bout (defeating the short-
+                        // pause guarantee).
+                        let room_pos = (max_x - p.x).max(0.0);
+                        let room_neg = p.x.max(0.0);
+                        let dir = if room_pos <= 0.0 {
+                            -1.0
+                        } else if room_neg <= 0.0 {
+                            1.0
+                        } else if rng.next_unit() < 0.5 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let room = if dir > 0.0 { room_pos } else { room_neg };
+                        let travel = rand_range(rng, WALK_STEP_PX_RANGE).min(room);
+                        p.target_x = p.x + dir * travel;
+                        // Duration matches the (possibly room-clamped) travel
+                        // distance at WALK_SPEED, so the bout ends exactly
+                        // when the pet arrives — never idling mid-"walk".
+                        p.wander_timer_ms = (travel / WALK_SPEED) * 1000.0;
+                    }
+                }
+            }
+            let speed = if p.wander_state == WanderState::Walking {
+                WALK_SPEED
+            } else {
+                0.0
+            };
             let dx = p.target_x - p.x;
             let applied = dx.signum() * dx.abs().min(speed * dt);
             p.x += applied;
             p.set_facing_from_dx(applied);
+            p.set_moving_from_dx(applied);
         }
         // Pairwise separation only nudges working pets — a non-working pet's
         // x must stay exactly at its pre-step value, so it neither pushes
@@ -239,6 +293,78 @@ mod tests {
         for p in &h.pets {
             assert!(p.x >= 0.0 && p.x <= 80.0, "x={} out of bounds", p.x);
         }
+    }
+
+    #[test]
+    fn working_pet_alternates_short_pauses_between_longer_walks() {
+        let mut h = Herd::new();
+        let mut rng = Lcg::new(3);
+        h.reconcile(
+            &[agent("w", AgentStatus::Working)],
+            1,
+            300.0,
+            16.0,
+            &mut rng,
+        );
+
+        let dt = 20.0_f32;
+        let mut walking_ticks = 0u32;
+        let mut paused_ticks = 0u32;
+        let mut longest_paused_run_ms = 0.0_f32;
+        let mut current_paused_run_ms = 0.0_f32;
+        for _ in 0..3000 {
+            let before = h.pets[0].x;
+            h.step(dt, 300.0, 16.0, &mut rng);
+            if h.pets[0].x != before {
+                walking_ticks += 1;
+                current_paused_run_ms = 0.0;
+            } else {
+                paused_ticks += 1;
+                current_paused_run_ms += dt;
+                longest_paused_run_ms = longest_paused_run_ms.max(current_paused_run_ms);
+            }
+        }
+
+        assert!(
+            walking_ticks > paused_ticks,
+            "should spend more time walking than paused: walk={walking_ticks} pause={paused_ticks}"
+        );
+        assert!(
+            longest_paused_run_ms <= 500.0,
+            "a pause must stay short, got a {longest_paused_run_ms}ms stretch of no movement"
+        );
+    }
+
+    #[test]
+    fn working_pet_resumes_walking_after_a_pause_using_the_injected_rng() {
+        // Deterministic under a fixed seed: same seed => identical trajectory.
+        let mut h1 = Herd::new();
+        let mut rng1 = Lcg::new(42);
+        h1.reconcile(
+            &[agent("w", AgentStatus::Working)],
+            1,
+            300.0,
+            16.0,
+            &mut rng1,
+        );
+        let mut h2 = Herd::new();
+        let mut rng2 = Lcg::new(42);
+        h2.reconcile(
+            &[agent("w", AgentStatus::Working)],
+            1,
+            300.0,
+            16.0,
+            &mut rng2,
+        );
+
+        for _ in 0..500 {
+            h1.step(20.0, 300.0, 16.0, &mut rng1);
+            h2.step(20.0, 300.0, 16.0, &mut rng2);
+        }
+        assert_eq!(
+            h1.pets[0].x, h2.pets[0].x,
+            "same seed must reproduce the same walk/pause trajectory"
+        );
     }
 
     #[test]
