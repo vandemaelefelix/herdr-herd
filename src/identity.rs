@@ -61,7 +61,8 @@ mod tests {
     fn species_and_hue_are_independent() {
         // Two ids sharing a species should still usually differ in hue.
         let ids: Vec<_> = (0..40).map(|i| format!("term_{i}")).collect();
-        let same_species: Vec<u16> = ids.iter()
+        let same_species: Vec<u16> = ids
+            .iter()
             .map(|t| identity_for(t, 2))
             .filter(|i| i.species_index == 0)
             .map(|i| i.hue)

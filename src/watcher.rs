@@ -6,9 +6,10 @@
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
-use crate::agent::{parse_agent_list, Agent};
+use crate::agent::{Agent, parse_agent_list};
 use crate::herdr::HerdrCli;
-use crate::socket::{subscribe_request, SocketClient};
+use crate::sidebar::{parse_tab_labels, parse_workspace_labels};
+use crate::socket::{SocketClient, subscribe_request};
 
 /// A source of monotonic milliseconds, behind a seam so tests never sleep or
 /// touch the real clock.
@@ -44,10 +45,33 @@ impl Clock for RealClock {
 
 /// Fetch a fresh snapshot via the CLI; `None` on any spawn/parse failure so
 /// callers can silently skip a bad refetch rather than propagate the error.
+///
+/// Each agent's `hover_label` is resolved here (the watcher owns the CLI and is
+/// debounced, so it is the right place, not the per-frame render loop): the
+/// `workspace list` / `tab list` labels are fetched best-effort and joined by
+/// `workspace_id` / `tab_id` into the sidebar breadcrumb. A failed label fetch
+/// degrades to an empty map ⇒ the per-agent fallback chain, never an error.
 fn refetch(cli: &dyn HerdrCli) -> Option<Vec<Agent>> {
-    cli.run_json(&["agent", "list"])
+    let mut agents = cli
+        .run_json(&["agent", "list"])
         .ok()
-        .and_then(|s| parse_agent_list(&s).ok())
+        .and_then(|s| parse_agent_list(&s).ok())?;
+    let ws = cli
+        .run_json(&["workspace", "list"])
+        .ok()
+        .map(|s| parse_workspace_labels(&s))
+        .unwrap_or_default();
+    let tabs = cli
+        .run_json(&["tab", "list"])
+        .ok()
+        .map(|s| parse_tab_labels(&s))
+        .unwrap_or_default();
+    for a in agents.iter_mut() {
+        let ws_label = ws.get(&a.workspace_id).map(String::as_str);
+        let tab_label = tabs.get(&a.tab_id).map(String::as_str);
+        a.hover_label = Some(a.sidebar_label(ws_label, tab_label));
+    }
+    Some(agents)
 }
 
 /// Test seam: consume all events a socket yields, applying the debounce rule,
@@ -111,10 +135,10 @@ pub fn watch(
                         // An event arrived; debounce a refetch.
                         let now = clock.now_ms();
                         if now.saturating_sub(last_send) >= debounce_ms {
-                            if let Some(s) = refetch(cli.as_ref()) {
-                                if tx.send(s).is_err() {
-                                    return;
-                                }
+                            if let Some(s) = refetch(cli.as_ref())
+                                && tx.send(s).is_err()
+                            {
+                                return;
                             }
                             last_send = now;
                         }
@@ -137,10 +161,10 @@ pub fn watch(
             // or degraded to `None`).
             let now = clock.now_ms();
             if now.saturating_sub(last_send) >= slow_ms {
-                if let Some(s) = refetch(cli.as_ref()) {
-                    if tx.send(s).is_err() {
-                        return;
-                    }
+                if let Some(s) = refetch(cli.as_ref())
+                    && tx.send(s).is_err()
+                {
+                    return;
                 }
                 last_send = now;
             }

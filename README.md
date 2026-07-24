@@ -58,30 +58,91 @@ Both read state from herdr's socket API; herdr is the single source of truth.
 
 ## Install
 
-> Not yet released. Planned install paths:
-
 ```sh
-# From the plugin registry (release):
-herdr plugin install <owner>/herdr-pets
+# For local development, from a checkout of this repo:
+herdr plugin link .
 
-# For local development:
-herdr plugin link /path/to/herdr-pets
+# From the plugin registry (release): builds from source via this repo's
+# `[[build]]` step in herdr-plugin.toml.
+herdr plugin install <owner>/herdr-pets
 ```
 
 herdr-pets requires **herdr ≥ 0.7.0**.
 
+## Usage
+
+herdr-pets ships two actions (run via herdr's action picker, or their
+underlying commands directly):
+
+- **`place-pets`** / `herdr-pets place` — on-demand: places a full-width pets
+  strip in the current tab right now. This uses herdr's destructive pane
+  rebuild to make room, so it's opt-in — run it when you want a strip and
+  don't already have one.
+- **`start-pets-controller`** / `herdr-pets control` — the always-on watchdog.
+  Once started, it keeps a strip present across every tab in every workspace,
+  automatically and non-destructively. It injects a full-width strip into any
+  tab that has a full-width bottom pane — single-pane tabs and the common
+  "content on top, full-width terminal/agent across the bottom" multi-pane
+  layout — by splitting that bottom pane (which never kills its process). Tabs
+  whose bottom edge is split into side-by-side columns have no full-width bottom
+  pane, so a full-width strip there needs the destructive rebuild; use the
+  on-demand **`place`** for those. The watchdog does not auto-start on a fresh
+  herdr session (herdr fires no plugin-start hook) — start it once via the
+  action above.
+
 ## Configuration
 
-Opinionated defaults, a few knobs (shipped as `config.example.toml`):
+herdr-pets reads an optional `config.toml` from its plugin config dir
+(`herdr plugin config-dir herdr-pets`). Every key is optional and falls back to
+an opinionated default:
 
-- **enable / auto-inject** — turn it off globally, or inject into every tab vs.
-  only tabs you opt into.
-- **scope** — `mirror-sidebar` (default) · `all` · `current-workspace` ·
-  `current-tab`.
-- **height & motion** — strip height in rows (default 3), animation speed, and a
-  calm `reduced-motion` mode.
-- **palette & behavior** — how pet colors are generated (herdr-theme-aligned or
-  vivid), and optional overrides of the state→behavior mapping.
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Whether the `control` watchdog runs. |
+| `strip_rows` | int | `5` | Strip height, in rows (1 icon lane + 3 pixel rows + 1 caption). |
+| `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
+| `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
+| `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw pets with. |
+| `pet_scale` | int | `7` | Kitty-backend sprite scale (image px per sprite px); ignored by half-block. |
+
+`strip_rows` applies to the always-on `control` watchdog; the on-demand
+`herdr-pets place` uses a fixed height.
+
+Example `config.toml`:
+
+    reduced_motion = true
+    strip_rows = 6
+
+## Rendering
+
+herdr-pets always works with the universal **half-block** renderer (`▀▄`
+characters + 24-bit color) — no dependencies, no setup, correct everywhere.
+
+On top of that, herdr-pets can draw pets as small, crisp, full-detail images
+via the **kitty graphics protocol**, an **experimental, opt-in upgrade** on
+terminals that support it (e.g. Ghostty, kitty). Set `renderer = "auto"`
+(the default) to use it automatically when available, falling back to
+half-blocks everywhere else; or force it with `renderer = "kitty"` /
+`renderer = "half-block"`.
+
+The kitty upgrade has a prerequisite chain, since herdr itself gates it:
+
+1. The outer terminal must support the kitty graphics protocol.
+2. herdr must have the experimental flag enabled in
+   `~/.config/herdr/config.toml`:
+   ```toml
+   [experimental]
+   kitty_graphics = true
+   ```
+3. Run `herdr server reload-config`, then **detach and reattach** your herdr
+   client — rendering support is negotiated client-side, so an existing
+   session won't pick up the flag until you reattach.
+
+If any of those aren't in place, `renderer = "auto"` silently falls back to
+the half-block renderer — the strip always renders, just without the extra
+crispness. (`renderer = "kitty"` is a forced override for testing/debugging:
+it skips the probe and always draws via kitty escapes, so use `auto` unless
+you know the prerequisites are met.)
 
 ## Development
 
