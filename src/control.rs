@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::herdr::HerdrCli;
-use crate::place::{parse_tab_rows, slim_ratio};
+use crate::place::slim_ratio;
 use crate::{lock, socket};
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
@@ -39,6 +39,66 @@ pub struct PaneRef {
 /// marker or the manifest pane title (so a `place`/manual strip is deduped too).
 pub fn is_strip_label(label: &str) -> bool {
     label == STRIP_LABEL || label == "Pets"
+}
+
+/// The pane to split for a full-width strip, plus its row count. The split
+/// ratio is computed relative to this pane (not the whole tab), so the strip is
+/// the target height wherever the pane sits in the layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StripTarget {
+    pub pane_id: String,
+    pub pane_rows: u16,
+}
+
+/// From a `herdr pane layout` reply, find the pane to split for a **full-width
+/// bottom** strip: a leaf pane whose `rect` spans the tab width
+/// (`x == area.x && width == area.width`) and sits on the tab's bottom edge
+/// (`y + height == area.y + area.height`). Splitting it `down` is
+/// non-destructive and yields a full-width strip.
+///
+/// - A single-pane tab's sole pane qualifies (unchanged coverage).
+/// - A "content on top, full-width pane across the bottom" multi-pane tab
+///   qualifies (new coverage) — the bottom-most such pane is chosen.
+/// - A tab whose bottom edge is split into side-by-side columns has no
+///   full-width bottom pane ⇒ `None` (can't get a full-width strip without the
+///   process-killing `layout.apply`; left to the on-demand `place`).
+///
+/// Tolerant: malformed or absent geometry ⇒ `None` (the tab is skipped).
+pub fn find_bottom_strip_target(layout_json: &str) -> Option<StripTarget> {
+    let v: Value = serde_json::from_str(layout_json).ok()?;
+    let layout = v.get("result")?.get("layout")?;
+    let area = layout.get("area")?;
+    let ax = area.get("x")?.as_i64()?;
+    let ay = area.get("y")?.as_i64()?;
+    let aw = area.get("width")?.as_i64()?;
+    let ah = area.get("height")?.as_i64()?;
+    let tab_bottom = ay + ah;
+
+    let mut best: Option<StripTarget> = None;
+    let mut best_y = i64::MIN;
+    for p in layout.get("panes")?.as_array()? {
+        let Some(id) = p.get("pane_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(r) = p.get("rect") else { continue };
+        let get = |k: &str| r.get(k).and_then(Value::as_i64);
+        let (Some(rx), Some(ry), Some(rw), Some(rh)) =
+            (get("x"), get("y"), get("width"), get("height"))
+        else {
+            continue;
+        };
+        let full_width = rx == ax && rw == aw;
+        let bottom_aligned = ry + rh == tab_bottom;
+        // Bottom-most full-width pane wins (there should be exactly one).
+        if full_width && bottom_aligned && ry > best_y {
+            best_y = ry;
+            best = Some(StripTarget {
+                pane_id: id.to_string(),
+                pane_rows: rh.max(0) as u16,
+            });
+        }
+    }
+    best
 }
 
 /// Parse `herdr tab list` into `TabRef`s (skips malformed entries tolerantly).
@@ -89,15 +149,18 @@ pub fn tabs_with_strip(panes: &[PaneRef]) -> HashSet<String> {
         .collect()
 }
 
-/// A tab is eligible for non-destructive full-width injection iff it has exactly
-/// one pane and no strip yet. (Multi-pane tabs can't get a full-width strip
-/// without the destructive `layout.apply`, so they are left to on-demand `place`.)
+/// A tab is a candidate for injection iff it does not already hold a strip.
+/// Whether a full-width strip can actually be placed non-destructively is
+/// decided per-tab from its layout geometry ([`find_bottom_strip_target`]) —
+/// single-pane tabs and multi-pane tabs with a full-width bottom pane qualify;
+/// a columned-bottom tab yields no target and is skipped.
 pub fn needs_strip(tab: &TabRef, with_strip: &HashSet<String>) -> bool {
-    tab.pane_count == 1 && !with_strip.contains(&tab.tab_id)
+    !with_strip.contains(&tab.tab_id)
 }
 
-/// The `(tab_id, root_pane_id)` pairs to inject this sweep: each eligible tab
-/// paired with its sole pane (the split target).
+/// The `(tab_id, probe_pane_id)` pairs to consider this sweep: every tab without
+/// a strip, paired with one of its pane ids (used only to fetch that tab's
+/// layout; `find_bottom_strip_target` then picks the actual split target).
 pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, String)> {
     let with_strip = tabs_with_strip(panes);
     tabs.iter()
@@ -109,23 +172,24 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
         .collect()
 }
 
-/// Non-destructively place a slim full-width pets strip below `root_pane_id`
-/// (the sole pane of a single-pane tab): measure the tab, split down at the slim
-/// ratio, run the renderer in the new pane, and stamp the de-dup label. Uses
-/// `pane split` (NOT `layout.apply`) so the existing pane's process survives.
+/// Non-destructively place a slim full-width pets strip below `target_pane`
+/// (a full-width bottom pane found by [`find_bottom_strip_target`]): split it
+/// `down` at the slim ratio, run the renderer in the new pane, and stamp the
+/// de-dup label. The ratio is relative to `pane_rows` (the target pane's own
+/// height), so the strip is ~`target_rows` tall wherever the pane sits. Uses
+/// `pane split` (NOT `layout.apply`), so the split pane's process survives.
 pub fn inject_strip(
     cli: &dyn HerdrCli,
-    root_pane_id: &str,
+    target_pane: &str,
+    pane_rows: u16,
     self_exe: &str,
     target_rows: u16,
 ) -> io::Result<()> {
-    let layout_json = cli.run_json(&["pane", "layout", "--pane", root_pane_id])?;
-    let rows = parse_tab_rows(&layout_json)?;
-    let ratio_arg = format!("{:.4}", slim_ratio(rows, target_rows));
+    let ratio_arg = format!("{:.4}", slim_ratio(pane_rows, target_rows));
     let split_reply = cli.run_json(&[
         "pane",
         "split",
-        root_pane_id,
+        target_pane,
         "--direction",
         "down",
         "--ratio",
@@ -150,14 +214,31 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("no result.pane.pane_id in pane split reply"))
 }
 
-/// One sweep: list tabs + panes, then inject a strip into every eligible tab.
-/// A per-tab injection failure is logged and skipped so one bad tab never
-/// aborts the sweep or the other tabs (unobtrusive).
+/// One sweep: list tabs + panes, then inject a strip into every tab that has a
+/// full-width bottom pane (single-pane tabs and top+bottom multi-pane tabs).
+/// For each candidate the tab's layout is fetched and
+/// [`find_bottom_strip_target`] picks the split target; a tab with no full-width
+/// bottom pane (columned bottom) is skipped (left to on-demand `place`). A
+/// per-tab failure is logged and skipped so one bad tab never aborts the sweep
+/// or the others (unobtrusive).
 pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::Result<()> {
     let tabs = parse_tabs(&cli.run_json(&["tab", "list"])?)?;
     let panes = parse_panes(&cli.run_json(&["pane", "list"])?)?;
-    for (tab_id, root_pane) in plan_injections(&tabs, &panes) {
-        if let Err(e) = inject_strip(cli, &root_pane, self_exe, target_rows) {
+    for (tab_id, probe_pane) in plan_injections(&tabs, &panes) {
+        let result = (|| -> io::Result<()> {
+            let layout = cli.run_json(&["pane", "layout", "--pane", &probe_pane])?;
+            match find_bottom_strip_target(&layout) {
+                Some(target) => inject_strip(
+                    cli,
+                    &target.pane_id,
+                    target.pane_rows,
+                    self_exe,
+                    target_rows,
+                ),
+                None => Ok(()), // columned bottom — no full-width strip possible
+            }
+        })();
+        if let Err(e) = result {
             eprintln!("herdr-pets: could not place strip in {tab_id}: {e}");
         }
     }
@@ -212,6 +293,23 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// A `pane layout` reply for a tab whose bottom edge is the full-width pane
+    /// `id` (single-pane tab, or a top+bottom multi-pane tab). 64-row tab.
+    fn full_width_bottom_layout(id: impl std::fmt::Display) -> String {
+        format!(
+            r#"{{"result":{{"layout":{{"area":{{"x":0,"y":0,"width":100,"height":64}},"panes":[{{"pane_id":"top","rect":{{"x":0,"y":0,"width":100,"height":57}}}},{{"pane_id":"{id}","rect":{{"x":0,"y":57,"width":100,"height":7}}}}]}}}}}}"#
+        )
+    }
+
+    /// A `pane layout` reply for a tab whose bottom edge is split into two
+    /// side-by-side columns — no full-width bottom pane, so no strip is possible.
+    fn columned_bottom_layout() -> String {
+        r#"{"result":{"layout":{"area":{"x":0,"y":0,"width":100,"height":64},"panes":[
+            {"pane_id":"left","rect":{"x":0,"y":0,"width":50,"height":64}},
+            {"pane_id":"right","rect":{"x":50,"y":0,"width":50,"height":64}}]}}}"#
+            .into()
+    }
+
     struct FakeCli {
         calls: RefCell<Vec<Vec<String>>>,
     }
@@ -234,9 +332,7 @@ mod tests {
                 ["pane", "list"] => {
                     Ok(r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}"#.into())
                 }
-                ["pane", "layout", ..] => {
-                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
-                }
+                ["pane", "layout", "--pane", id] => Ok(full_width_bottom_layout(id)),
                 ["pane", "split", ..] => Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into()),
                 _ => Ok(r#"{"result":{}}"#.into()),
             }
@@ -246,12 +342,13 @@ mod tests {
     #[test]
     fn inject_strip_splits_runs_and_labels_in_order() {
         let cli = FakeCli::new();
-        inject_strip(&cli, "w1:p1", "/abs/herdr-pets", 7).unwrap();
+        // pane_rows = 64 (the target pane's own height) -> slim_ratio(64, 7).
+        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-pets", 7).unwrap();
         let calls = cli.calls.borrow();
-        assert_eq!(calls[0], vec!["pane", "layout", "--pane", "w1:p1"]);
+        // No self-fetch of layout: the sweep already resolved the target + rows.
         // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
         assert_eq!(
-            calls[1],
+            calls[0],
             vec![
                 "pane",
                 "split",
@@ -264,10 +361,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            calls[2],
+            calls[1],
             vec!["pane", "run", "w1:pNEW", "'/abs/herdr-pets' render"]
         );
-        assert_eq!(calls[3], vec!["pane", "rename", "w1:pNEW", "herdr-pets"]);
+        assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-pets"]);
     }
 
     fn tab(id: &str, panes: u32) -> TabRef {
@@ -323,31 +420,71 @@ mod tests {
     }
 
     #[test]
-    fn needs_strip_is_true_only_for_a_single_pane_tab_without_one() {
+    fn needs_strip_is_true_for_any_tab_without_a_strip() {
         let mut with = HashSet::new();
         assert!(
             needs_strip(&tab("w1:t1", 1), &with),
             "single-pane, no strip"
         );
         assert!(
-            !needs_strip(&tab("w1:t2", 2), &with),
-            "multi-pane is skipped"
+            needs_strip(&tab("w1:t2", 3), &with),
+            "multi-pane is a candidate now — geometry decides per-tab"
         );
         with.insert("w1:t1".to_string());
         assert!(!needs_strip(&tab("w1:t1", 1), &with), "already has a strip");
     }
 
     #[test]
-    fn plan_injections_pairs_eligible_tabs_with_their_sole_pane() {
+    fn plan_injections_includes_multi_pane_tabs_and_skips_stripped_ones() {
         let tabs = vec![tab("w1:t1", 1), tab("w1:t2", 2), tab("w1:t3", 1)];
         let panes = vec![
-            pane("w1:p1", "w1:t1", None), // eligible
-            pane("w1:p2", "w1:t2", None), // multi-pane, skipped
+            pane("w1:p1", "w1:t1", None), // candidate
+            pane("w1:p2", "w1:t2", None), // multi-pane, now also a candidate
             pane("w1:p9", "w1:t2", None),
-            pane("w1:pA", "w1:t3", Some("Pets")), // already stripped
+            pane("w1:pA", "w1:t3", Some("Pets")), // already stripped -> skipped
         ];
         let plan = plan_injections(&tabs, &panes);
-        assert_eq!(plan, vec![("w1:t1".to_string(), "w1:p1".to_string())]);
+        assert_eq!(
+            plan,
+            vec![
+                ("w1:t1".to_string(), "w1:p1".to_string()),
+                ("w1:t2".to_string(), "w1:p2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn find_bottom_strip_target_picks_the_full_width_bottom_pane() {
+        // Single-pane tab: the sole full-area pane qualifies.
+        let single = r#"{"result":{"layout":{"area":{"x":0,"y":0,"width":100,"height":64},
+            "panes":[{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":100,"height":64}}]}}}"#;
+        assert_eq!(
+            find_bottom_strip_target(single),
+            Some(StripTarget {
+                pane_id: "w1:p1".into(),
+                pane_rows: 64
+            })
+        );
+
+        // Top content + full-width bottom pane: the bottom pane is chosen.
+        let top_bottom = full_width_bottom_layout("w1:pB");
+        assert_eq!(
+            find_bottom_strip_target(&top_bottom),
+            Some(StripTarget {
+                pane_id: "w1:pB".into(),
+                pane_rows: 7
+            })
+        );
+    }
+
+    #[test]
+    fn find_bottom_strip_target_is_none_for_a_columned_bottom_or_junk() {
+        assert_eq!(find_bottom_strip_target(&columned_bottom_layout()), None);
+        assert_eq!(find_bottom_strip_target("not json"), None);
+        assert_eq!(
+            find_bottom_strip_target(r#"{"result":{"layout":{}}}"#),
+            None
+        );
     }
 
     struct SweepFake {
@@ -363,9 +500,12 @@ mod tests {
             match args {
                 ["tab", "list"] => Ok(self.tabs.clone()),
                 ["pane", "list"] => Ok(self.panes.clone()),
-                ["pane", "layout", ..] => {
-                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
+                // A probe pane id containing "COL" models a columned-bottom tab
+                // (no full-width bottom pane); anything else is top+bottom.
+                ["pane", "layout", "--pane", id] if id.contains("COL") => {
+                    Ok(columned_bottom_layout())
                 }
+                ["pane", "layout", "--pane", id] => Ok(full_width_bottom_layout(id)),
                 ["pane", "split", ..] => Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into()),
                 _ => Ok(r#"{"result":{}}"#.into()),
             }
@@ -399,9 +539,7 @@ mod tests {
             match args {
                 ["tab", "list"] => Ok(self.tabs.clone()),
                 ["pane", "list"] => Ok(self.panes.clone()),
-                ["pane", "layout", ..] => {
-                    Ok(r#"{"result":{"layout":{"area":{"height":64}}}}"#.into())
-                }
+                ["pane", "layout", "--pane", id] => Ok(full_width_bottom_layout(id)),
                 ["pane", "split", target, ..] => {
                     if *target == self.fail_split_for {
                         Err(io::Error::other("boom"))
@@ -417,7 +555,7 @@ mod tests {
     #[test]
     fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
         let cli = FailableCli::new("", "", "w1:p1");
-        let result = inject_strip(&cli, "w1:p1", "/abs/herdr-pets", 7);
+        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-pets", 7);
         assert!(result.is_err(), "a failed split must surface as an error");
         let calls = cli.calls.borrow();
         assert!(
@@ -469,34 +607,40 @@ mod tests {
     }
 
     #[test]
-    fn sweep_once_injects_only_the_eligible_tab() {
-        // t1: single-pane, no strip -> inject. t2: multi-pane -> skip.
-        // t3: single-pane but already stripped -> skip.
+    fn sweep_once_injects_single_and_top_bottom_tabs_but_skips_columned_and_stripped() {
+        // t1: single-pane, no strip           -> inject (full-width bottom).
+        // t2: multi-pane, top+full-width-bottom -> inject (NEW coverage).
+        // t3: single-pane, already stripped    -> skip (label de-dup).
+        // t4: multi-pane, columned bottom      -> skip (no full-width bottom).
         let cli = SweepFake {
             calls: RefCell::new(Vec::new()),
             tabs: r#"{"result":{"tabs":[
                 {"tab_id":"w1:t1","pane_count":1},
                 {"tab_id":"w1:t2","pane_count":2},
-                {"tab_id":"w1:t3","pane_count":1}]}}"#
+                {"tab_id":"w1:t3","pane_count":2},
+                {"tab_id":"w1:t4","pane_count":2}]}}"#
                 .into(),
             panes: r#"{"result":{"panes":[
                 {"pane_id":"w1:p1","tab_id":"w1:t1"},
                 {"pane_id":"w1:p2","tab_id":"w1:t2"},
                 {"pane_id":"w1:p9","tab_id":"w1:t2"},
-                {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-pets"}]}}"#
+                {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-pets"},
+                {"pane_id":"w1:pB","tab_id":"w1:t3"},
+                {"pane_id":"w1:pCOL","tab_id":"w1:t4"},
+                {"pane_id":"w1:pD","tab_id":"w1:t4"}]}}"#
                 .into(),
         };
         sweep_once(&cli, "/abs/herdr-pets", 7).unwrap();
         let calls = cli.calls.borrow();
-        // Exactly one split, targeting t1's sole pane w1:p1.
-        let splits: Vec<&Vec<String>> = calls
+        let split_targets: Vec<&str> = calls
             .iter()
             .filter(|c| {
                 c.first().map(String::as_str) == Some("pane")
                     && c.get(1).map(String::as_str) == Some("split")
             })
+            .map(|c| c[2].as_str())
             .collect();
-        assert_eq!(splits.len(), 1, "only the one eligible tab is injected");
-        assert_eq!(splits[0][2], "w1:p1");
+        // t1 and t2 injected; t3 (stripped) and t4 (columned) skipped.
+        assert_eq!(split_targets, vec!["w1:p1", "w1:p2"]);
     }
 }

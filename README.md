@@ -79,9 +79,16 @@ underlying commands directly):
   rebuild to make room, so it's opt-in — run it when you want a strip and
   don't already have one.
 - **`start-pets-controller`** / `herdr-pets control` — the always-on watchdog.
-  Once started, it keeps a strip present across tabs automatically: it's
-  non-destructive and only auto-injects into tabs that currently have a single
-  pane, so it never rearranges or kills a tab with work already running in it.
+  Once started, it keeps a strip present across every tab in every workspace,
+  automatically and non-destructively. It injects a full-width strip into any
+  tab that has a full-width bottom pane — single-pane tabs and the common
+  "content on top, full-width terminal/agent across the bottom" multi-pane
+  layout — by splitting that bottom pane (which never kills its process). Tabs
+  whose bottom edge is split into side-by-side columns have no full-width bottom
+  pane, so a full-width strip there needs the destructive rebuild; use the
+  on-demand **`place`** for those. The watchdog does not auto-start on a fresh
+  herdr session (herdr fires no plugin-start hook) — start it once via the
+  action above.
 
 ## Configuration
 
