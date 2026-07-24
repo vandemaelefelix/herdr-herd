@@ -29,11 +29,9 @@ use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::sprite::Species;
 
-/// Height of the pet band in pixels (3 half-block rows). Sprites are drawn a
-/// little shorter than this (see the `h <= 5` guard in `sprite.rs`) and
-/// bottom-anchored, so the leftover headroom absorbs the hop/shake lift and the
-/// pet never clips the band's top or bottom edge.
-pub const PET_PX_H: usize = 6;
+/// Height of the pet band in pixels. Sprites are 16x14 (see sprites/*.sprite);
+/// the band is the sprite height plus 1px of headroom for the hop/shake lift.
+pub const PET_PX_H: usize = 15;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
@@ -455,7 +453,7 @@ mod tests {
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle, Working, Done, Blocked, Unknown]);
-        let mut terminal = Terminal::new(TestBackend::new(90, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 11)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();
@@ -467,7 +465,7 @@ mod tests {
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle; 20]);
-        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();
@@ -492,7 +490,7 @@ mod tests {
             p.x = 4.0 + i as f32 * 18.0;
             p.target_x = p.x;
         }
-        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 11)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();
@@ -555,7 +553,7 @@ mod tests {
     fn caption_shows_the_hovered_name_on_the_bottom_row() {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
-        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|f| {
                 draw_herd(f, &herd, &species, Theme::Dark);
@@ -580,7 +578,7 @@ mod tests {
         // below (row 1+), so the icon can never cover the animal.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Done]);
-        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();
@@ -600,7 +598,7 @@ mod tests {
         // never mid-band on top of a pet.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Idle; 30]);
-        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark))
             .unwrap();

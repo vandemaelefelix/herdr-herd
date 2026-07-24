@@ -354,8 +354,8 @@ mod tests {
                 assert!(!spec.frames.is_empty(), "{} {st:?} has no frames", sp.name);
                 let (w, h) = (spec.frames[0].w, spec.frames[0].h);
                 assert!(
-                    h <= 5,
-                    "{} must be <= 5 px (1 px shorter than the 6 px band) so \
+                    h <= 14,
+                    "{} must be <= 14 px (1 px shorter than the 15 px band) so \
                      the hop/shake lift never clips",
                     sp.name
                 );
