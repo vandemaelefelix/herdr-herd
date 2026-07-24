@@ -116,13 +116,14 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
     };
 
     let frame_count = state.frames.len();
-    // Static state (frame_ms == 0): no frame swap, no motion phase (matches
-    // the old `advance` contract). Working-but-paused: legs hold a single
-    // standing frame instead of cycling on a free-running clock — tied to
-    // actual horizontal movement, not wall-clock time alone. Other statuses'
-    // frame_ms drives their own motion (breathe/hop/shake/sway), unrelated to
-    // walking, so they ignore `moving` entirely.
-    let legs_frozen = state.frame_ms == 0 || (status == AgentStatus::Working && !moving);
+    // Working-but-paused: the sheep has stopped ambling, so its legs hold a
+    // single frame instead of cycling on a free-running clock — leg animation
+    // is tied to actual horizontal movement, not wall-clock time alone (#11).
+    let working_paused = status == AgentStatus::Working && !moving;
+    // Static state (frame_ms == 0): no frame swap, no motion phase (matches the
+    // old `advance` contract). Other statuses' frame_ms drives their own motion
+    // (breathe/hop/shake/sway), unrelated to walking, so they ignore `moving`.
+    let legs_frozen = state.frame_ms == 0 || working_paused;
     let phase = if legs_frozen {
         0.0
     } else {
@@ -130,8 +131,14 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
         let offset0 = unit_hash("anim-phase", terminal_id) as f64;
         ((now_ms as f64 / cycle_ms) + offset0).rem_euclid(1.0) as f32
     };
+    // Walk frames are ordered stride-first (drawn airborne, on the hop's upbeat
+    // — phase < 0.5) and planted-last (drawn grounded). A paused sheep rests on
+    // the planted frame so it stands feet-down rather than frozen mid-stride
+    // (#13 + #11); a static/single-frame state just uses its only frame.
     let frame_index = if frame_count <= 1 {
         0
+    } else if working_paused {
+        frame_count - 1
     } else {
         ((phase * frame_count as f32) as usize).min(frame_count - 1)
     };
@@ -264,30 +271,69 @@ mod tests {
     }
 
     #[test]
-    fn legs_hold_a_single_frame_while_paused_and_cycle_while_walking() {
+    fn legs_hold_the_planted_frame_while_paused_and_cycle_while_walking() {
         let st = sheep_working_state();
         assert!(
             st.frames.len() >= 2,
             "fixture needs a real walk cycle to test frame gating"
         );
+        // Walk frames are ordered stride-first, planted-last (see `animate`), so
+        // a paused sheep must rest on the planted (feet-down) pose — not the
+        // mid-stride frame, which would look like it froze in the air.
+        let planted = st.frames.len() - 1;
         let mut saw_paused_instant = false;
-        let mut saw_walking_with_a_non_standing_frame = false;
+        let mut saw_walking_with_a_non_planted_frame = false;
         for ms in (0..MAX_PERIOD_MS).step_by(50) {
             let a = animate("legs-test", AgentStatus::Working, &st, ms);
             if a.moving {
-                saw_walking_with_a_non_standing_frame |= a.frame_index != 0;
+                saw_walking_with_a_non_planted_frame |= a.frame_index != planted;
             } else {
                 assert_eq!(
-                    a.frame_index, 0,
-                    "paused pet must hold the standing frame, ms={ms}"
+                    a.frame_index, planted,
+                    "paused pet must hold the planted (standing) frame, ms={ms}"
                 );
                 saw_paused_instant = true;
             }
         }
         assert!(saw_paused_instant, "test must sample a paused instant");
         assert!(
-            saw_walking_with_a_non_standing_frame,
+            saw_walking_with_a_non_planted_frame,
             "test must sample a walking instant that shows the legs actually cycling"
+        );
+    }
+
+    #[test]
+    fn walking_leg_frame_stays_locked_to_the_hop() {
+        // #13: while walking, the airborne part of the hop shows the mid-stride
+        // (stride-first) frame and the grounded part shows the planted (last)
+        // frame, so the sheep reads as really running rather than sliding.
+        let st = sheep_working_state();
+        let planted = st.frames.len() - 1;
+        let stride = 0;
+        let mut saw_airborne = false;
+        let mut saw_grounded = false;
+        for ms in (0..MAX_PERIOD_MS).step_by(15) {
+            let a = animate("legs-test", AgentStatus::Working, &st, ms);
+            if !a.moving {
+                continue;
+            }
+            if a.offset.dy < 0.0 {
+                assert_eq!(
+                    a.frame_index, stride,
+                    "airborne must show the mid-stride frame, ms={ms}"
+                );
+                saw_airborne = true;
+            } else {
+                assert_eq!(
+                    a.frame_index, planted,
+                    "grounded must show the planted frame, ms={ms}"
+                );
+                saw_grounded = true;
+            }
+        }
+        assert!(
+            saw_airborne && saw_grounded,
+            "test must sample both airborne and grounded walking instants"
         );
     }
 
