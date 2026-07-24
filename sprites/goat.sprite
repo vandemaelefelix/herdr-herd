@@ -2,10 +2,12 @@ name = Goat
 
 # Same side-view poses as the sheep, with a horn (h) sweeping back from the head
 # so the two species read apart at a glance. idle = dozing (lying); working =
-# two-frame hop cycle (airborne legs hand-extended into a diagonal running
-# stride, same shape as the sheep's — the horns already fill the top row's
-# headroom, so unlike the sheep this pose doesn't also lift the body);
-# done/blocked/unknown = standing. All frames 16x14.
+# two-frame hop cycle: both frames are original, pre-existing traced poses
+# (never hand-invented) — the grounded frame's legs lean back a real, if
+# subtle, one-column shift versus the airborne frame's straight legs. The
+# horns already fill the top row's headroom, so unlike the sheep this pose
+# doesn't also lift the body. done/blocked/unknown = standing. All frames
+# 16x14.
 
 [idle]    frame_ms=520 motion=breathe overlay=bubble:Zz
 ................
@@ -34,10 +36,10 @@ name = Goat
 .#MMMMSMSMSMS##.
 .#MSMMMMMMMMM#..
 ..#MMMMSMMMMS#..
-...#SS#..#MM#...
-..#SS#....#MM#..
-.#SS#......#MM#.
-#SS#........#MM#
+..#MSMSSSMMS#...
+..#SS###SSS#....
+..#MM#..#MM#....
+...##....##.....
 
 .........hh.....
 ..........h###..

@@ -328,31 +328,22 @@ mod tests {
                 );
             }
 
-            // The jump pose's legs must genuinely extend, not just repeat
-            // the stand pose's legs under a lifted body: the horizontal
-            // column span painted across the leg rows (last 4 rows) must be
-            // visibly wider — a real running stride, not a
-            // same-legs-different-head illusion.
-            let leg_span = |f: &Frame| -> usize {
-                let leg_rows = f.h.saturating_sub(4)..f.h;
-                let mut lo = f.w;
-                let mut hi = 0usize;
-                for y in leg_rows {
-                    for x in 0..f.w {
-                        if f.cells[y * f.w + x] != Role::Transparent {
-                            lo = lo.min(x);
-                            hi = hi.max(x);
-                        }
-                    }
-                }
-                hi + 1 - lo
-            };
-            assert!(
-                leg_span(airborne) > leg_span(grounded) + 2,
-                "{}: the jump pose's legs (span {}) must extend visibly wider than the stand pose's (span {})",
-                species.name,
-                leg_span(airborne),
-                leg_span(grounded)
+            // The jump pose's legs must genuinely differ from the stand
+            // pose's, not just repeat them under a (species-permitting)
+            // lifted body — otherwise the leg-swap conveys nothing. Traced
+            // faithfully from the sheet's own walk.step frame (a real,
+            // if subtle, backward-leaning shift) rather than an invented
+            // silhouette — a hand-drawn wide/splayed stride was tried and
+            // rejected on visual review as looking stretched/unnatural.
+            fn leg_rows(f: &Frame) -> &[Role] {
+                let start = f.h.saturating_sub(4) * f.w;
+                &f.cells[start..]
+            }
+            assert_ne!(
+                leg_rows(airborne),
+                leg_rows(grounded),
+                "{}: the jump pose's legs must differ from the stand pose's",
+                species.name
             );
 
             // Mirrors `motion::animate`'s frame-select formula exactly.

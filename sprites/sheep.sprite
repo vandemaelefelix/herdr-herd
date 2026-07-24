@@ -5,12 +5,13 @@ name = Sheep
 # settle sequence (rows traced from the sheet's sleep row, sinking 1px per
 # stage as the legs fold under and the eye closes), then holds on doze (the
 # lying-down "dozing" pose, row4_f0) with the breathe motion; working = the
-# two-frame hop cycle (jump.up airborne / walk.stand grounded). The airborne
-# frame's body/head are traced from the jump row; its legs are hand-extended
-# into a diagonal running stride rather than reused verbatim from the source
-# art, whose own jump.up leaves the legs pixel-identical to walk.stand (body
-# lifts alone read as a head-bob, not a hop — confirmed by eye in the live
-# pane). done/blocked/unknown = the standing pose. All
+# two-frame hop cycle. The airborne frame's body/head are traced from the
+# jump.up row (the source's own jump.up leaves legs pixel-identical to
+# walk.stand); its legs are traced from walk.step's row instead — a real,
+# if subtle, backward-leaning shift (confirmed on review: a hand-drawn
+# wide/splayed stride looked stretched/unnatural, so this uses only frames
+# that actually exist in the source sheet). done/blocked/unknown = the
+# standing pose. All
 # frames are normalised to 16x14 (shorter poses padded on top, so the feet
 # stay on the ground).
 
@@ -86,10 +87,10 @@ name = Sheep
 .#MMMMSMMMMMM#..
 .#MSMMMMMMMMM#..
 ..#MMMMSMMMMS#..
-...#SS#..#MM#...
-..#SS#....#MM#..
-.#SS#......#MM#.
-#SS#........#MM#
+..#MSMSSSMMS#...
+.#MMS###MMS#....
+.#MM#..#MS#.....
+..##....##......
 
 ................
 ...........###..
