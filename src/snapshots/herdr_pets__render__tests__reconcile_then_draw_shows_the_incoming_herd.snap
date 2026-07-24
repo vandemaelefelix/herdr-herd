@@ -1,6 +1,6 @@
 ---
 source: src/render.rs
-assertion_line: 718
+assertion_line: 762
 expression: terminal.backend()
 ---
 "                                                !           "
@@ -10,7 +10,7 @@ expression: terminal.backend()
 "                                                            "
 "                                                            "
 "                                                            "
-"                                          ▄▄                "
-"                                         ▀▀▀ ▄▀▀▄           "
-"                                         ▀▀  ▀▀▀▀           "
+"                                                            "
+"                                         ▄▀▀ ▄▀▀▄           "
+"                                         ▀▀▀ ▀▀▀▀           "
 "                                                            "
