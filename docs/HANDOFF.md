@@ -1,5 +1,10 @@
 # herdr-pets — Handoff / Status
 
+> **⚠️ Newer handoff:** the latest work (post-roadmap improvements + a live
+> sprite/sizing iteration, incl. a flagged sprite issue) is captured in
+> [`HANDOFF-2026-07-24-session2.md`](HANDOFF-2026-07-24-session2.md) — **read
+> that first.** This file is the phase-era overview.
+
 **As of:** 2026-07-24 · **Written for:** resuming after a context clear.
 
 ## TL;DR
