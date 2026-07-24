@@ -343,6 +343,39 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
     );
 }
 
+/// Dev-only git-commit marker (see `dev-build-marker` in Cargo.toml and
+/// `build.rs`) — lets two running `herdr-pets render` panes be told apart by
+/// which commit they're actually running, without inspecting process info by
+/// hand. Never compiled into a real install (`scripts/build.sh` never passes
+/// `--features dev-build-marker`).
+#[cfg(feature = "dev-build-marker")]
+const BUILD_MARKER: &str = env!("HERDR_PETS_BUILD_SHA");
+
+/// Draw the dev build marker in the strip's bottom-right corner, dim gray.
+/// Drawn after the caption, so a very long hover label could overwrite its
+/// tail — an acceptable tradeoff for a dev-only aid.
+#[cfg(feature = "dev-build-marker")]
+fn draw_build_marker(frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text: String = BUILD_MARKER
+        .chars()
+        .rev()
+        .take(area.width as usize)
+        .collect();
+    let text: String = text.chars().rev().collect();
+    let w = text.chars().count() as u16;
+    let x = area.right() - w;
+    let y = area.bottom() - 1;
+    frame.buffer_mut().set_span(
+        x,
+        y,
+        &Span::styled(text, Style::default().fg(Color::DarkGray)),
+        w,
+    );
+}
+
 /// The index of the visible pet drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
 /// Only pets that are actually drawn (the visible set on overflow) are
@@ -576,6 +609,8 @@ where
         terminal.draw(|f| {
             renderer.draw(f, &herd, species, theme, now_ms);
             draw_caption(f, f.area(), caption.as_deref());
+            #[cfg(feature = "dev-build-marker")]
+            draw_build_marker(f, f.area());
         })?;
 
         if event::poll(tick)? {
@@ -860,6 +895,28 @@ mod tests {
             .lines()
             .map(|l| l.trim().trim_matches('"').to_string())
             .collect()
+    }
+
+    #[cfg(feature = "dev-build-marker")]
+    #[test]
+    fn build_marker_renders_in_the_bottom_right_corner() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| draw_build_marker(f, f.area())).unwrap();
+        let rows = rows_of(terminal.backend());
+        let last_row = rows.last().unwrap();
+        assert!(
+            last_row.trim_end().ends_with(BUILD_MARKER),
+            "expected the build marker {BUILD_MARKER:?} at the end of the bottom row, got {last_row:?}"
+        );
+    }
+
+    #[cfg(feature = "dev-build-marker")]
+    #[test]
+    fn build_marker_does_not_panic_in_a_zero_sized_area() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| draw_build_marker(f, Rect::new(0, 0, 0, 0)))
+            .unwrap();
     }
 
     #[test]
