@@ -21,7 +21,15 @@ fn main() -> ExitCode {
                 .and_then(|p| RealSocket::connect(&p).ok())
                 .map(|s| Box::new(s) as Box<dyn SocketClient + Send>);
             let _watcher = watch(cli, socket, Box::new(RealClock::new()), tx, 2500, 250);
-            match render::run(rx, species, Theme::Dark, focus, cfg.reduced_motion) {
+            match render::run(
+                rx,
+                species,
+                Theme::Dark,
+                focus,
+                cfg.reduced_motion,
+                cfg.renderer,
+                cfg.pet_scale,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("herdr-pets: {e}");

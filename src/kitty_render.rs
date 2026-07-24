@@ -233,6 +233,10 @@ impl PetRenderer for KittyRenderer {
     fn teardown(&mut self) -> io::Result<()> {
         self.out.write_all(delete_all().as_bytes())
     }
+
+    fn backend_name(&self) -> &'static str {
+        "kitty"
+    }
 }
 
 /// A `Vec<u8>`-backed [`Write`] sink shared between the renderer and the test

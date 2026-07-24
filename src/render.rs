@@ -276,6 +276,9 @@ pub trait PetRenderer {
     fn teardown(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Short backend id (`"half-block"` / `"kitty"`), so selection is
+    /// assertable in tests without downcasting.
+    fn backend_name(&self) -> &'static str;
 }
 
 /// The universal half-block renderer (ratatui `▀▄` cells).
@@ -294,6 +297,30 @@ impl PetRenderer for HalfBlockRenderer {
     ) -> Option<usize> {
         pet_at_column(herd, species, strip_w, col)
     }
+    fn backend_name(&self) -> &'static str {
+        "half-block"
+    }
+}
+
+/// Choose the backend: forced kinds win; `Auto` probes and falls back to
+/// half-blocks when kitty graphics are unavailable (herdr flag off, non-kitty
+/// terminal, etc.).
+pub fn select_renderer(
+    kind: crate::config::RendererKind,
+    caps: &mut dyn crate::caps::TerminalCaps,
+    scale: usize,
+) -> Box<dyn PetRenderer> {
+    use crate::config::RendererKind::*;
+    let use_kitty = match kind {
+        HalfBlock => false,
+        Kitty => true,
+        Auto => caps.supports_kitty_graphics(),
+    };
+    if use_kitty {
+        Box::new(crate::kitty_render::KittyRenderer::new_stdout(scale))
+    } else {
+        Box::new(HalfBlockRenderer)
+    }
 }
 
 /// Focus the agent identified by `terminal_id` via `herdr agent focus`.
@@ -311,13 +338,18 @@ pub fn run(
     theme: Theme,
     focus: Box<dyn HerdrCli>,
     reduced_motion: bool,
+    renderer_kind: crate::config::RendererKind,
+    pet_scale: usize,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut renderer = HalfBlockRenderer;
+    // The kitty-graphics probe reads/writes the tty once, here, before the
+    // event loop starts (raw mode must already be enabled for it to work).
+    let mut caps = crate::caps::RealCaps::new();
+    let mut renderer = select_renderer(renderer_kind, &mut caps, pet_scale);
     let result = run_loop(
         &mut terminal,
         rx,
@@ -325,9 +357,10 @@ pub fn run(
         theme,
         focus.as_ref(),
         reduced_motion,
-        &mut renderer,
+        renderer.as_mut(),
     );
 
+    let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -744,6 +777,26 @@ mod tests {
         );
         focus_agent(&cli, "term_abc").unwrap();
         assert_eq!(*args.borrow(), vec!["agent", "focus", "term_abc"]);
+    }
+
+    #[test]
+    fn auto_picks_kitty_when_supported_else_half_block() {
+        use crate::caps::FakeCaps;
+        use crate::config::RendererKind;
+        let is_kitty = |r: &dyn PetRenderer| r.backend_name() == "kitty";
+        let mut yes = FakeCaps { supported: true };
+        assert!(is_kitty(
+            select_renderer(RendererKind::Auto, &mut yes, 7).as_ref()
+        ));
+        let mut no = FakeCaps { supported: false };
+        assert!(!is_kitty(
+            select_renderer(RendererKind::Auto, &mut no, 7).as_ref()
+        ));
+        // Forced modes ignore the probe:
+        let mut yes2 = FakeCaps { supported: true };
+        assert!(!is_kitty(
+            select_renderer(RendererKind::HalfBlock, &mut yes2, 7).as_ref()
+        ));
     }
 
     #[test]

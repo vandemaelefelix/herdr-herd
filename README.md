@@ -102,6 +102,8 @@ an opinionated default:
 | `strip_rows` | int | `5` | Strip height, in rows (1 icon lane + 3 pixel rows + 1 caption). |
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm pets — no wandering or bounce. |
+| `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw pets with. |
+| `pet_scale` | int | `7` | Kitty-backend sprite scale (image px per sprite px); ignored by half-block. |
 
 `strip_rows` applies to the always-on `control` watchdog; the on-demand
 `herdr-pets place` uses a fixed height.
@@ -110,6 +112,37 @@ Example `config.toml`:
 
     reduced_motion = true
     strip_rows = 6
+
+## Rendering
+
+herdr-pets always works with the universal **half-block** renderer (`▀▄`
+characters + 24-bit color) — no dependencies, no setup, correct everywhere.
+
+On top of that, herdr-pets can draw pets as small, crisp, full-detail images
+via the **kitty graphics protocol**, an **experimental, opt-in upgrade** on
+terminals that support it (e.g. Ghostty, kitty). Set `renderer = "auto"`
+(the default) to use it automatically when available, falling back to
+half-blocks everywhere else; or force it with `renderer = "kitty"` /
+`renderer = "half-block"`.
+
+The kitty upgrade has a prerequisite chain, since herdr itself gates it:
+
+1. The outer terminal must support the kitty graphics protocol.
+2. herdr must have the experimental flag enabled in
+   `~/.config/herdr/config.toml`:
+   ```toml
+   [experimental]
+   kitty_graphics = true
+   ```
+3. Run `herdr server reload-config`, then **detach and reattach** your herdr
+   client — rendering support is negotiated client-side, so an existing
+   session won't pick up the flag until you reattach.
+
+If any of those aren't in place, `renderer = "auto"` silently falls back to
+the half-block renderer — the strip always renders, just without the extra
+crispness. (`renderer = "kitty"` is a forced override for testing/debugging:
+it skips the probe and always draws via kitty escapes, so use `auto` unless
+you know the prerequisites are met.)
 
 ## Development
 
