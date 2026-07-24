@@ -465,7 +465,12 @@ impl KittyRenderer {
                 // sprite-pixel space into this pet's own on-screen footprint.
                 let (_head_row, head_col) = head_anchor(fr, animated.facing_left);
                 let head_frac = head_col as f32 / fr.w.max(1) as f32;
-                let hat_row = overlay_lane_row(area.height) as i32;
+                // Share the pet's OWN top cursor row rather than the row
+                // above it: the whole pet is only 2-4 terminal rows tall, so
+                // a full extra row of gap would read as floating rather than
+                // worn. Its much higher z (`Z_HAT_BASE`) draws it over the
+                // head pixels in that shared cell instead of behind them.
+                let hat_row = row;
                 let hat_col_center = col + (head_frac * cols as f32).round() as i32;
                 let hat_col_max = (area.width as i32 - hat_cols as i32 + 1).max(1);
                 let hat_col = (hat_col_center - (hat_cols as i32) / 2).clamp(1, hat_col_max);
@@ -1192,6 +1197,40 @@ mod tests {
         assert!(
             panned,
             "the hat must pan with the pet's own motion offset, exactly like the body"
+        );
+    }
+
+    /// The 1-indexed cursor row from the `\x1b[{row};{col}H` escape that
+    /// immediately precedes the placement chunk containing `marker` (e.g.
+    /// `,z=0,` for the pet's own body, `,z=100000,` for the hat).
+    fn cup_row_before(out: &str, marker: &str) -> u16 {
+        let idx = out.find(marker).expect("marker present in output");
+        let before = &out[..idx];
+        let cup_start = before
+            .rfind("\x1b[")
+            .expect("a CUP escape before the placement");
+        let cup = &before[cup_start + 2..];
+        cup.split(';').next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn hat_shares_the_pets_own_top_row_so_it_sits_on_the_head_with_no_gap() {
+        // At only 2-4 terminal rows tall, a whole extra row between the hat
+        // and the pet reads as clearly detached rather than "worn". Kitty
+        // can't place sub-cell, so the hat must share the pet's own top
+        // cursor row (and rely on its much higher z to draw over the head),
+        // not float a full row above it.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_focused_working_herd();
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 40, 10), Theme::Dark, 0);
+        let out = sink.take();
+        let pet_row = cup_row_before(&out, ",z=0,");
+        let hat_row = cup_row_before(&out, ",z=100000,");
+        assert_eq!(
+            hat_row, pet_row,
+            "the hat's cursor row must equal the pet's own top row, not a row above it"
         );
     }
 
