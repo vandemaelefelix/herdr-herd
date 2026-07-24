@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod anim;
+pub mod base64;
 pub mod config;
 pub mod control;
 pub mod herd;
