@@ -32,9 +32,9 @@ use crate::sprite::{Frame as SpriteFrame, Role, Species};
 
 /// Rows the focus hat occupies above a pet's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
-const HAT_H: usize = 3;
+pub(crate) const HAT_H: usize = 3;
 /// Columns the focus hat occupies, centered over the head anchor.
-const HAT_W: usize = 5;
+pub(crate) const HAT_W: usize = 5;
 /// The hat's pixel grid, top row first: `.` transparent, `#` outline, `r` red
 /// fill. Symmetric, so facing flip never needs to mirror it.
 const HAT_ROWS: [&str; HAT_H] = ["..#..", ".#r#.", "#rrr#"];
@@ -95,7 +95,7 @@ fn to_color(c: Rgb) -> Color {
 /// or per-state table: whichever pixel is highest just is the head. Falls
 /// back to top-center for a fully transparent frame (never hit by real
 /// sprites, all of which paint something).
-fn head_anchor(fr: &SpriteFrame, flip: bool) -> (usize, usize) {
+pub(crate) fn head_anchor(fr: &SpriteFrame, flip: bool) -> (usize, usize) {
     for y in 0..fr.h {
         let mut lo = None;
         let mut hi = None;
@@ -134,6 +134,40 @@ fn draw_hat(buf: &mut PixelBuf, ox: i32, oy: i32, head_row: usize, head_col: usi
             }
         }
     }
+}
+
+/// Rasterize the focus hat to RGBA at `scale` px per hat-pixel, padded by
+/// `pad` hat-pixels of transparent margin on every side — mirrors
+/// `raster::pad_frame` + `raster::rasterize`, but for the fixed 5x3 hat
+/// bitmap rather than a per-species sprite `Frame`. Used by the kitty
+/// backend so the hat can be transmitted once and panned by motion offset
+/// like the body (`kitty_render::crop_rect`), the same trick `icon::
+/// rasterize_icon` uses for overlay icons.
+pub(crate) fn rasterize_hat(scale: usize, pad: usize) -> crate::raster::Rgba {
+    let scale = scale.max(1);
+    let (w, h) = ((HAT_W + pad * 2) * scale, (HAT_H + pad * 2) * scale);
+    let mut px = vec![0u8; w * h * 4];
+    for (y, row) in HAT_ROWS.iter().enumerate() {
+        for (x, ch) in row.chars().enumerate() {
+            let color = match ch {
+                '#' => Some(HAT_OUTLINE),
+                'r' => Some(HAT_FILL),
+                _ => None,
+            };
+            let Some(c) = color else { continue };
+            let (px_x, px_y) = ((x + pad) * scale, (y + pad) * scale);
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let i = ((px_y + dy) * w + (px_x + dx)) * 4;
+                    px[i] = c.0;
+                    px[i + 1] = c.1;
+                    px[i + 2] = c.2;
+                    px[i + 3] = 255;
+                }
+            }
+        }
+    }
+    crate::raster::Rgba { w, h, px }
 }
 
 /// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
@@ -238,13 +272,21 @@ fn build_band(
 }
 
 /// Draw the whole strip: visible pets in priority z-order (blocked draws
-/// last, i.e. on top), their overlays (bubbles/badges), and a `+N` marker for
-/// any pets the strip has no room for. Overlays and `+N` live in a reserved top
-/// lane (row 0); the pet band is drawn below it, so an icon never covers a pet.
-/// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
-/// reduced motion) drives every pet's position/pose via `motion::animate` — a
-/// pure function, so this is fully deterministic given the same inputs.
-pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: Theme, now_ms: u64) {
+/// last, i.e. on top), their overlays (bubbles/badges), the hovered pet's
+/// caption, and a `+N` marker for any pets the strip has no room for. All of
+/// these live in a reserved top lane (`lane_y`); the pet band is drawn below
+/// it, so nothing in the lane ever covers a pet. `now_ms` (milliseconds since
+/// the Unix epoch, or a frozen value under reduced motion) drives every pet's
+/// position/pose via `motion::animate` — a pure function, so this is fully
+/// deterministic given the same inputs.
+pub fn draw_herd(
+    frame: &mut Frame,
+    herd: &Herd,
+    species: &[Species],
+    theme: Theme,
+    now_ms: u64,
+    hover_label: Option<&str>,
+) {
     let area = frame.area();
     let strip_w = area.width as usize;
     let (buf, order) = build_band(herd, species, strip_w, theme, now_ms);
@@ -256,13 +298,12 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
 
     // Bottom-align the whole strip so it reads as a slim status line whatever
     // the pane's height (herdr enforces a minimum pane height, so the pane can be
-    // taller than the content needs): the caption is the bottom row, the pet band
-    // sits just above it, and the icon lane sits just above the band. Any extra
-    // rows fall at the top, blending with the pane above. The icon lane keeps
-    // overlays/`+N` off the pet.
+    // taller than the content needs): the pet band bottom-aligns to the pane
+    // floor, and the icon lane sits just above it. Any extra rows fall at the
+    // top, blending with the pane above. The icon lane keeps overlays/`+N`/the
+    // caption off the pet.
     let band_rows = PET_PX_H.div_ceil(2) as u16;
-    let caption_row = area.bottom().saturating_sub(1);
-    let band_top = caption_row.saturating_sub(band_rows);
+    let band_top = area.bottom().saturating_sub(band_rows);
     let lane_y = band_top.saturating_sub(1);
     let pet_area = Rect {
         x: area.x,
@@ -322,23 +363,43 @@ pub fn draw_herd(frame: &mut Frame, herd: &Herd, species: &[Species], theme: The
             label_w,
         );
     }
+
+    draw_caption(frame, area, lane_y, hover_label, hidden);
 }
 
-/// Draw the hover caption on the strip's bottom row: the hovered pet's label,
-/// or nothing when `label` is `None`. It has its own row so hovering never
-/// shifts the herd; the label is truncated to the strip width.
-pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
+/// Ochre — the hovered pet's caption color, distinct from the `+N` marker's
+/// neutral dark gray.
+const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
+
+/// Draw the hover caption top-right in the reserved top lane (row `y`),
+/// right-aligned and ochre, or nothing when `label` is `None`. When `hidden`
+/// pets overflow (the `+N` marker also lives in this lane, further right) the
+/// caption stops one column short of it; either way it's truncated so it
+/// never overruns the strip width.
+pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, hidden: usize) {
     let Some(label) = label else { return };
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let y = area.bottom() - 1;
-    let text: String = label.chars().take(area.width as usize).collect();
+    // 1-col margin from the strip edge (matching `+N`'s own margin), plus,
+    // when `+N` is also shown, its width and a further 1-col gap before it.
+    let hidden_w = if hidden > 0 {
+        format!("+{hidden}").chars().count() as u16 + 1
+    } else {
+        0
+    };
+    let right = area.right().saturating_sub(1 + hidden_w);
+    let max_chars = right.saturating_sub(area.x) as usize;
+    if max_chars == 0 {
+        return;
+    }
+    let text: String = label.chars().take(max_chars).collect();
     let w = text.chars().count() as u16;
+    let x = right.saturating_sub(w);
     frame.buffer_mut().set_span(
-        area.x,
+        x,
         y,
-        &Span::styled(text, Style::default().fg(Color::Gray)),
+        &Span::styled(text, Style::default().fg(CAPTION_OCHRE)),
         w,
     );
 }
@@ -395,8 +456,9 @@ pub fn pet_at_column(
 /// hit-testing differ between backends (half-block vs kitty graphics).
 pub trait PetRenderer {
     /// Draw the whole strip for this frame: the pet band, and (where the
-    /// backend supports it) overlays/`+N`. `now_ms` drives every pet's
-    /// position/pose (see `motion::animate`).
+    /// backend supports it) overlays/`+N`/the hover caption. `now_ms` drives
+    /// every pet's position/pose (see `motion::animate`). `hover_label` is the
+    /// hovered pet's name, if any, drawn top-right in the reserved lane.
     fn draw(
         &mut self,
         frame: &mut Frame,
@@ -404,6 +466,7 @@ pub trait PetRenderer {
         species: &[Species],
         theme: Theme,
         now_ms: u64,
+        hover_label: Option<&str>,
     );
     /// The visible pet under terminal column `col`, if any (for hover/click).
     /// `now_ms` must match the value passed to `draw` this frame.
@@ -435,8 +498,9 @@ impl PetRenderer for HalfBlockRenderer {
         species: &[Species],
         theme: Theme,
         now_ms: u64,
+        hover_label: Option<&str>,
     ) {
-        draw_herd(frame, herd, species, theme, now_ms);
+        draw_herd(frame, herd, species, theme, now_ms, hover_label);
     }
     fn pet_at_column(
         &self,
@@ -572,8 +636,7 @@ where
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
         terminal.draw(|f| {
-            renderer.draw(f, &herd, species, theme, now_ms);
-            draw_caption(f, f.area(), caption.as_deref());
+            renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
         })?;
 
         if event::poll(tick)? {
@@ -665,7 +728,7 @@ mod tests {
         let herd = fixed_herd(&[Idle, Working, Done, Blocked, Unknown]);
         let mut terminal = Terminal::new(TestBackend::new(90, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -687,7 +750,7 @@ mod tests {
         h.reconcile(&agents, 1);
         let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &h, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &h, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -699,7 +762,7 @@ mod tests {
         let herd = fixed_herd(&[Idle; 20]);
         let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -713,7 +776,7 @@ mod tests {
         herd.reconcile(&[agent("a", Working), agent("b", Blocked)], 1);
         let mut terminal = Terminal::new(TestBackend::new(60, 11)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
@@ -802,18 +865,91 @@ mod tests {
         );
     }
 
+    /// Row `y` as one `String` of cell symbols, plus each cell's foreground —
+    /// lets a test assert on text and color together from a `Buffer` directly
+    /// (`TestBackend`'s `Display` only exposes symbols).
+    fn row_text_and_fg(buffer: &ratatui::buffer::Buffer, y: u16) -> (String, Vec<Color>) {
+        let text = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        let fg = (0..buffer.area.width).map(|x| buffer[(x, y)].fg).collect();
+        (text, fg)
+    }
+
     #[test]
-    fn caption_shows_the_hovered_name_on_the_bottom_row() {
+    fn caption_renders_top_right_in_ochre() {
+        // A pane exactly the band's height + 1 lane row, so the lane sits at
+        // row 0 (matching `overlays_never_occlude_the_pet`'s convention).
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let completed = terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, Some("backend-api")))
+            .unwrap();
+        let (row0, fg) = row_text_and_fg(completed.buffer, 0);
+        assert!(
+            row0.trim_end().ends_with("backend-api"),
+            "caption is right-aligned in the top lane (row 0): {row0:?}"
+        );
+        let label_start = row0.find("backend-api").unwrap();
+        assert_eq!(
+            fg[label_start],
+            Color::Rgb(0xd9, 0xa4, 0x41),
+            "caption is ochre"
+        );
+    }
+
+    #[test]
+    fn caption_no_longer_reserves_the_bottom_row() {
+        // Freeing the bottom row means the pet band now bottom-aligns exactly
+        // to the pane floor: the last row is pet pixels, not blank/caption.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, Some("backend-api")))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        let last = rows.last().unwrap();
+        assert!(
+            !last.contains("backend-api"),
+            "caption no longer occupies the bottom row: {last:?}"
+        );
+        assert!(
+            last.contains('▀') || last.contains('▄'),
+            "the band now bottom-aligns to the pane floor: {last:?}"
+        );
+    }
+
+    #[test]
+    fn caption_truncates_and_stays_left_of_the_overflow_marker() {
+        // `Working` carries no overlay glyph (unlike `Idle`'s "Zz" bubble),
+        // so the top lane holds only the caption and the `+N` marker.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working; 30]);
+        let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
         terminal
             .draw(|f| {
-                draw_herd(f, &herd, &species, Theme::Dark, NOW_MS);
-                draw_caption(f, f.area(), Some("backend-api"));
+                draw_herd(
+                    f,
+                    &herd,
+                    &species,
+                    Theme::Dark,
+                    NOW_MS,
+                    Some("a-very-long-agent-name-that-does-not-fit"),
+                )
             })
             .unwrap();
-        insta::assert_snapshot!(terminal.backend());
+        let rows = rows_of(terminal.backend());
+        let row0 = &rows[0];
+        assert!(row0.contains('+'), "the +N marker is still shown");
+        let plus_at = row0.find('+').unwrap();
+        let last_caption_char = row0[..plus_at].trim_end().len();
+        assert!(
+            last_caption_char < plus_at,
+            "caption stays left of the +N marker with a gap: {row0:?}"
+        );
+        assert!(row0.chars().count() <= 24, "never overruns the strip width");
     }
 
     /// Dump a TestBackend as one `String` per terminal row (symbols only).
@@ -833,7 +969,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Done]);
         let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         let rows = rows_of(terminal.backend());
         assert!(rows[0].contains('!'), "badge sits in the top lane (row 0)");
@@ -853,7 +989,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Idle; 30]);
         let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         let rows = rows_of(terminal.backend());
         assert!(rows[0].contains('+'), "the +N marker is in the top lane");
@@ -918,7 +1054,7 @@ mod tests {
             .expect("some instant facing left");
         let render = |ms: u64| {
             let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
-            t.draw(|f| draw_herd(f, &herd, &species, Theme::Dark, ms))
+            t.draw(|f| draw_herd(f, &herd, &species, Theme::Dark, ms, None))
                 .unwrap();
             format!("{}", t.backend())
         };
@@ -968,11 +1104,11 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut via_trait = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_trait
-            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         let mut via_fn = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_fn
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
         assert_eq!(
             format!("{}", via_trait.backend()),
@@ -989,7 +1125,7 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
-            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS))
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
     }
 
