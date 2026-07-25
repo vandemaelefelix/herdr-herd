@@ -1,12 +1,66 @@
 name = Sheep
 
 # Traced from the maintainer's sprite-playground artifact (sheep_assets_x4):
-# a side-view sheep. idle = the lying-down "dozing" pose (row4_f0); working =
-# the two-frame walk cycle (row1_f0/f1); done/blocked/unknown = the standing
-# pose. All frames are normalised to 16x14 (shorter poses padded on top, so the
-# feet stay on the ground).
+# a side-view sheep. idle = a one-shot stand -> sleep.1 -> sleep.2 -> doze
+# settle sequence (rows traced from the sheet's sleep row, sinking 1px per
+# stage as the legs fold under and the eye closes), then holds on doze (the
+# lying-down "dozing" pose, row4_f0) with the breathe motion; working = the
+# two-frame hop cycle. The airborne frame's body/head are traced from the
+# jump.up row (the source's own jump.up leaves legs pixel-identical to
+# walk.stand); its legs are traced from walk.step's row instead — a real,
+# if subtle, backward-leaning shift (confirmed on review: a hand-drawn
+# wide/splayed stride looked stretched/unnatural, so this uses only frames
+# that actually exist in the source sheet). done/blocked/unknown = the
+# standing pose. All
+# frames are normalised to 16x14 (shorter poses padded on top, so the feet
+# stay on the ground).
 
 [idle]    frame_ms=520 motion=breathe overlay=bubble:Zz
+................
+...........###..
+........###MMM#.
+...#####SpMSMSS#
+..#MMMMM##Mp#p#.
+.#SSMSMSMSMpepp#
+#SMMMMMMMMMpppp#
+.#MMMMSMSMSMS##.
+.#MSMMMMMMMMM#..
+..#MMMMSMMMMS#..
+..#MSMSSSMMS#...
+..#SS###SSS#....
+..#MM#..#MM#....
+...##....##.....
+
+................
+................
+................
+...........###..
+........###MMM#.
+...#####SpMSMSS#
+..#MMMMM##M##p#.
+.#SSMSMSMSMpppp#
+#SMMMMMMMMMpppM#
+.#MMMMSMSMSMS##.
+.#MSMMMMMMMMM#..
+..#MMMMSMMMMS#..
+..#MSMSSSMMS#...
+.#MSSM###SSS#...
+
+................
+................
+................
+................
+...........###..
+........###MMM#.
+...#####SpMSMSS#
+..#MMMMM##M##p#.
+.#SSMSMSMSMpppp#
+#SMMMMMMMMMpppM#
+.#MMMMSMSMSMS##.
+.#MSMMMMMMMMM#..
+..#MMMMSMMMMS#..
+..#MSMSSSMMS#...
+
 ................
 ................
 ................
@@ -22,15 +76,15 @@ name = Sheep
 ..#MMMMM###.....
 ...#####........
 
-[working] frame_ms=150 motion=hop+wander overlay=none
+[working] frame_ms=150 motion=walkhop+wander overlay=none
 ................
-...........###..
 ........###MMM#.
-...#####SpMSMSS#
-..#MMMMM##Mp#p#.
-.#SSMSMSMSMpepp#
-#SMMMMMMMMMpppp#
-.#MMMMSMSMSMS##.
+........SpMSMSS.
+...#####SpMp#p#.
+..#MMMMMMSMpepp.
+.#SSMSMSMMMpppM.
+.SMMMMMMSMSMS##.
+.#MMMMSMMMMMM#..
 .#MSMMMMMMMMM#..
 ..#MMMMSMMMMS#..
 ..#MSMSSSMMS#...

@@ -5,8 +5,9 @@
 //! `motion::animate`, a pure function of time computed fresh at draw time, so
 //! every pane agrees without needing to share any of this state.
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentStatus};
 use crate::identity::identity_for;
+use crate::motion::{Anchor, wander_position};
 use crate::pet::{Pet, priority};
 
 /// A herd of pets, kept in sync with the live agent snapshot.
@@ -36,7 +37,25 @@ impl Herd {
     /// has departed. Returns the old→new status changes seen on survivors — a
     /// freshly spawned pet has no prior status, so it never contributes one;
     /// this is what keeps the initial snapshot silent for sound notifications.
-    pub fn reconcile(&mut self, agents: &[Agent], species_count: usize) -> Vec<StatusTransition> {
+    ///
+    /// `now_ms` is the current wall-clock instant (see `render::run_loop`):
+    /// when a survivor leaves `Working`, its freeze anchor is captured here —
+    /// `frozen_x` sampled from `motion::wander_position` at this exact
+    /// instant, `settled_at_ms` set to it — so `motion::animate` can hold the
+    /// pet there instead of teleporting it to the identity rest position.
+    /// Re-entering `Working` clears the anchor; a transition between two
+    /// non-Working statuses leaves an existing anchor untouched (it persists
+    /// until the pet works again). A pet's first-ever appearance already
+    /// non-Working has no anchor to capture (there's no prior Working instant
+    /// to sample) — accepted per-pane cosmetic tradeoff: a pane that only sees
+    /// the pet post-transition can't know where it was, so it falls back to
+    /// the identity rest position, same as before anchors existed.
+    pub fn reconcile(
+        &mut self,
+        agents: &[Agent],
+        species_count: usize,
+        now_ms: u64,
+    ) -> Vec<StatusTransition> {
         let mut transitions = Vec::new();
         for a in agents {
             if let Some(p) = self
@@ -50,6 +69,15 @@ impl Herd {
                         from: p.status,
                         to: a.agent_status,
                     });
+                    if p.status == AgentStatus::Working {
+                        let (frozen_x, _facing_left) = wander_position(&p.terminal_id, now_ms);
+                        p.anchor = Some(Anchor {
+                            frozen_x,
+                            settled_at_ms: now_ms,
+                        });
+                    } else if a.agent_status == AgentStatus::Working {
+                        p.anchor = None;
+                    }
                 }
                 p.status = a.agent_status;
                 p.label = a.display_label();
@@ -120,6 +148,7 @@ mod tests {
                 agent("b", AgentStatus::Working),
             ],
             2,
+            0,
         );
         assert_eq!(h.pets.len(), 2);
 
@@ -130,6 +159,7 @@ mod tests {
                 agent("c", AgentStatus::Idle),
             ],
             2,
+            0,
         );
         let a = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
         assert_eq!(a.status, AgentStatus::Blocked);
@@ -141,9 +171,9 @@ mod tests {
     fn reconcile_preserves_identity_across_reconciles() {
         // A survivor's stable identity (species/hue) must not be re-rolled.
         let mut h = Herd::new();
-        h.reconcile(&[agent("a", AgentStatus::Idle)], 3);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 3, 0);
         let identity0 = h.pets[0].identity;
-        h.reconcile(&[agent("a", AgentStatus::Working)], 3);
+        h.reconcile(&[agent("a", AgentStatus::Working)], 3, 0);
         assert_eq!(h.pets[0].identity, identity0);
     }
 
@@ -152,13 +182,13 @@ mod tests {
         let mut h = Herd::new();
         let mut a = agent("a", AgentStatus::Idle);
         a.name = Some("backend".into());
-        h.reconcile(&[a], 1);
+        h.reconcile(&[a], 1, 0);
         assert_eq!(h.pets[0].label, "backend");
 
         // A survivor renamed mid-session picks up the new label.
         let mut a2 = agent("a", AgentStatus::Idle);
         a2.name = Some("frontend".into());
-        h.reconcile(&[a2], 1);
+        h.reconcile(&[a2], 1, 0);
         assert_eq!(h.pets[0].label, "frontend");
     }
 
@@ -167,7 +197,7 @@ mod tests {
         let mut h = Herd::new();
         let mut a = agent("a", AgentStatus::Idle);
         a.focused = true;
-        h.reconcile(&[a], 1);
+        h.reconcile(&[a], 1, 0);
         assert!(
             h.pets[0].focused,
             "a fresh pet picks up focused from the agent"
@@ -178,7 +208,7 @@ mod tests {
         a2.focused = false;
         let mut b = agent("b", AgentStatus::Idle);
         b.focused = true;
-        h.reconcile(&[a2, b], 1);
+        h.reconcile(&[a2, b], 1, 0);
         let a_pet = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
         let b_pet = h.pets.iter().find(|p| p.terminal_id == "b").unwrap();
         assert!(
@@ -194,13 +224,13 @@ mod tests {
         // A fresh pet takes the resolved breadcrumb, not the legacy "claude".
         let mut a = agent("a", AgentStatus::Working);
         a.hover_label = Some("herdr-pets › renderer".into());
-        h.reconcile(&[a], 1);
+        h.reconcile(&[a], 1, 0);
         assert_eq!(h.pets[0].label, "herdr-pets › renderer");
 
         // A survivor whose breadcrumb changes (moved tab) picks up the new one.
         let mut a2 = agent("a", AgentStatus::Working);
         a2.hover_label = Some("herdr-pets › tests".into());
-        h.reconcile(&[a2], 1);
+        h.reconcile(&[a2], 1, 0);
         assert_eq!(h.pets[0].label, "herdr-pets › tests");
     }
 
@@ -213,6 +243,7 @@ mod tests {
                 agent("b", AgentStatus::Done),
             ],
             2,
+            0,
         );
         assert!(
             transitions.is_empty(),
@@ -223,8 +254,8 @@ mod tests {
     #[test]
     fn reconcile_reports_a_transition_when_a_survivor_changes_status() {
         let mut h = Herd::new();
-        h.reconcile(&[agent("a", AgentStatus::Idle)], 1);
-        let transitions = h.reconcile(&[agent("a", AgentStatus::Blocked)], 1);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 0);
+        let transitions = h.reconcile(&[agent("a", AgentStatus::Blocked)], 1, 0);
         assert_eq!(
             transitions,
             vec![StatusTransition {
@@ -238,8 +269,8 @@ mod tests {
     #[test]
     fn reconcile_reports_no_transition_when_status_is_unchanged() {
         let mut h = Herd::new();
-        h.reconcile(&[agent("a", AgentStatus::Working)], 1);
-        let transitions = h.reconcile(&[agent("a", AgentStatus::Working)], 1);
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        let transitions = h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
         assert!(transitions.is_empty());
     }
 
@@ -253,6 +284,7 @@ mod tests {
                 agent("c", AgentStatus::Working),
             ],
             1,
+            0,
         );
         let mut transitions = h.reconcile(
             &[
@@ -261,6 +293,7 @@ mod tests {
                 agent("c", AgentStatus::Working), // unchanged
             ],
             1,
+            0,
         );
         transitions.sort_by(|x, y| x.terminal_id.cmp(&y.terminal_id));
         assert_eq!(
@@ -278,6 +311,63 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reconcile_anchors_a_pet_leaving_working_at_its_wander_position_and_instant() {
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        assert_eq!(h.pets[0].anchor, None, "still working -> no anchor yet");
+
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 12_345);
+        let (expected_x, _) = crate::motion::wander_position("a", 12_345);
+        assert_eq!(
+            h.pets[0].anchor,
+            Some(Anchor {
+                frozen_x: expected_x,
+                settled_at_ms: 12_345,
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_clears_the_anchor_on_re_entering_working() {
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
+        assert!(h.pets[0].anchor.is_some());
+
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 2_000);
+        assert_eq!(
+            h.pets[0].anchor, None,
+            "re-entering Working clears the anchor"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_the_anchor_across_non_working_to_non_working_changes() {
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
+        let anchor = h.pets[0].anchor;
+        assert!(anchor.is_some());
+
+        // Idle -> Blocked much later: the anchor must persist unchanged, not
+        // re-sample at the new instant.
+        h.reconcile(&[agent("a", AgentStatus::Blocked)], 1, 99_999);
+        assert_eq!(
+            h.pets[0].anchor, anchor,
+            "a non-working -> non-working change must not touch the anchor"
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_a_freshly_seen_non_working_pet_unanchored() {
+        // First-ever appearance already non-working: no prior Working instant
+        // was ever observed, so there's nothing to anchor to.
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 5_000);
+        assert_eq!(h.pets[0].anchor, None);
     }
 
     #[test]

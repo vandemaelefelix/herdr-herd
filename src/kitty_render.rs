@@ -238,7 +238,7 @@ impl KittyRenderer {
             let Some(state) = sp.states.get(&pet.status) else {
                 continue;
             };
-            let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+            let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
             let fr = &state.frames[animated.frame_index];
             let key: ImgKey = (
                 pet.identity.species_index,
@@ -541,7 +541,7 @@ impl PetRenderer for KittyRenderer {
             let Some(state) = sp.states.get(&pet.status) else {
                 continue;
             };
-            let animated = animate(&pet.terminal_id, pet.status, state, now_ms);
+            let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
             let fr = &state.frames[animated.frame_index];
             // The image occupies `cols` cells from the pet's x; the visible
             // sprite is the opaque span scaled into those cols, so hover
@@ -1171,6 +1171,46 @@ mod tests {
         assert!(
             out.contains("a=d"),
             "the departed pet's placement is deleted"
+        );
+    }
+
+    #[test]
+    fn anchored_pet_placement_column_stays_fixed_as_time_advances() {
+        // The kitty path threads `pet.anchor` into `animate` exactly like the
+        // half-block path — a frozen pet's cursor column must not drift.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut herd = Herd::new();
+        let mut pet = Pet::new("t1".into(), identity_for("t1", 1), AgentStatus::Idle);
+        pet.anchor = Some(crate::motion::Anchor {
+            frozen_x: 0.4,
+            settled_at_ms: 0,
+        });
+        herd.pets.push(pet);
+
+        // The pet body's cursor-move escape is written before its placement
+        // (and before the overlay icon's own cursor move), so the first
+        // `\x1b[...H` in the frame is the pet's.
+        let cursor_pos = |out: &str| -> String {
+            let start = out.find("\x1b[").expect("a cursor-move escape") + 2;
+            let end = out[start..].find('H').expect("terminated cursor move") + start;
+            out[start..end].to_string()
+        };
+
+        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let pos0 = cursor_pos(&sink.take());
+        let _ = r.render_pets(
+            &herd,
+            &species,
+            Rect::new(0, 0, 200, 10),
+            Theme::Dark,
+            60_000,
+        );
+        let pos1 = cursor_pos(&sink.take());
+        assert_eq!(
+            pos0, pos1,
+            "an anchored pet's column must stay fixed regardless of elapsed time"
         );
     }
 }
