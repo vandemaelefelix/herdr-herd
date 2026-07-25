@@ -45,6 +45,40 @@ const PAUSE_FRACTION: f64 = 0.05;
 /// Icon float cycle, matching the old `Pet::ICON_CYCLE_MS`.
 const ICON_CYCLE_MS: f64 = 1800.0;
 
+/// Where a pet was, and when, the instant it last left `Working` — captured
+/// by `Herd::reconcile` and threaded into [`animate`] so a Working->non-Working
+/// transition freezes the pet in place instead of teleporting it to the
+/// identity-derived rest position. `None` means this pet has never been
+/// observed making that transition (a fresh or late-attached pane), in which
+/// case `animate` falls back to the old identity-derived rest position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Anchor {
+    /// `x_fraction` sampled from `wander_position` at the instant this pet
+    /// left `Working`.
+    pub frozen_x: f32,
+    /// `now_ms` at the instant this pet left `Working`.
+    pub settled_at_ms: u64,
+}
+
+/// Total duration of Idle's one-shot "settle" (stand -> lie down) animation,
+/// split evenly across however many frames the idle state has — ~1s per the
+/// design brief, then holds on the last (fully-dozing) frame indefinitely.
+const SETTLE_DURATION_MS: f64 = 1_000.0;
+
+/// A wandering (`Working`) pet's horizontal position/facing at `now_ms` — the
+/// same computation [`animate`] uses for its `x_fraction`/`facing_left`,
+/// factored out so `Herd::reconcile` can sample "where was this pet when it
+/// stopped working" without needing a `StateSpec` (position never depends on
+/// which sprite frames a species has).
+pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
+    let phase0 = unit_hash("wander-phase", terminal_id) as f64;
+    let period_ms =
+        WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
+    let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
+    let (x_fraction, facing_left, _moving) = wander_segment(u);
+    (x_fraction, facing_left)
+}
+
 /// A pet's fully-resolved, ready-to-draw state at one instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Animated {
@@ -99,8 +133,16 @@ fn wander_segment(u: f64) -> (f32, bool, bool) {
 
 /// Resolve `terminal_id`'s animated state for `status`/`state` at `now_ms`
 /// (milliseconds since the Unix epoch, or `0` under reduced motion — see
-/// `render::run_loop`). Pure: same inputs, same output, always.
-pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms: u64) -> Animated {
+/// `render::run_loop`). `anchor` is this pet's freeze anchor from
+/// `Herd::reconcile` (see [`Anchor`]), or `None` if it's never been observed
+/// leaving `Working`. Pure: same inputs, same output, always.
+pub fn animate(
+    terminal_id: &str,
+    status: AgentStatus,
+    state: &StateSpec,
+    now_ms: u64,
+    anchor: Option<Anchor>,
+) -> Animated {
     let (x_fraction, facing_left, moving) = if status == AgentStatus::Working {
         let phase0 = unit_hash("wander-phase", terminal_id) as f64;
         // +/-25% period variation so working pets don't all sweep in lockstep.
@@ -109,9 +151,17 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
         let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
         wander_segment(u)
     } else {
-        // Not wandering: a fixed, identity-derived resting spot and facing.
-        let rest = unit_hash("rest-x", terminal_id);
         let rest_facing_left = unit_hash("rest-facing", terminal_id) < 0.5;
+        // Freeze in place at the anchor captured when this pet left Working —
+        // no teleport to the identity rest spot. `Unknown` is exempted (stays
+        // on the plain identity rest-x, unchanged) and a pet with no anchor
+        // (never observed leaving Working) falls back to that same rest-x.
+        let rest = if status != AgentStatus::Unknown {
+            anchor.map(|a| a.frozen_x)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| unit_hash("rest-x", terminal_id));
         (rest, rest_facing_left, false)
     };
 
@@ -124,6 +174,13 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
     // old `advance` contract). Other statuses' frame_ms drives their own motion
     // (breathe/hop/shake/sway), unrelated to walking, so they ignore `moving`.
     let legs_frozen = state.frame_ms == 0 || working_paused;
+    // Fixed wall-clock cadence for every status, including Working. A
+    // distance-linked cadence (hop phase tied to cumulative horizontal
+    // distance moved, so faster movement hopped faster) was tried here per
+    // the design brief, but live testing on real hardware showed it read as
+    // jittery rather than a clean walk — at ~12fps, a phase that speeds up
+    // and slows down continuously doesn't sample smoothly. Reverted to the
+    // brief's own explicit fallback.
     let phase = if legs_frozen {
         0.0
     } else {
@@ -139,6 +196,20 @@ pub fn animate(terminal_id: &str, status: AgentStatus, state: &StateSpec, now_ms
         0
     } else if working_paused {
         frame_count - 1
+    } else if status == AgentStatus::Idle {
+        // One-shot "settle" (stand -> lie down): steps through the idle
+        // state's frames once, driven by time since this pet's anchor was
+        // captured, then holds on the last (fully-dozing) frame. No anchor
+        // (never observed settling) skips straight to that resting frame —
+        // there is no reference instant to animate the lie-down from.
+        match anchor {
+            Some(a) => {
+                let elapsed_ms = now_ms.saturating_sub(a.settled_at_ms) as f64;
+                let stage = (elapsed_ms / SETTLE_DURATION_MS * frame_count as f64) as usize;
+                stage.min(frame_count - 1)
+            }
+            None => frame_count - 1,
+        }
     } else {
         ((phase * frame_count as f32) as usize).min(frame_count - 1)
     };
@@ -184,6 +255,14 @@ mod tests {
             .unwrap()
     }
 
+    fn sheep_idle_state() -> StateSpec {
+        parse_species(SHEEP)
+            .unwrap()
+            .states
+            .remove(&AgentStatus::Idle)
+            .unwrap()
+    }
+
     /// Upper bound on the jittered wander period (`WANDER_PERIOD_MS * 1.25`),
     /// so a scan of this many ms is guaranteed to cover at least one full
     /// walk/pause cycle for any terminal_id.
@@ -194,16 +273,16 @@ mod tests {
         // The whole point: two independent calls (standing in for two
         // independent panes) must agree exactly.
         let st = state(AgentStatus::Working);
-        let a = animate("term_x", AgentStatus::Working, &st, 12_345);
-        let b = animate("term_x", AgentStatus::Working, &st, 12_345);
+        let a = animate("term_x", AgentStatus::Working, &st, 12_345, None);
+        let b = animate("term_x", AgentStatus::Working, &st, 12_345, None);
         assert_eq!(a, b);
     }
 
     #[test]
     fn working_pets_wander_over_time() {
         let st = state(AgentStatus::Working);
-        let a = animate("term_x", AgentStatus::Working, &st, 0);
-        let b = animate("term_x", AgentStatus::Working, &st, 5_000);
+        let a = animate("term_x", AgentStatus::Working, &st, 0, None);
+        let b = animate("term_x", AgentStatus::Working, &st, 5_000, None);
         assert_ne!(a.x_fraction, b.x_fraction, "position must change over time");
     }
 
@@ -216,8 +295,8 @@ mod tests {
             AgentStatus::Unknown,
         ] {
             let st = state(status);
-            let a = animate("term_x", status, &st, 0);
-            let b = animate("term_x", status, &st, 60_000);
+            let a = animate("term_x", status, &st, 0, None);
+            let b = animate("term_x", status, &st, 60_000, None);
             assert_eq!(a.x_fraction, b.x_fraction, "{status:?} must not wander");
         }
     }
@@ -226,7 +305,7 @@ mod tests {
     fn x_fraction_stays_within_bounds() {
         let st = state(AgentStatus::Working);
         for ms in [0, 1_000, 4_999, 12_345, 999_999] {
-            let a = animate("term_x", AgentStatus::Working, &st, ms);
+            let a = animate("term_x", AgentStatus::Working, &st, ms, None);
             assert!((0.0..=1.0).contains(&a.x_fraction));
         }
     }
@@ -234,8 +313,8 @@ mod tests {
     #[test]
     fn different_agents_get_different_wander_phases() {
         let st = state(AgentStatus::Working);
-        let a = animate("term_a", AgentStatus::Working, &st, 1_000);
-        let b = animate("term_b", AgentStatus::Working, &st, 1_000);
+        let a = animate("term_a", AgentStatus::Working, &st, 1_000, None);
+        let b = animate("term_b", AgentStatus::Working, &st, 1_000, None);
         assert_ne!(
             a.x_fraction, b.x_fraction,
             "distinct agents shouldn't move in lockstep"
@@ -247,8 +326,8 @@ mod tests {
         // `unknown` has frame_ms=0 (static), but the icon must still float.
         let st = state(AgentStatus::Unknown);
         assert_eq!(st.frame_ms, 0);
-        let a = animate("term_x", AgentStatus::Unknown, &st, 0);
-        let b = animate("term_x", AgentStatus::Unknown, &st, 900);
+        let a = animate("term_x", AgentStatus::Unknown, &st, 0, None);
+        let b = animate("term_x", AgentStatus::Unknown, &st, 900, None);
         assert_eq!(
             a.offset, b.offset,
             "body motion is pinned for a static state"
@@ -262,8 +341,8 @@ mod tests {
     #[test]
     fn reduced_motion_freezes_at_now_ms_zero() {
         let st = state(AgentStatus::Working);
-        let a = animate("term_x", AgentStatus::Working, &st, 0);
-        let b = animate("term_x", AgentStatus::Working, &st, 0);
+        let a = animate("term_x", AgentStatus::Working, &st, 0, None);
+        let b = animate("term_x", AgentStatus::Working, &st, 0, None);
         assert_eq!(
             a, b,
             "now_ms=0 is just another fixed instant — no special-casing needed"
@@ -284,7 +363,7 @@ mod tests {
         let mut saw_paused_instant = false;
         let mut saw_walking_with_a_non_planted_frame = false;
         for ms in (0..MAX_PERIOD_MS).step_by(50) {
-            let a = animate("legs-test", AgentStatus::Working, &st, ms);
+            let a = animate("legs-test", AgentStatus::Working, &st, ms, None);
             if a.moving {
                 saw_walking_with_a_non_planted_frame |= a.frame_index != planted;
             } else {
@@ -313,7 +392,7 @@ mod tests {
         let mut saw_airborne = false;
         let mut saw_grounded = false;
         for ms in (0..MAX_PERIOD_MS).step_by(15) {
-            let a = animate("legs-test", AgentStatus::Working, &st, ms);
+            let a = animate("legs-test", AgentStatus::Working, &st, ms, None);
             if !a.moving {
                 continue;
             }
@@ -347,7 +426,7 @@ mod tests {
             let mut longest_paused_run_ms = 0u64;
             let mut current_paused_run_ms = 0u64;
             for ms in (0..MAX_PERIOD_MS).step_by(step_ms as usize) {
-                let a = animate(terminal_id, AgentStatus::Working, &st, ms);
+                let a = animate(terminal_id, AgentStatus::Working, &st, ms, None);
                 if a.moving {
                     moving += 1;
                     current_paused_run_ms = 0;
@@ -372,14 +451,136 @@ mod tests {
     }
 
     #[test]
+    fn anchored_non_working_pet_freezes_at_the_anchor_instead_of_teleporting() {
+        let anchor = Anchor {
+            frozen_x: 0.37,
+            settled_at_ms: 1_000,
+        };
+        for status in [AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked] {
+            let st = state(status);
+            let a = animate("term_x", status, &st, 1_000, Some(anchor));
+            let b = animate("term_x", status, &st, 60_000, Some(anchor));
+            assert_eq!(
+                a.x_fraction, anchor.frozen_x,
+                "{status:?} must render at the anchor's frozen_x"
+            );
+            assert_eq!(
+                a.x_fraction, b.x_fraction,
+                "{status:?} must stay put at the anchor regardless of elapsed time"
+            );
+        }
+    }
+
+    #[test]
+    fn unanchored_non_working_pet_falls_back_to_the_identity_rest_x() {
+        let st = state(AgentStatus::Idle);
+        let with_none = animate("term_x", AgentStatus::Idle, &st, 1_000, None);
+        let without_arg = animate("term_x", AgentStatus::Idle, &st, 60_000, None);
+        assert_eq!(
+            with_none.x_fraction, without_arg.x_fraction,
+            "no anchor observed yet -> stable identity rest-x, same as before anchors existed"
+        );
+    }
+
+    #[test]
+    fn unknown_status_ignores_the_anchor_and_keeps_the_identity_rest_x() {
+        let st = state(AgentStatus::Unknown);
+        let anchor = Anchor {
+            frozen_x: 0.91,
+            settled_at_ms: 0,
+        };
+        let anchored = animate("term_x", AgentStatus::Unknown, &st, 5_000, Some(anchor));
+        let unanchored = animate("term_x", AgentStatus::Unknown, &st, 5_000, None);
+        assert_eq!(
+            anchored.x_fraction, unanchored.x_fraction,
+            "Unknown stays on the plain identity rest-x even if it happens to carry an anchor"
+        );
+        assert_ne!(
+            anchored.x_fraction, anchor.frozen_x,
+            "Unknown must not use the anchor's frozen_x"
+        );
+    }
+
+    #[test]
+    fn idle_settle_sequence_steps_stand_sleep1_sleep2_doze_then_holds() {
+        let st = sheep_idle_state();
+        assert!(
+            st.frames.len() >= 4,
+            "fixture needs the traced stand/sleep.1/sleep.2/doze settle sequence"
+        );
+        let doze = st.frames.len() - 1;
+        let anchor = Anchor {
+            frozen_x: 0.2,
+            settled_at_ms: 0,
+        };
+        let frame_at =
+            |ms: u64| animate("settle-test", AgentStatus::Idle, &st, ms, Some(anchor)).frame_index;
+        assert_eq!(
+            frame_at(0),
+            0,
+            "starts on the standing frame the instant it settles"
+        );
+        assert_eq!(frame_at(300), 1, "sleep.1 partway through the settle");
+        assert_eq!(frame_at(600), 2, "sleep.2 further along");
+        assert_eq!(frame_at(1_000), doze, "fully dozing by ~1s");
+        assert_eq!(
+            frame_at(60_000),
+            doze,
+            "holds on doze indefinitely afterward"
+        );
+    }
+
+    #[test]
+    fn idle_settle_sequence_is_relative_to_when_this_pet_settled() {
+        // Two pets settling at different wall-clock instants must each play
+        // their own ~1s settle from their own settled_at_ms, not from t=0.
+        let st = sheep_idle_state();
+        let doze = st.frames.len() - 1;
+        let anchor = Anchor {
+            frozen_x: 0.5,
+            settled_at_ms: 10_000,
+        };
+        assert_eq!(
+            animate("settle-test", AgentStatus::Idle, &st, 10_000, Some(anchor)).frame_index,
+            0
+        );
+        assert_eq!(
+            animate("settle-test", AgentStatus::Idle, &st, 10_600, Some(anchor)).frame_index,
+            2
+        );
+        assert_eq!(
+            animate("settle-test", AgentStatus::Idle, &st, 20_000, Some(anchor)).frame_index,
+            doze
+        );
+    }
+
+    #[test]
+    fn idle_without_an_observed_settle_shows_the_resting_doze_frame_directly() {
+        // A fresh/late pane never saw the Working->Idle transition, so there
+        // is no reference instant to animate a lie-down from — it should
+        // just show the resting pose, not the standing start of a settle it
+        // never observed happening.
+        let st = sheep_idle_state();
+        let doze = st.frames.len() - 1;
+        assert_eq!(
+            animate("settle-test", AgentStatus::Idle, &st, 0, None).frame_index,
+            doze
+        );
+        assert_eq!(
+            animate("settle-test", AgentStatus::Idle, &st, 999_999, None).frame_index,
+            doze
+        );
+    }
+
+    #[test]
     fn non_working_states_keep_animating_regardless_of_the_moving_gate() {
         // Non-working pets never wander (`moving` is always false for them),
         // but their own motion (bounce/breathe/hop/sway) must still animate
         // freely on its own clock — the `moving` gate only freezes Working's
         // walk cycle.
         let st = state(AgentStatus::Blocked); // frame_ms=110, motion=bounce
-        let a = animate("term_x", AgentStatus::Blocked, &st, 0);
-        let b = animate("term_x", AgentStatus::Blocked, &st, 55);
+        let a = animate("term_x", AgentStatus::Blocked, &st, 0, None);
+        let b = animate("term_x", AgentStatus::Blocked, &st, 55, None);
         assert!(!a.moving && !b.moving, "non-working pets never wander");
         assert_ne!(
             a.offset, b.offset,

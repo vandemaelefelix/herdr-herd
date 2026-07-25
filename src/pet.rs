@@ -7,6 +7,7 @@
 
 use crate::agent::AgentStatus;
 use crate::identity::Identity;
+use crate::motion::Anchor;
 
 /// Map a status to its draw/overflow priority: higher draws on top and is
 /// kept first when the herd overflows the available width.
@@ -32,11 +33,17 @@ pub struct Pet {
     /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
     /// derived here — `Pet` has no access to the agent snapshot.
     pub focused: bool,
+    /// Where/when this pet was last seen leaving `Working`, threaded into
+    /// `motion::animate` so a Working->non-Working transition freezes it in
+    /// place instead of teleporting to the identity rest position. `None`
+    /// until `Herd::reconcile` observes that transition; cleared again on
+    /// re-entering `Working`. See [`crate::motion::Anchor`].
+    pub anchor: Option<Anchor>,
 }
 
 impl Pet {
     /// Build a pet with an empty label (filled in by `reconcile`), unfocused
-    /// until `Herd::reconcile` says otherwise.
+    /// and unanchored until `Herd::reconcile` says otherwise.
     pub fn new(terminal_id: String, identity: Identity, status: AgentStatus) -> Self {
         Self {
             terminal_id,
@@ -44,6 +51,7 @@ impl Pet {
             status,
             label: String::new(),
             focused: false,
+            anchor: None,
         }
     }
 
