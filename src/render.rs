@@ -33,15 +33,19 @@ use crate::sprite::{Frame as SpriteFrame, Role, Species};
 /// Rows the focus hat occupies above a pet's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
 pub(crate) const HAT_H: usize = 3;
-/// Columns the focus hat occupies, centered over the head anchor. Wider than
-/// the hat's own crown to leave room for the brim.
-pub(crate) const HAT_W: usize = 7;
+/// Columns the focus hat occupies, centered over the head anchor.
+pub(crate) const HAT_W: usize = 5;
 /// The hat's pixel grid, top row first: `.` transparent, `#` outline, `r` red
-/// fill. A simple fedora — a rounded crown over a flat, full-width brim.
-/// Symmetric, so facing flip never needs to mirror it.
-const HAT_ROWS: [&str; HAT_H] = ["..#r#..", ".#rrr#.", "#rrrrr#"];
+/// fill. A simple pointed hat. Symmetric, so facing flip never needs to
+/// mirror it.
+const HAT_ROWS: [&str; HAT_H] = ["..#..", ".#r#.", "#rrr#"];
 pub(crate) const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
 pub(crate) const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
+/// Sinks the hat's bottom row into the head's own top row by this many
+/// pixels, rather than stacking the whole hat cleanly above it — picked
+/// after visual review: floating a full row above the head read as a
+/// separate sticker rather than something worn.
+const HAT_OVERLAP: i32 = 1;
 
 /// Milliseconds since the Unix epoch — the same absolute reference on every
 /// process on this machine (all `herdr-pets render` panes run server-side, so
@@ -122,7 +126,7 @@ pub(crate) fn head_anchor(fr: &SpriteFrame, flip: bool) -> (usize, usize) {
 /// the sprite's own local coordinates (pre-offset); `head_col` is already in
 /// drawn (post-flip) space, so the hat is not flipped again.
 fn draw_hat(buf: &mut PixelBuf, ox: i32, oy: i32, head_row: usize, head_col: usize) {
-    let top = oy + head_row as i32 - HAT_H as i32;
+    let top = oy + head_row as i32 - HAT_H as i32 + HAT_OVERLAP;
     let left = ox + head_col as i32 - (HAT_W / 2) as i32;
     for (y, row) in HAT_ROWS.iter().enumerate() {
         for (x, ch) in row.chars().enumerate() {
@@ -157,7 +161,7 @@ pub(crate) fn stamp_hat(
     head_col: usize,
 ) {
     let scale = scale.max(1);
-    let top = pad as i32 + head_row as i32 - HAT_H as i32;
+    let top = pad as i32 + head_row as i32 - HAT_H as i32 + HAT_OVERLAP;
     let left = pad as i32 + head_col as i32 - (HAT_W as i32 / 2);
     for (y, row) in HAT_ROWS.iter().enumerate() {
         for (x, ch) in row.chars().enumerate() {
@@ -1151,7 +1155,7 @@ mod tests {
 
     /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should
     /// land in the buffer when the hat is drawn with no clipping at all.
-    const HAT_PIXEL_COUNT: usize = 15;
+    const HAT_PIXEL_COUNT: usize = 9;
 
     fn count_hat_pixels(buf: &PixelBuf) -> usize {
         buf.px
@@ -1364,5 +1368,47 @@ mod tests {
             px: vec![0u8; 10 * 10 * 4],
         };
         stamp_hat(&mut rgba, 1, 0, 0, 0);
+    }
+
+    #[test]
+    fn stamp_hat_sinks_one_pixel_into_the_heads_own_row() {
+        // Picked after visual review: the hat should sit into the head by
+        // 1px (its bottom row covers the head's own topmost row) rather than
+        // floating a clean row above it.
+        let mut rgba = crate::raster::Rgba {
+            w: 40,
+            h: 40,
+            px: vec![0u8; 40 * 40 * 4],
+        };
+        let (pad, head_row, head_col) = (10usize, 10usize, 10usize);
+        stamp_hat(&mut rgba, 1, pad, head_row, head_col);
+        let y = pad + head_row; // the head's own top row, in the padded canvas
+        let row_has_hat_pixel = (0..rgba.w).any(|x| {
+            let i = (y * rgba.w + x) * 4;
+            rgba.px[i + 3] == 255
+                && ((rgba.px[i], rgba.px[i + 1], rgba.px[i + 2])
+                    == (HAT_OUTLINE.0, HAT_OUTLINE.1, HAT_OUTLINE.2)
+                    || (rgba.px[i], rgba.px[i + 1], rgba.px[i + 2])
+                        == (HAT_FILL.0, HAT_FILL.1, HAT_FILL.2))
+        });
+        assert!(
+            row_has_hat_pixel,
+            "the hat's bottom row must overlap the head's own top row"
+        );
+    }
+
+    #[test]
+    fn draw_hat_sinks_one_pixel_into_the_heads_own_row() {
+        let mut buf = PixelBuf::new(20, 20);
+        let (ox, oy, head_row, head_col) = (5, 10, 2usize, 8usize);
+        draw_hat(&mut buf, ox, oy, head_row, head_col);
+        let y = oy + head_row as i32; // the head's own top row
+        let row_has_hat_pixel = (0..buf.w as i32).any(|x| {
+            matches!(buf.px[y as usize * buf.w + x as usize], Some(c) if c == HAT_OUTLINE || c == HAT_FILL)
+        });
+        assert!(
+            row_has_hat_pixel,
+            "the hat's bottom row must overlap the head's own top row"
+        );
     }
 }
