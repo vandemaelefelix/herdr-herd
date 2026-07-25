@@ -216,10 +216,10 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
 ///
 /// `test-blob.sprite` is intentionally absent here: it is a unit-test fixture
 /// only (included directly by the sprite/render tests), not a shipped species.
-const EMBEDDED: &[&str] = &[
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/sheep.sprite")),
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sprites/goat.sprite")),
-];
+const EMBEDDED: &[&str] = &[include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/sprites/sheep.sprite"
+))];
 
 /// Parse the embedded sprites. Guarded by `every_embedded_species_is_valid`.
 pub fn embedded_species() -> Vec<Species> {
@@ -267,6 +267,16 @@ mod tests {
     ));
 
     #[test]
+    fn only_sheep_ships_goat_has_been_removed() {
+        let species = embedded_species();
+        assert_eq!(
+            species.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Sheep"],
+            "goat was removed from the embedded roster; only Sheep should ship"
+        );
+    }
+
+    #[test]
     fn parses_name_states_and_frame_grid() {
         let sp = parse_species(BLOB).expect("valid fixture");
         assert_eq!(sp.name, "TestBlob");
@@ -304,13 +314,10 @@ mod tests {
                 species.name
             );
 
-            // The jump pose ideally lifts the body too: more of its
-            // silhouette occupies the frame's top rows than the planted
-            // stand pose's. Only checked for Sheep, whose source art has
-            // spare top headroom to lift into (a blank row above the head);
-            // Goat's horns already occupy that row, so lifting would clip
-            // them — its jump pose relies on the (universally required,
-            // checked below) leg extension alone to read as airborne.
+            // The jump pose lifts the body too: more of its silhouette
+            // occupies the frame's top rows than the planted stand pose's
+            // (Sheep's source art has spare top headroom — a blank row
+            // above the head — for the jump to lift into).
             let painted_in_top_rows = |f: &Frame, rows: usize| -> usize {
                 (0..rows.min(f.h))
                     .map(|y| {
@@ -320,13 +327,11 @@ mod tests {
                     })
                     .sum()
             };
-            if species.name == "Sheep" {
-                assert!(
-                    painted_in_top_rows(airborne, 3) > painted_in_top_rows(grounded, 3),
-                    "{}: the jump pose's body/head must fill more of the top rows than the planted stand pose",
-                    species.name
-                );
-            }
+            assert!(
+                painted_in_top_rows(airborne, 3) > painted_in_top_rows(grounded, 3),
+                "{}: the jump pose's body/head must fill more of the top rows than the planted stand pose",
+                species.name
+            );
 
             // The jump pose's legs must genuinely differ from the stand
             // pose's, not just repeat them under a (species-permitting)

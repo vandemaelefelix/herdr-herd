@@ -1241,38 +1241,6 @@ mod tests {
     }
 
     #[test]
-    fn hat_never_clips_on_the_goat_despite_its_taller_horned_silhouette() {
-        // The goat's horns sit a row above the sheep's head, so its head
-        // anchor is one row higher — the generic topmost-opaque-pixel scan
-        // must pick that up on its own, with no per-species table, and the
-        // reserved headroom must still cover it, even at peak bounce lift.
-        let species = crate::sprite::embedded_species();
-        let goat_index = species
-            .iter()
-            .position(|s| s.name == "Goat")
-            .expect("Goat is embedded");
-        let state = &species[goat_index].states[&AgentStatus::Blocked];
-        let peak_ms = peak_lift_ms("f", AgentStatus::Blocked, state, 20_000);
-        let mut herd = Herd::new();
-        let mut pet = Pet::new(
-            "f".into(),
-            crate::identity::Identity {
-                species_index: goat_index,
-                hue: 0,
-            },
-            AgentStatus::Blocked,
-        );
-        pet.focused = true;
-        herd.pets.push(pet);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
-        assert_eq!(
-            count_hat_pixels(&buf),
-            HAT_PIXEL_COUNT,
-            "the hat fits above the goat's horns even mid-bounce"
-        );
-    }
-
-    #[test]
     fn head_anchor_column_flips_with_facing() {
         // TestBlob's working frame is asymmetric (`MM../MMM./M##./.MM.`), so a
         // facing flip must move the head anchor's column — otherwise the hat
