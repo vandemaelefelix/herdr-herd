@@ -40,8 +40,8 @@ pub(crate) const HAT_W: usize = 7;
 /// fill. A simple fedora — a rounded crown over a flat, full-width brim.
 /// Symmetric, so facing flip never needs to mirror it.
 const HAT_ROWS: [&str; HAT_H] = ["..#r#..", ".#rrr#.", "#rrrrr#"];
-const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
-const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
+pub(crate) const HAT_OUTLINE: Rgb = Rgb(0x20, 0x18, 0x18);
+pub(crate) const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
 
 /// Milliseconds since the Unix epoch — the same absolute reference on every
 /// process on this machine (all `herdr-pets render` panes run server-side, so
@@ -138,17 +138,27 @@ fn draw_hat(buf: &mut PixelBuf, ox: i32, oy: i32, head_row: usize, head_col: usi
     }
 }
 
-/// Rasterize the focus hat to RGBA at `scale` px per hat-pixel, padded by
-/// `pad` hat-pixels of transparent margin on every side — mirrors
-/// `raster::pad_frame` + `raster::rasterize`, but for the fixed [`HAT_W`]x
-/// [`HAT_H`] hat bitmap rather than a per-species sprite `Frame`. Used by the kitty
-/// backend so the hat can be transmitted once and panned by motion offset
-/// like the body (`kitty_render::crop_rect`), the same trick `icon::
-/// rasterize_icon` uses for overlay icons.
-pub(crate) fn rasterize_hat(scale: usize, pad: usize) -> crate::raster::Rgba {
+/// Composite the focus hat directly onto an already-rasterized RGBA image
+/// (from `raster::rasterize`), at the head anchor `(head_row, head_col)` —
+/// in the *original, unpadded* frame's local sprite-pixel coordinates —
+/// given `pad` sprite-pixels of transparent margin already baked into
+/// `rgba` on every side (see `raster::pad_frame`). Mirrors `draw_hat`'s
+/// placement math exactly, so the kitty backend's baked-in hat lands at the
+/// identical pixel position the half-block renderer already uses —
+/// pixel-perfect and pose-independent, unlike a separately-placed image
+/// (which can only land at whole-terminal-cell resolution and drifts away
+/// from poses like the idle "dozing" lump, whose top rows are transparent
+/// padding — see `sprites/sheep.sprite`'s comment on normalising frames).
+pub(crate) fn stamp_hat(
+    rgba: &mut crate::raster::Rgba,
+    scale: usize,
+    pad: usize,
+    head_row: usize,
+    head_col: usize,
+) {
     let scale = scale.max(1);
-    let (w, h) = ((HAT_W + pad * 2) * scale, (HAT_H + pad * 2) * scale);
-    let mut px = vec![0u8; w * h * 4];
+    let top = pad as i32 + head_row as i32 - HAT_H as i32;
+    let left = pad as i32 + head_col as i32 - (HAT_W as i32 / 2);
     for (y, row) in HAT_ROWS.iter().enumerate() {
         for (x, ch) in row.chars().enumerate() {
             let color = match ch {
@@ -157,19 +167,27 @@ pub(crate) fn rasterize_hat(scale: usize, pad: usize) -> crate::raster::Rgba {
                 _ => None,
             };
             let Some(c) = color else { continue };
-            let (px_x, px_y) = ((x + pad) * scale, (y + pad) * scale);
+            let px_row = top + y as i32;
+            let px_col = left + x as i32;
+            if px_row < 0 || px_col < 0 {
+                continue;
+            }
+            let (base_x, base_y) = (px_col as usize * scale, px_row as usize * scale);
             for dy in 0..scale {
                 for dx in 0..scale {
-                    let i = ((px_y + dy) * w + (px_x + dx)) * 4;
-                    px[i] = c.0;
-                    px[i + 1] = c.1;
-                    px[i + 2] = c.2;
-                    px[i + 3] = 255;
+                    let (xx, yy) = (base_x + dx, base_y + dy);
+                    if xx >= rgba.w || yy >= rgba.h {
+                        continue;
+                    }
+                    let i = (yy * rgba.w + xx) * 4;
+                    rgba.px[i] = c.0;
+                    rgba.px[i + 1] = c.1;
+                    rgba.px[i + 2] = c.2;
+                    rgba.px[i + 3] = 255;
                 }
             }
         }
     }
-    crate::raster::Rgba { w, h, px }
 }
 
 /// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
@@ -1308,5 +1326,43 @@ mod tests {
         let (_row_right, col_right) = head_anchor(fr, false);
         let (_row_left, col_left) = head_anchor(fr, true);
         assert_ne!(col_right, col_left, "facing flip must move the head anchor");
+    }
+
+    fn contains_color(rgba: &crate::raster::Rgba, target: Rgb) -> bool {
+        rgba.px
+            .chunks(4)
+            .any(|p| p[3] == 255 && (p[0], p[1], p[2]) == (target.0, target.1, target.2))
+    }
+
+    #[test]
+    fn stamp_hat_paints_both_hat_colors_onto_the_rgba_buffer() {
+        // A large enough blank canvas that the hat (stamped near the middle)
+        // can't clip against any edge.
+        let mut rgba = crate::raster::Rgba {
+            w: 40,
+            h: 40,
+            px: vec![0u8; 40 * 40 * 4],
+        };
+        stamp_hat(&mut rgba, 1, 10, 10, 10);
+        assert!(
+            contains_color(&rgba, HAT_OUTLINE),
+            "the hat's outline color must be painted"
+        );
+        assert!(
+            contains_color(&rgba, HAT_FILL),
+            "the hat's fill color must be painted"
+        );
+    }
+
+    #[test]
+    fn stamp_hat_does_not_panic_when_it_would_clip_the_canvas_edge() {
+        // head_row/head_col near (0, 0) push the hat's top-left off-canvas;
+        // stamp_hat must clip gracefully rather than index out of bounds.
+        let mut rgba = crate::raster::Rgba {
+            w: 10,
+            h: 10,
+            px: vec![0u8; 10 * 10 * 4],
+        };
+        stamp_hat(&mut rgba, 1, 0, 0, 0);
     }
 }

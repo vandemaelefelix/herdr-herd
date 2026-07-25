@@ -20,7 +20,7 @@ use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::pet::priority;
 use crate::raster::{pad_frame, rasterize};
-use crate::render::{HAT_H, HAT_W, PetRenderer, head_anchor, rasterize_hat};
+use crate::render::{HAT_H, PetRenderer, head_anchor, stamp_hat};
 use crate::sprite::{Frame as SpriteFrame, Species};
 
 /// Sprite-pixel margin padded around a transmitted pet image, so a motion
@@ -47,11 +47,6 @@ const ICON_MARGIN: usize = 2;
 /// Stacking index floor for overlay icons: always above every pet body, which
 /// draw at `z = 0..order.len()`.
 const Z_ICON_BASE: i32 = 1000;
-
-/// Stacking index floor for the focus hat: always above every pet body AND
-/// every overlay icon (a focused, idle pet shows both its Zz icon and its
-/// hat, and the hat must win).
-const Z_HAT_BASE: i32 = 100_000;
 
 /// The source rectangle (in raster pixels) that shows an unpadded `w`x`h`
 /// (at `scale` px/unit) region shifted by `(dx, dy)` units within a canvas
@@ -140,10 +135,11 @@ fn opaque_col_span(frame: &SpriteFrame, flip: bool) -> Option<(usize, usize)> {
     any.then_some((lo, hi + 1))
 }
 
-/// Cache key for a transmitted image: species/status/frame/flip/hue fully
-/// determine the rasterized pixels, so two pets sharing all five reuse one
-/// image id instead of retransmitting.
-type ImgKey = (usize, AgentStatus, usize, bool, u16);
+/// Cache key for a transmitted image: species/status/frame/flip/hue/focused
+/// fully determine the rasterized pixels (focused bakes the hat directly
+/// into the image — see `render::stamp_hat`), so two pets sharing all six
+/// reuse one image id instead of retransmitting.
+type ImgKey = (usize, AgentStatus, usize, bool, u16, bool);
 
 /// Draws the herd via the kitty graphics protocol instead of ratatui cells.
 /// Images are transmitted once per distinct `ImgKey` and cached; each visible
@@ -171,16 +167,6 @@ pub struct KittyRenderer {
     /// `placements` because a pet can lose its overlay (e.g. idle -> working)
     /// while staying visible, which must delete the icon but keep the pet.
     icon_placements: HashMap<String, (u32, u32)>,
-    /// The transmitted focus-hat image id, once rasterized. Unlike pet/icon
-    /// images the hat never varies (always the same red hat, no theme/hue),
-    /// so a single cached id suffices.
-    hat_cache: Option<u32>,
-    /// `terminal_id -> (image_id, placement_id)` of that pet's current hat
-    /// placement, if it's the focused pet. Tracked separately from
-    /// `placements`/`icon_placements` because a pet can lose focus while
-    /// staying visible, which must delete the hat but keep the pet (and any
-    /// icon).
-    hat_placements: HashMap<String, (u32, u32)>,
     next_id: u32,
     /// The pane area the last frame was drawn against. When it changes (a
     /// resize), the terminal may have dropped our transmitted images, so we
@@ -203,8 +189,6 @@ impl KittyRenderer {
             placements: HashMap::new(),
             icon_cache: HashMap::new(),
             icon_placements: HashMap::new(),
-            hat_cache: None,
-            hat_placements: HashMap::new(),
             next_id: 1,
             last_area: None,
         }
@@ -231,8 +215,6 @@ impl KittyRenderer {
             self.placements.clear();
             self.icon_cache.clear();
             self.icon_placements.clear();
-            self.hat_cache = None;
-            self.hat_placements.clear();
             self.last_area = Some(area);
         }
 
@@ -264,7 +246,17 @@ impl KittyRenderer {
                 animated.frame_index,
                 animated.facing_left,
                 pet.identity.hue,
+                pet.focused,
             );
+            // Focused pets get extra padding above (on top of the usual
+            // motion pad) so the hat — baked directly into this same image,
+            // not a separate placement — never clips, exactly mirroring
+            // PET_PX_H's `+HAT_H` headroom in the half-block renderer.
+            let body_pad = if pet.focused {
+                MOTION_PAD + HAT_H
+            } else {
+                MOTION_PAD
+            };
             let image_id = match self.cache.get(&key) {
                 Some(&id) => id,
                 None => {
@@ -275,8 +267,8 @@ impl KittyRenderer {
                     // Transmit a padded canvas (once per key), so this state's
                     // motion can be animated below by panning a crop window
                     // over it instead of retransmitting every frame.
-                    let padded = pad_frame(fr, MOTION_PAD);
-                    let rgba = rasterize(
+                    let padded = pad_frame(fr, body_pad);
+                    let mut rgba = rasterize(
                         &padded,
                         pet.identity.hue,
                         theme,
@@ -284,6 +276,15 @@ impl KittyRenderer {
                         self.scale,
                         animated.facing_left,
                     );
+                    if pet.focused {
+                        // Stamped in pixel space, using the exact same head
+                        // anchor the half-block renderer uses — pose-agnostic,
+                        // so it lands correctly on every pose (including the
+                        // idle "dozing" lump, whose top rows are transparent
+                        // padding — see sprites/sheep.sprite).
+                        let (head_row, head_col) = head_anchor(fr, animated.facing_left);
+                        stamp_hat(&mut rgba, self.scale, body_pad, head_row, head_col);
+                    }
                     let id = self.next_id;
                     self.next_id += 1;
                     self.out
@@ -312,10 +313,10 @@ impl KittyRenderer {
             self.next_id += 1;
             // Pan the crop window by this state's motion offset (breathe/hop/
             // bounce/sway) — the same offset the half-block path bakes
-            // straight into its pixel buffer — so the body actually animates
-            // instead of sitting dead still.
+            // straight into its pixel buffer — so the body (and its baked-in
+            // hat, if any) actually animates instead of sitting dead still.
             let crop = crop_rect(
-                MOTION_PAD,
+                body_pad,
                 self.scale,
                 fr.w,
                 fr.h,
@@ -428,80 +429,6 @@ impl KittyRenderer {
                     }
                 }
             }
-
-            // Focus hat: a small red hat above the focused pet's head, panned
-            // by the same motion offset as the body (`crop_rect`) so it never
-            // detaches during the hop. Stacked above both the body and any
-            // overlay icon (`Z_HAT_BASE`). Torn down the moment focus moves
-            // away, mirroring the icon teardown just above.
-            if pet.focused {
-                let hat_image_id = match self.hat_cache {
-                    Some(id) => id,
-                    None => {
-                        let rgba = rasterize_hat(self.scale, MOTION_PAD);
-                        let id = self.next_id;
-                        self.next_id += 1;
-                        self.out
-                            .write_all(transmit_rgba(id, rgba.w, rgba.h, &rgba.px).as_bytes())?;
-                        self.hat_cache = Some(id);
-                        id
-                    }
-                };
-                // Same pad/offset inputs as the body's own `crop_rect` call
-                // above, so the hat pans by the identical amount and never
-                // drifts away from the head during motion.
-                let hat_crop = crop_rect(
-                    MOTION_PAD,
-                    self.scale,
-                    HAT_W,
-                    HAT_H,
-                    animated.offset.dx,
-                    animated.offset.dy,
-                );
-                let hat_rows: u16 = 1;
-                let hat_cols = pet_cols(hat_rows, HAT_W, HAT_H);
-                // Center the hat over the head anchor's column (already in
-                // drawn, post-flip space — see `head_anchor`), mapped from
-                // sprite-pixel space into this pet's own on-screen footprint.
-                let (_head_row, head_col) = head_anchor(fr, animated.facing_left);
-                let head_frac = head_col as f32 / fr.w.max(1) as f32;
-                // Share the pet's OWN top cursor row rather than the row
-                // above it: the whole pet is only 2-4 terminal rows tall, so
-                // a full extra row of gap would read as floating rather than
-                // worn. Its much higher z (`Z_HAT_BASE`) draws it over the
-                // head pixels in that shared cell instead of behind them.
-                let hat_row = row;
-                let hat_col_center = col + (head_frac * cols as f32).round() as i32;
-                let hat_col_max = (area.width as i32 - hat_cols as i32 + 1).max(1);
-                let hat_col = (hat_col_center - (hat_cols as i32) / 2).clamp(1, hat_col_max);
-                self.out
-                    .write_all(format!("\x1b[{hat_row};{hat_col}H").as_bytes())?;
-                let hat_pid = self.next_id;
-                self.next_id += 1;
-                self.out.write_all(
-                    place_cropped(
-                        hat_image_id,
-                        hat_pid,
-                        hat_crop,
-                        hat_cols,
-                        hat_rows,
-                        Z_HAT_BASE + zi as i32,
-                    )
-                    .as_bytes(),
-                )?;
-                if let Some((old_img, old_pid)) = self
-                    .hat_placements
-                    .insert(pet.terminal_id.clone(), (hat_image_id, hat_pid))
-                {
-                    self.out
-                        .write_all(delete_placement(old_img, old_pid).as_bytes())?;
-                }
-            } else if let Some((old_img, old_pid)) = self.hat_placements.remove(&pet.terminal_id) {
-                // Focus moved away from this (still-visible) pet — drop its
-                // hat placement.
-                self.out
-                    .write_all(delete_placement(old_img, old_pid).as_bytes())?;
-            }
         }
 
         // Any tracked pet not in the current visible set (departed, or pushed
@@ -530,17 +457,6 @@ impl KittyRenderer {
             .collect();
         for tid in departed_icons {
             if let Some((img, pid)) = self.icon_placements.remove(&tid) {
-                self.out.write_all(delete_placement(img, pid).as_bytes())?;
-            }
-        }
-        let departed_hats: Vec<String> = self
-            .hat_placements
-            .keys()
-            .filter(|tid| !visible_ids.contains(tid.as_str()))
-            .cloned()
-            .collect();
-        for tid in departed_hats {
-            if let Some((img, pid)) = self.hat_placements.remove(&tid) {
                 self.out.write_all(delete_placement(img, pid).as_bytes())?;
             }
         }
@@ -1058,125 +974,156 @@ mod tests {
         h
     }
 
+    fn one_focused_idle_herd() -> Herd {
+        let mut h = Herd::new();
+        let mut pet = Pet::new("t1".into(), identity_for("t1", 1), AgentStatus::Idle);
+        pet.focused = true;
+        h.pets.push(pet);
+        h
+    }
+
+    const HAT_OUTLINE_RGB: (u8, u8, u8) = (0x20, 0x18, 0x18);
+    const HAT_FILL_RGB: (u8, u8, u8) = (0xd6, 0x2b, 0x2b);
+
+    /// Decode the `occurrence`-th (0-indexed) transmitted image (`a=t`) in
+    /// `out` into `(width, height, rgba bytes)`. Assumes one APC chunk per
+    /// transmission — true at the tiny `scale=1` these decode-based tests
+    /// use, comfortably under the protocol's 4096-char chunk limit.
+    fn decode_transmit_at(out: &str, occurrence: usize) -> (usize, usize, Vec<u8>) {
+        let chunk = out
+            .split("\x1b_G")
+            .filter(|c| c.starts_with("a=t"))
+            .nth(occurrence)
+            .expect("a transmit chunk at this occurrence");
+        // Bound to this APC's own terminator — splitting on `\x1b_G` alone
+        // leaves whatever follows (e.g. the next escape's `\x1b[{row};{col}H`
+        // CUP sequence) dangling on the end of this piece.
+        let end = chunk.find("\x1b\\").expect("APC terminator");
+        let body = &chunk[..end];
+        let (control, payload) = body.split_once(';').expect("control;payload");
+        let field = |key: &str| -> usize {
+            control
+                .split(',')
+                .find_map(|kv| kv.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{key} field in {control:?}"))
+                .parse()
+                .unwrap()
+        };
+        let (w, h) = (field("s="), field("v="));
+        (w, h, crate::base64::decode(payload))
+    }
+
+    fn contains_rgb(px: &[u8], target: (u8, u8, u8)) -> bool {
+        px.chunks(4)
+            .any(|p| p[3] == 255 && (p[0], p[1], p[2]) == target)
+    }
+
     #[test]
-    fn focused_pet_emits_a_hat_image_and_placement() {
+    fn focused_working_pet_bakes_a_visible_hat_into_its_own_image() {
         let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let mut r = KittyRenderer::for_test(sink.clone(), 1);
         let species = vec![parse_species(BLOB).unwrap()];
         r.draw_to_sink(&one_focused_working_herd(), &species, Theme::Dark, 0);
-        let out = sink.take();
-        assert_eq!(
-            out.matches("a=t").count(),
-            2,
-            "the pet's own frame and the hat image are both transmitted"
+        let (_w, _h, px) = decode_transmit_at(&sink.take(), 0);
+        assert!(
+            contains_rgb(&px, HAT_FILL_RGB),
+            "the hat's fill color is baked into the transmitted image"
         );
-        assert_eq!(
-            out.matches("a=p").count(),
-            2,
-            "the pet placement and the hat placement"
+        assert!(
+            contains_rgb(&px, HAT_OUTLINE_RGB),
+            "the hat's outline color is baked into the transmitted image"
         );
     }
 
     #[test]
-    fn unfocused_pet_emits_no_hat() {
+    fn focused_idle_pet_bakes_a_visible_hat_despite_the_dozing_poses_top_padding() {
+        // Regression: the idle "dozing" pose is normalised to the same frame
+        // size as standing poses by padding blank rows on TOP (see
+        // sprites/sheep.sprite's comment). A hat placed relative to the
+        // pet's own top cell (rather than the actual head) used to float in
+        // that padding, invisible against the mostly-transparent top of the
+        // image. Baking it in at the real head anchor fixes this for every
+        // pose, not just standing ones.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 1);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_focused_idle_herd(), &species, Theme::Dark, 0);
+        let (_w, _h, px) = decode_transmit_at(&sink.take(), 0);
+        assert!(
+            contains_rgb(&px, HAT_FILL_RGB),
+            "hat fill must be visible even on the idle/dozing pose"
+        );
+        assert!(
+            contains_rgb(&px, HAT_OUTLINE_RGB),
+            "hat outline must be visible even on the idle/dozing pose"
+        );
+    }
+
+    #[test]
+    fn unfocused_pets_image_has_no_hat_pixels() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 1);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_working_herd(), &species, Theme::Dark, 0);
+        let (_w, _h, px) = decode_transmit_at(&sink.take(), 0);
+        assert!(
+            !contains_rgb(&px, HAT_FILL_RGB),
+            "an unfocused pet's image must carry no hat pixels"
+        );
+    }
+
+    #[test]
+    fn gaining_focus_retransmits_a_distinct_hat_bearing_image() {
+        // The cache key includes `focused` (the hat is baked directly into
+        // the image), so toggling focus must retransmit and re-place —
+        // reusing the unfocused image would silently hide the hat.
         let sink = SharedSink::default();
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         r.draw_to_sink(&one_working_herd(), &species, Theme::Dark, 0);
+        let _ = sink.take();
+        r.draw_to_sink(&one_focused_working_herd(), &species, Theme::Dark, 0);
         let out = sink.take();
         assert_eq!(
             out.matches("a=t").count(),
             1,
-            "only the pet's own frame; no hat image"
+            "gaining focus must transmit a fresh (hat-bearing) image, not reuse the unfocused one"
+        );
+        assert!(
+            out.contains("a=d"),
+            "the stale unfocused placement is deleted"
+        );
+    }
+
+    #[test]
+    fn focused_idle_pet_still_shows_its_zz_icon_alongside_the_baked_in_hat() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_focused_idle_herd(), &species, Theme::Dark, 0);
+        let out = sink.take();
+        assert_eq!(
+            out.matches("a=t").count(),
+            2,
+            "the pet's own (hat-bearing) frame and the Zz icon — no separate hat image"
         );
         assert_eq!(
             out.matches("a=p").count(),
-            1,
-            "only the pet placement; no hat placement"
-        );
-    }
-
-    #[test]
-    fn hat_placement_is_torn_down_when_focus_moves_away() {
-        let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4);
-        let species = vec![parse_species(BLOB).unwrap()];
-        let _ = r.render_pets(
-            &one_focused_working_herd(),
-            &species,
-            Rect::new(0, 0, 200, 10),
-            Theme::Dark,
-            0,
-        );
-        let _ = sink.take();
-        // Same pet, now unfocused: the old hat placement must be torn down,
-        // and neither the (cached) body nor the (cached) hat is re-transmitted.
-        let _ = r.render_pets(
-            &one_working_herd(),
-            &species,
-            Rect::new(0, 0, 200, 10),
-            Theme::Dark,
-            0,
-        );
-        let out = sink.take();
-        // Two deletes: the body's own old placement (redrawn every frame
-        // regardless of focus) AND the now-stale hat placement.
-        assert_eq!(
-            out.matches("a=d").count(),
             2,
-            "the body's old placement and the stale hat placement are both deleted: {out:?}"
-        );
-        assert_eq!(
-            out.matches("a=t").count(),
-            0,
-            "body and hat images are both already cached — no re-transmit"
+            "the pet placement and the icon placement — no separate hat placement"
         );
     }
 
     #[test]
-    fn hat_placement_is_torn_down_when_the_focused_pet_departs() {
-        let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4);
-        let species = vec![parse_species(BLOB).unwrap()];
-        let _ = r.render_pets(
-            &one_focused_working_herd(),
-            &species,
-            Rect::new(0, 0, 200, 10),
-            Theme::Dark,
-            0,
-        );
-        let _ = sink.take();
-        // The pet is gone entirely (empty herd): its hat placement must not
-        // linger as a ghost image.
-        let _ = r.render_pets(
-            &Herd::new(),
-            &species,
-            Rect::new(0, 0, 200, 10),
-            Theme::Dark,
-            0,
-        );
-        let out = sink.take();
-        // Two deletes: the departed pet's body placement AND its hat placement.
-        assert_eq!(
-            out.matches("a=d").count(),
-            2,
-            "the departed pet's body and hat placements are both deleted: {out:?}"
-        );
-    }
-
-    #[test]
-    fn hat_placement_pans_as_time_advances() {
+    fn hat_pans_with_the_pets_own_motion_since_its_baked_into_the_same_image() {
         let sink = SharedSink::default();
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_focused_working_herd();
-
-        // Isolate the HAT's placement command by its distinctive high z index
-        // (Z_HAT_BASE, far above the body's z=0 and the icon's Z_ICON_BASE+).
-        let hat_placement = |out: &str| -> String {
+        let pet_placement = |out: &str| -> String {
             out.split("\x1b_G")
-                .find(|chunk| chunk.contains("a=p") && chunk.contains(",z=100000,"))
-                .expect("the hat's own placement command")
+                .find(|chunk| chunk.contains("a=p") && chunk.contains(",z=0,"))
+                .expect("the pet's own placement command")
                 .to_string()
         };
         let y_field = |chunk: &str| -> String {
@@ -1186,76 +1133,44 @@ mod tests {
                 .expect("a y= field")
                 .to_string()
         };
-
         let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
-        let y0 = y_field(&hat_placement(&sink.take()));
-
+        let y0 = y_field(&pet_placement(&sink.take()));
         let panned = (10..500u64).step_by(10).any(|ms| {
             let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
-            y_field(&hat_placement(&sink.take())) != y0
+            y_field(&pet_placement(&sink.take())) != y0
         });
         assert!(
             panned,
-            "the hat must pan with the pet's own motion offset, exactly like the body"
-        );
-    }
-
-    /// The 1-indexed cursor row from the `\x1b[{row};{col}H` escape that
-    /// immediately precedes the placement chunk containing `marker` (e.g.
-    /// `,z=0,` for the pet's own body, `,z=100000,` for the hat).
-    fn cup_row_before(out: &str, marker: &str) -> u16 {
-        let idx = out.find(marker).expect("marker present in output");
-        let before = &out[..idx];
-        let cup_start = before
-            .rfind("\x1b[")
-            .expect("a CUP escape before the placement");
-        let cup = &before[cup_start + 2..];
-        cup.split(';').next().unwrap().parse().unwrap()
-    }
-
-    #[test]
-    fn hat_shares_the_pets_own_top_row_so_it_sits_on_the_head_with_no_gap() {
-        // At only 2-4 terminal rows tall, a whole extra row between the hat
-        // and the pet reads as clearly detached rather than "worn". Kitty
-        // can't place sub-cell, so the hat must share the pet's own top
-        // cursor row (and rely on its much higher z to draw over the head),
-        // not float a full row above it.
-        let sink = SharedSink::default();
-        let mut r = KittyRenderer::for_test(sink.clone(), 4);
-        let species = vec![parse_species(BLOB).unwrap()];
-        let herd = one_focused_working_herd();
-        let _ = r.render_pets(&herd, &species, Rect::new(0, 0, 40, 10), Theme::Dark, 0);
-        let out = sink.take();
-        let pet_row = cup_row_before(&out, ",z=0,");
-        let hat_row = cup_row_before(&out, ",z=100000,");
-        assert_eq!(
-            hat_row, pet_row,
-            "the hat's cursor row must equal the pet's own top row, not a row above it"
+            "the combined body+hat image must still pan with motion"
         );
     }
 
     #[test]
-    fn focused_idle_pet_emits_both_its_zz_icon_and_its_hat() {
-        // A focused, idle pet shows both overlays at once — the hat must not
-        // replace or be replaced by the icon.
+    fn departed_pets_placement_is_deleted() {
         let sink = SharedSink::default();
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
-        let mut herd = Herd::new();
-        let mut pet = Pet::new("t1".into(), identity_for("t1", 1), AgentStatus::Idle);
-        pet.focused = true;
-        herd.pets.push(pet);
-        r.draw_to_sink(&herd, &species, Theme::Dark, 0);
-        let out = sink.take();
-        assert_eq!(
-            out.matches("a=t").count(),
-            3,
-            "the pet frame, the Zz icon, and the hat"
+        let _ = r.render_pets(
+            &one_focused_working_herd(),
+            &species,
+            Rect::new(0, 0, 200, 10),
+            Theme::Dark,
+            0,
         );
-        assert_eq!(
-            out.matches("a=p").count(),
-            3,
-            "the pet placement, the icon placement, and the hat placement"
+        let _ = sink.take();
+        // The pet is gone entirely (empty herd): its placement must not
+        // linger as a ghost image.
+        let _ = r.render_pets(
+            &Herd::new(),
+            &species,
+            Rect::new(0, 0, 200, 10),
+            Theme::Dark,
+            0,
+        );
+        let out = sink.take();
+        assert!(
+            out.contains("a=d"),
+            "the departed pet's placement is deleted"
         );
     }
 }
