@@ -343,46 +343,6 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, label: Option<&str>) {
     );
 }
 
-/// Dev-only git-commit marker (see `dev-build-marker` in Cargo.toml and
-/// `build.rs`) — lets two running `herdr-pets render` panes be told apart by
-/// which commit they're actually running, without inspecting process info by
-/// hand. Never compiled into a real install (`scripts/build.sh` never passes
-/// `--features dev-build-marker`).
-#[cfg(feature = "dev-build-marker")]
-const BUILD_MARKER: &str = env!("HERDR_PETS_BUILD_SHA");
-
-/// A loud, unmistakable color for the dev build marker — deliberately not
-/// subtle (unlike the rest of the strip's palette) since legibility across
-/// any terminal theme matters more than blending in for a debug aid that
-/// never ships.
-#[cfg(feature = "dev-build-marker")]
-const BUILD_MARKER_COLOR: Color = Color::Rgb(255, 215, 0);
-
-/// Draw the dev build marker in the strip's bottom-right corner. Drawn after
-/// the caption, so a very long hover label could overwrite its tail — an
-/// acceptable tradeoff for a dev-only aid.
-#[cfg(feature = "dev-build-marker")]
-fn draw_build_marker(frame: &mut Frame, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let text: String = BUILD_MARKER
-        .chars()
-        .rev()
-        .take(area.width as usize)
-        .collect();
-    let text: String = text.chars().rev().collect();
-    let w = text.chars().count() as u16;
-    let x = area.right() - w;
-    let y = area.bottom() - 1;
-    frame.buffer_mut().set_span(
-        x,
-        y,
-        &Span::styled(text, Style::default().fg(BUILD_MARKER_COLOR)),
-        w,
-    );
-}
-
 /// The index of the visible pet drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
 /// Only pets that are actually drawn (the visible set on overflow) are
@@ -616,8 +576,6 @@ where
         terminal.draw(|f| {
             renderer.draw(f, &herd, species, theme, now_ms);
             draw_caption(f, f.area(), caption.as_deref());
-            #[cfg(feature = "dev-build-marker")]
-            draw_build_marker(f, f.area());
         })?;
 
         if event::poll(tick)? {
@@ -902,47 +860,6 @@ mod tests {
             .lines()
             .map(|l| l.trim().trim_matches('"').to_string())
             .collect()
-    }
-
-    #[cfg(feature = "dev-build-marker")]
-    #[test]
-    fn build_marker_renders_in_the_bottom_right_corner() {
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal.draw(|f| draw_build_marker(f, f.area())).unwrap();
-        let rows = rows_of(terminal.backend());
-        let last_row = rows.last().unwrap();
-        assert!(
-            last_row.trim_end().ends_with(BUILD_MARKER),
-            "expected the build marker {BUILD_MARKER:?} at the end of the bottom row, got {last_row:?}"
-        );
-    }
-
-    #[cfg(feature = "dev-build-marker")]
-    #[test]
-    fn build_marker_uses_a_high_contrast_color_not_dark_gray() {
-        // DarkGray on a typical dark terminal background is nearly invisible
-        // at a glance — confirmed live: the marker was present in the cell
-        // buffer (verified via `herdr pane read`) but not actually visible.
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal.draw(|f| draw_build_marker(f, f.area())).unwrap();
-        let buf = terminal.backend().buffer();
-        let last_col = buf.area.width - 1;
-        let last_row = buf.area.height - 1;
-        let cell = &buf[(last_col, last_row)];
-        assert_ne!(
-            cell.style().fg,
-            Some(Color::DarkGray),
-            "the marker must not use low-contrast DarkGray"
-        );
-    }
-
-    #[cfg(feature = "dev-build-marker")]
-    #[test]
-    fn build_marker_does_not_panic_in_a_zero_sized_area() {
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal
-            .draw(|f| draw_build_marker(f, Rect::new(0, 0, 0, 0)))
-            .unwrap();
     }
 
     #[test]

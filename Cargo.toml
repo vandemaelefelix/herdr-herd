@@ -26,13 +26,3 @@ serde_json = "1"
 [dev-dependencies]
 insta = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
-
-[features]
-# Dev-only: renders a short git-commit marker in the strip's corner, so
-# multiple running `herdr-pets render` panes (e.g. across worktrees, or a
-# stale process next to a freshly-rebuilt one) can be told apart at a glance
-# instead of having to inspect each pane's process info by hand. Never part
-# of the real install path — `scripts/build.sh` runs a plain `cargo build
-# --release` with no extra features, so a shipped/installed build never
-# includes this.
-dev-build-marker = []
