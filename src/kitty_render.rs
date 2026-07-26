@@ -26,8 +26,16 @@ use crate::sprite::{Frame as SpriteFrame, Species};
 /// Sprite-pixel margin padded around a transmitted pet image, so a motion
 /// offset can be animated by panning a crop window instead of retransmitting.
 /// 2px comfortably covers every motion's max amplitude (breathe <=0.5, hop/
-/// bounce <=1.0, sway <=1.0).
+/// bounce <=1.0, sway <=1.0). The walking hop lifts up to 2px, still covered.
 const MOTION_PAD: usize = 2;
+
+/// Sprite-pixels of transparent headroom the *displayed* crop window keeps
+/// ABOVE the sprite, so the baked-in focus hat (`HAT_H`) and the walking hop
+/// (`<=2px`) never clip the head. Reserved for every pet (focused or not) so
+/// all sheep render at one consistent size, and folded into the same cell
+/// footprint — so the visible sheep is simply drawn a little smaller to make
+/// the room, rather than the strip growing taller.
+const TOP_HEADROOM: usize = HAT_H + 2;
 
 /// Icon-pixel margin padded around a transmitted overlay icon image, for the
 /// same crop-panning trick. `ICON_PAD - ICON_MARGIN` is the pan range each
@@ -67,6 +75,43 @@ fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> 
     }
 }
 
+/// The displayed crop for a pet: `sprite_w` wide but `sprite_h + top_headroom`
+/// tall — the extra rows sit ABOVE the sprite so the baked-in hat and the
+/// walking hop never clip the head (unlike a plain `sprite_h`-tall window,
+/// which pans straight off the top of the head on the upbeat). Bottom-anchored
+/// on the feet and panned by the motion offset, exactly like [`crop_rect`],
+/// then placed into the same cell footprint so the sheep just renders smaller.
+/// `body_pad` must be `>= top_headroom` (the rest offset above the sprite) and
+/// `>=` the max hop (the downward pan room) — `MOTION_PAD + HAT_H` satisfies both.
+fn pet_crop(
+    body_pad: usize,
+    top_headroom: usize,
+    scale: usize,
+    sprite_w: usize,
+    sprite_h: usize,
+    dx: f32,
+    dy: f32,
+) -> Crop {
+    let s = scale as f32;
+    let win_h = sprite_h + top_headroom;
+    // Horizontal pan: identical to `crop_rect` — centered on the sprite, swayed
+    // by dx, clamped inside the horizontal padding.
+    let max_x = (2 * body_pad * scale) as f32;
+    let x = (((body_pad as f32) - dx) * s).round().clamp(0.0, max_x) as u32;
+    // Vertical: at rest the window starts `top_headroom` rows above the sprite
+    // (revealing the hat); a hop (dy<0) shifts it down so the feet lift off the
+    // floor. Clamped so it never reads past the padded canvas's bottom.
+    let y_rest = (body_pad - top_headroom) as f32;
+    let max_y = ((2 * body_pad - top_headroom) * scale) as f32;
+    let y = ((y_rest - dy) * s).round().clamp(0.0, max_y) as u32;
+    Crop {
+        x,
+        y,
+        w: (sprite_w * scale) as u32,
+        h: (win_h * scale) as u32,
+    }
+}
+
 /// Rows a pet image occupies, derived from the pane height and capped small
 /// so the pets always read as a slim strip, even in a tall pane. Reserves 1
 /// row off the top for the shared overlay lane (see [`overlay_lane_row`]) —
@@ -84,13 +129,14 @@ fn pet_row(pane_h: i32, rows: u16) -> i32 {
     (pane_h - rows as i32 + 1).clamp(1, pane_h.max(1))
 }
 
-/// The 1-indexed row shared by every overlay in the strip's top lane — the
-/// hover caption (drawn via the ratatui frame in [`KittyRenderer::draw`]) and,
-/// per visible pet, its Zz/!/? icon and (if focused) its hat (drawn one row
-/// above the pet's own top row in `render_pets`). A single shared lane, not
-/// two, keeps the pet band as tall as `pet_rows` allows instead of losing a
-/// second row to a caption that's blank most of the time; column position
-/// (right-aligned caption vs. per-pet-centered icon/hat) keeps them apart.
+/// The 1-indexed strip row reserved exclusively for the hover caption (the
+/// pet's *name*), drawn via the ratatui frame in [`KittyRenderer::draw`]. It
+/// sits one row above the pet band and carries **no kitty image ever** — the
+/// per-pet Zz/!/? icons now float inside the band's own headroom (above the
+/// shrunk sheep's head), and the focus hat is baked into the pet image. A
+/// dedicated, image-free row is what stops a pet's icon or hopping head from
+/// painting over the name (which made it flicker on then vanish) and
+/// guarantees it can never overlap a sheep.
 fn overlay_lane_row(pane_h: u16) -> u16 {
     let rows = pet_rows(pane_h);
     pet_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
@@ -248,15 +294,12 @@ impl KittyRenderer {
                 pet.identity.hue,
                 pet.focused,
             );
-            // Focused pets get extra padding above (on top of the usual
-            // motion pad) so the hat — baked directly into this same image,
-            // not a separate placement — never clips, exactly mirroring
-            // PET_PX_H's `+HAT_H` headroom in the half-block renderer.
-            let body_pad = if pet.focused {
-                MOTION_PAD + HAT_H
-            } else {
-                MOTION_PAD
-            };
+            // Every pet's image reserves hat + hop headroom above the sprite
+            // (the hat is baked directly into this same image, not a separate
+            // placement), so all sheep rasterize at one size whether or not
+            // they're focused — and the headroom-inclusive crop below can keep
+            // TOP_HEADROOM rows above the head without ever clipping it.
+            let body_pad = MOTION_PAD + HAT_H;
             let image_id = match self.cache.get(&key) {
                 Some(&id) => id,
                 None => {
@@ -301,7 +344,10 @@ impl KittyRenderer {
             // 1-based and clamped into the pane so an edge pet is never
             // placed off-screen.
             let rows = pet_rows(area.height);
-            let cols = pet_cols(rows, fr.w, fr.h);
+            // Size the on-screen footprint to the *headroom-inclusive* window
+            // (fr.h + TOP_HEADROOM), so the sheep shrinks a little to leave room
+            // for the hat/hop above it — rather than the strip growing taller.
+            let cols = pet_cols(rows, fr.w, fr.h + TOP_HEADROOM);
             let pane_h = area.height as i32;
             let row = pet_row(pane_h, rows);
             let col = ((animated.x_fraction * max_x).round() as i32 + 1)
@@ -315,8 +361,9 @@ impl KittyRenderer {
             // bounce/sway) — the same offset the half-block path bakes
             // straight into its pixel buffer — so the body (and its baked-in
             // hat, if any) actually animates instead of sitting dead still.
-            let crop = crop_rect(
+            let crop = pet_crop(
                 body_pad,
+                TOP_HEADROOM,
                 self.scale,
                 fr.w,
                 fr.h,
@@ -392,7 +439,13 @@ impl KittyRenderer {
                     );
                     let icon_rows: u16 = 1;
                     let icon_cols = pet_cols(icon_rows, iw, ih);
-                    let icon_row = overlay_lane_row(area.height) as i32;
+                    // Float the icon in the pet band's own headroom (its top
+                    // cell), above the shrunk sheep's head — NOT the top lane,
+                    // which is now the dedicated, kitty-image-free name row, so
+                    // the hover caption there can never be painted over by an
+                    // icon (the old shared-lane collision that made the name
+                    // flicker on and vanish).
+                    let icon_row = row;
                     let icon_col_max = (area.width as i32 - icon_cols as i32 + 1).max(1);
                     let icon_col =
                         (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
@@ -464,6 +517,33 @@ impl KittyRenderer {
         Ok(())
     }
 
+    /// Draw the hover caption as direct terminal escapes on the dedicated name
+    /// row — bypassing ratatui, whose text the
+    /// per-frame kitty re-placement clobbers and then never redraws (see
+    /// [`KittyRenderer::draw`]). The row carries no pet image, so it's cleared
+    /// and rewritten every frame with no stale trail. Row/column are 1-indexed
+    /// within this pane's own terminal.
+    fn draw_overlay_text(&mut self, area: Rect, hover_label: Option<&str>) -> io::Result<()> {
+        if area.width == 0 || area.height == 0 {
+            return Ok(());
+        }
+        let row = overlay_lane_row(area.height);
+        let width = area.width as usize;
+        let mut s = String::new();
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        if let Some(label) = hover_label {
+            let max = width.saturating_sub(1);
+            let text: String = label.chars().take(max).collect();
+            let tw = text.chars().count();
+            // Right-aligned, ochre, with a 1-column margin from the edge.
+            let col = width.saturating_sub(tw).max(1);
+            s.push_str(&format!(
+                "\x1b[{row};{col}H\x1b[38;2;217;164;65m{text}\x1b[0m"
+            ));
+        }
+        self.out.write_all(s.as_bytes())
+    }
+
     /// Test-only entry point that skips the ratatui `Frame` entirely and
     /// drives `render_pets` with a fixed `strip_w` matching the hit-test
     /// tests (200 columns). Errors are swallowed, mirroring `draw`'s
@@ -490,12 +570,14 @@ impl PetRenderer for KittyRenderer {
     ) {
         let area = frame.area();
         let _ = self.render_pets(herd, species, area, theme, now_ms);
-        // Share the same overlay lane every pet's icon/hat uses, not a row of
-        // its own — kitty doesn't draw `+N`, so there's no overflow width to
-        // dodge, but the caption still needs the column-based right-alignment
-        // `draw_caption` already does to avoid a hovered pet's own icon/hat.
-        let lane_y = overlay_lane_row(area.height).saturating_sub(1); // 1-indexed -> 0-indexed
-        crate::render::draw_caption(frame, area, lane_y, hover_label, 0);
+        // Draw the name (and the temp build marker) as DIRECT terminal escapes,
+        // in the same layer as the pets — NOT ratatui text via `frame`. The
+        // per-frame kitty image re-placement clobbers ratatui's text cells, and
+        // ratatui's diff then skips redrawing "unchanged" text, so anything
+        // drawn through the frame flashed on for one frame and then vanished
+        // (the long-standing name-disappears bug). Writing straight to the sink
+        // every frame keeps it stable, on its own dedicated top row.
+        let _ = self.draw_overlay_text(area, hover_label);
     }
 
     /// Hit-test using the same visible set as `render_pets`. A pet's hit range
@@ -706,6 +788,40 @@ mod tests {
     }
 
     #[test]
+    fn pet_crop_keeps_hat_and_hop_headroom_above_the_sprite() {
+        // The displayed window is TOP_HEADROOM rows taller than the sprite,
+        // with that headroom ABOVE it, so the baked-in hat and the walking hop
+        // (up to 2px) never clip the head — the regression this whole change
+        // fixes. Verify across the entire hop range (dy 0.0 -> -2.0).
+        let (body_pad, scale, w, sprite_h) = (MOTION_PAD + HAT_H, 7usize, 16usize, 14usize);
+        let win_h = (sprite_h + TOP_HEADROOM) * scale;
+        // Topmost hat pixel row, and the row just past the feet, in padded-canvas
+        // pixels — the window must always straddle both.
+        let hat_top = ((body_pad - HAT_H) * scale) as u32;
+        let feet = ((body_pad + sprite_h) * scale) as u32;
+        let canvas_h = ((sprite_h + 2 * body_pad) * scale) as u32;
+        for tenths in 0..=20 {
+            let dy = -(tenths as f32) / 10.0; // 0.0 down to -2.0
+            let c = pet_crop(body_pad, TOP_HEADROOM, scale, w, sprite_h, 0.0, dy);
+            assert_eq!(c.h as usize, win_h, "window is sprite + headroom tall");
+            assert!(
+                c.y <= hat_top,
+                "dy={dy}: window top {} clipped the hat/head (hat top {hat_top})",
+                c.y
+            );
+            assert!(
+                c.y + c.h >= feet,
+                "dy={dy}: window bottom {} clipped the feet ({feet})",
+                c.y + c.h
+            );
+            assert!(
+                c.y + c.h <= canvas_h,
+                "dy={dy}: window read past the padded canvas ({canvas_h})"
+            );
+        }
+    }
+
+    #[test]
     fn pet_row_bottom_aligns_with_no_gap_at_the_pane_floor() {
         for (pane_h, rows) in [(6, 4u16), (10, 4), (4, 2), (3, 2)] {
             let row = pet_row(pane_h, rows);
@@ -732,33 +848,51 @@ mod tests {
     }
 
     #[test]
-    fn draw_places_the_hover_caption_on_the_shared_overlay_lane() {
-        // The caption shares the icon/hat lane (one row above the pet body),
-        // not a row of its own — so it lands wherever that lane falls for
-        // this pane height, not necessarily row 0.
+    fn draw_writes_the_hover_caption_as_a_direct_escape_on_the_name_row() {
+        // The caption is written straight to the sink (same layer as the pets),
+        // NOT into the ratatui frame — ratatui text gets clobbered by the
+        // per-frame kitty re-placement and never redrawn, which made the name
+        // flash on then vanish. It targets the 1-indexed name row for this pane.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let mut r = KittyRenderer::for_test(SharedSink::default(), 4);
         let pane_h = 10u16;
         let mut terminal = Terminal::new(TestBackend::new(40, pane_h)).unwrap();
-        let completed = terminal
+        terminal
             .draw(|f| {
                 PetRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
             })
             .unwrap();
-        let lane_y = overlay_lane_row(pane_h).saturating_sub(1); // 1-indexed -> 0-indexed
-        let row: String = (0..completed.buffer.area.width)
-            .map(|x| {
-                completed.buffer[(x, lane_y)]
-                    .symbol()
-                    .chars()
-                    .next()
-                    .unwrap_or(' ')
-            })
-            .collect();
+        let out = sink.take();
         assert!(
-            row.contains("agent-x"),
-            "caption drawn on the shared overlay lane (row {lane_y}): {row:?}"
+            out.contains("agent-x"),
+            "the caption is emitted as a direct escape: {out:?}"
+        );
+        let row = overlay_lane_row(pane_h);
+        assert!(
+            out.contains(&format!("\x1b[{row};")),
+            "the caption is positioned on the 1-indexed name row {row}"
+        );
+    }
+
+    #[test]
+    fn draw_emits_no_caption_escape_when_nothing_is_hovered() {
+        // With no hover label the name row still gets cleared + the marker, but
+        // no ochre caption text — so a stale name never lingers.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| PetRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        let out = sink.take();
+        // The ochre caption color (217;164;65) is only emitted for a real label.
+        assert!(
+            !out.contains("38;2;217;164;65"),
+            "no caption color is emitted when nothing is hovered: {out:?}"
         );
     }
 

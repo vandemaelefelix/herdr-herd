@@ -677,9 +677,17 @@ where
                 }
                 Event::Mouse(MouseEvent { kind, column, .. }) => match kind {
                     MouseEventKind::Moved => {
-                        hovered = renderer
-                            .pet_at_column(&herd, species, strip_w, column, now_ms)
-                            .map(|i| herd.pets[i].label.clone());
+                        // Sticky hover: only update the caption when the cursor
+                        // is actually over a sheep, and otherwise keep the last
+                        // one shown. The sheep are small and sparse, so clearing
+                        // on every gap between them made the name flash on then
+                        // vanish as the mouse moved; now it stays put, top-right,
+                        // until you hover a different sheep.
+                        if let Some(i) =
+                            renderer.pet_at_column(&herd, species, strip_w, column, now_ms)
+                        {
+                            hovered = Some(herd.pets[i].label.clone());
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
