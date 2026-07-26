@@ -517,8 +517,8 @@ impl KittyRenderer {
         Ok(())
     }
 
-    /// Draw the hover caption (and the temp build marker) as direct terminal
-    /// escapes on the dedicated name row — bypassing ratatui, whose text the
+    /// Draw the hover caption as direct terminal escapes on the dedicated name
+    /// row — bypassing ratatui, whose text the
     /// per-frame kitty re-placement clobbers and then never redraws (see
     /// [`KittyRenderer::draw`]). The row carries no pet image, so it's cleared
     /// and rewritten every frame with no stale trail. Row/column are 1-indexed
@@ -531,9 +531,6 @@ impl KittyRenderer {
         let width = area.width as usize;
         let mut s = String::new();
         s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-        // TEMP build marker (remove before merge): a green top-left tag so the
-        // running build is identifiable at a glance.
-        s.push_str("\x1b[38;2;125;216;125m\u{25c6}v2-namerow\x1b[0m");
         if let Some(label) = hover_label {
             let max = width.saturating_sub(1);
             let text: String = label.chars().take(max).collect();
