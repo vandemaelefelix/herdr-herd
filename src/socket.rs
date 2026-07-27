@@ -117,7 +117,7 @@ impl SocketClient for RealSocket {
 /// immediate structural snapshot. (Stream event names use underscores, e.g.
 /// `pane_created`; the watcher ignores event contents and just refetches.)
 pub fn subscribe_request() -> String {
-    r#"{"id":"pets","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"}]}}"#.to_string()
+    r#"{"id":"members","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"}]}}"#.to_string()
 }
 
 #[cfg(test)]
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn real_socket_sends_and_receives_framed_lines() {
-        let path = std::env::temp_dir().join(format!("herdr-pets-rt-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("herdr-herd-rt-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn({
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn request_writes_payload_and_reads_reply() {
-        let dir = std::env::temp_dir().join(format!("herdr-pets-sock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("herdr-herd-sock-{}", std::process::id()));
         let _ = std::fs::remove_file(&dir);
         let listener = UnixListener::bind(&dir).unwrap();
 
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn request_line_reads_one_reply_line_without_needing_eof() {
-        let path = std::env::temp_dir().join(format!("herdr-pets-rl-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("herdr-herd-rl-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn({
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn request_line_errors_when_the_socket_closes_before_a_reply() {
-        let path = std::env::temp_dir().join(format!("herdr-pets-rl-close-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("herdr-herd-rl-close-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn({

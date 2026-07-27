@@ -1,7 +1,7 @@
 //! Named motion primitives and overlay specs — the "animation config" library
 //! that `.sprite` files reference. All motion is a pure function of a phase in
 //! 0.0..1.0, so it is deterministic and testable. Horizontal roaming (`Wander`)
-//! is owned by the herd simulation, not by per-pet offsets.
+//! is owned by the herd simulation, not by per-member offsets.
 
 use std::f32::consts::TAU;
 
@@ -99,7 +99,7 @@ pub fn motion_offset(spec: &MotionSpec, phase: f32) -> Offset {
 }
 
 /// The overlay icon's own float: independent of the body's `MotionSpec`, so it
-/// keeps drifting even when the pet itself is static (e.g. `done`'s slow hop,
+/// keeps drifting even when the member itself is static (e.g. `done`'s slow hop,
 /// or `unknown`'s frozen phase). A full sine (not clamped like `Hop`) so it
 /// rises, then genuinely comes back down, plus a slower lateral drift — "floats
 /// up in a wavy pattern, then goes back", per the design brief.

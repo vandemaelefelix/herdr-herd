@@ -1,8 +1,8 @@
-# herdr-plugin.toml — manifest for herdr-pets.
-id = "herdr-pets"
-name = "herdr-pets"
+# herdr-plugin.toml — manifest for herdr-herd.
+id = "herdr-herd"
+name = "herdr-herd"
 version = "0.1.0"
-description = "A herd of pixel-art pets for your herdr agents."
+description = "A herd of pixel-art sheep for your herdr agents — one per agent."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 
@@ -12,21 +12,21 @@ platforms = ["linux", "macos"]
 platforms = ["linux", "macos"]
 command = ["/bin/sh", "scripts/build.sh"]
 
-# A pets strip opened manually via `herdr plugin pane open`.
+# A herd strip opened manually via `herdr plugin pane open`.
 [[panes]]
-id = "pets"
-title = "Pets"
+id = "herd"
+title = "Herd"
 placement = "split"
-command = ["./target/release/herdr-pets", "render"]
+command = ["./target/release/herdr-herd", "render"]
 
-# Place a full-width pets strip in the current tab now (destructive rebuild).
+# Place a full-width herd strip in the current tab now (destructive rebuild).
 [[actions]]
-id = "place-pets"
-title = "Place pets strip"
-command = ["./target/release/herdr-pets", "place"]
+id = "place-herd"
+title = "Place herd strip"
+command = ["./target/release/herdr-herd", "place"]
 
 # Start the always-on watchdog that keeps a strip in every eligible tab.
 [[actions]]
-id = "start-pets-controller"
-title = "Start pets controller"
-command = ["./target/release/herdr-pets", "control"]
+id = "start-herd-controller"
+title = "Start herd controller"
+command = ["./target/release/herdr-herd", "control"]

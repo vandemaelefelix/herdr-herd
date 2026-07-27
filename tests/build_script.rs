@@ -10,8 +10,8 @@ fn print_url(os: &str, arch: &str) -> String {
     let out = Command::new("sh")
         .arg(format!("{dir}/scripts/build.sh"))
         .arg("--print-url")
-        .env("HERDR_PETS_FAKE_UNAME_S", os)
-        .env("HERDR_PETS_FAKE_UNAME_M", arch)
+        .env("HERDR_HERD_FAKE_UNAME_S", os)
+        .env("HERDR_HERD_FAKE_UNAME_M", arch)
         .current_dir(dir)
         .output()
         .expect("build.sh should run under sh");
@@ -23,7 +23,7 @@ fn print_url(os: &str, arch: &str) -> String {
 fn macos_arm64_maps_to_the_apple_silicon_asset_at_the_manifest_version() {
     let url = print_url("Darwin", "arm64");
     assert!(
-        url.ends_with("/herdr-pets-aarch64-apple-darwin"),
+        url.ends_with("/herdr-herd-aarch64-apple-darwin"),
         "got: {url}"
     );
     // Ties the URL's version to the manifest so version drift fails the gate.
@@ -34,7 +34,7 @@ fn macos_arm64_maps_to_the_apple_silicon_asset_at_the_manifest_version() {
 fn macos_intel_maps_to_the_x86_64_apple_asset() {
     let url = print_url("Darwin", "x86_64");
     assert!(
-        url.ends_with("/herdr-pets-x86_64-apple-darwin"),
+        url.ends_with("/herdr-herd-x86_64-apple-darwin"),
         "got: {url}"
     );
 }
@@ -43,7 +43,7 @@ fn macos_intel_maps_to_the_x86_64_apple_asset() {
 fn linux_x86_64_maps_to_the_gnu_asset() {
     let url = print_url("Linux", "x86_64");
     assert!(
-        url.ends_with("/herdr-pets-x86_64-unknown-linux-gnu"),
+        url.ends_with("/herdr-herd-x86_64-unknown-linux-gnu"),
         "got: {url}"
     );
 }
@@ -52,7 +52,7 @@ fn linux_x86_64_maps_to_the_gnu_asset() {
 fn linux_arm64_maps_to_the_aarch64_gnu_asset() {
     let url = print_url("Linux", "aarch64");
     assert!(
-        url.ends_with("/herdr-pets-aarch64-unknown-linux-gnu"),
+        url.ends_with("/herdr-herd-aarch64-unknown-linux-gnu"),
         "got: {url}"
     );
 }

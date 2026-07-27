@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn label_prefers_name_then_agent_then_pane_id() {
         let a = parse_agent_list(FIXTURE).unwrap();
-        assert_eq!(a[0].label(), "pets-dev"); // has name
+        assert_eq!(a[0].label(), "members-dev"); // has name
         assert_eq!(a[1].label(), "claude"); // no name, has agent
         assert_eq!(a[2].label(), "w1F:p3"); // neither -> pane_id
     }
@@ -157,15 +157,15 @@ mod tests {
     fn sidebar_label_joins_workspace_and_tab_as_a_breadcrumb() {
         let a = parse_agent_list(FIXTURE).unwrap();
         assert_eq!(
-            a[0].sidebar_label(Some("herdr-pets"), Some("renderer")),
-            "herdr-pets › renderer"
+            a[0].sidebar_label(Some("herdr-herd"), Some("renderer")),
+            "herdr-herd › renderer"
         );
     }
 
     #[test]
     fn sidebar_label_shows_one_piece_bare_when_the_other_is_missing() {
         let a = parse_agent_list(FIXTURE).unwrap();
-        assert_eq!(a[0].sidebar_label(Some("herdr-pets"), None), "herdr-pets");
+        assert_eq!(a[0].sidebar_label(Some("herdr-herd"), None), "herdr-herd");
         assert_eq!(a[0].sidebar_label(None, Some("renderer")), "renderer");
         // Blank strings count as missing, not as an empty breadcrumb side.
         assert_eq!(a[0].sidebar_label(Some("  "), Some("renderer")), "renderer");
@@ -173,16 +173,16 @@ mod tests {
 
     #[test]
     fn sidebar_label_falls_back_to_the_folder_basename_then_legacy() {
-        // a[0].foreground_cwd = /Users/felix/projects/herdr-pets
+        // a[0].foreground_cwd = /Users/felix/projects/herdr-herd
         let a = parse_agent_list(FIXTURE).unwrap();
-        assert_eq!(a[0].sidebar_label(None, None), "herdr-pets");
+        assert_eq!(a[0].sidebar_label(None, None), "herdr-herd");
 
         // An agent with no folder path at all falls back to the legacy label.
         let mut bare = a[0].clone();
         bare.foreground_cwd = String::new();
         bare.cwd = String::new();
-        // a[0] has name "pets-dev", so legacy label() == "pets-dev".
-        assert_eq!(bare.sidebar_label(None, None), "pets-dev");
+        // a[0] has name "members-dev", so legacy label() == "members-dev".
+        assert_eq!(bare.sidebar_label(None, None), "members-dev");
     }
 
     #[test]

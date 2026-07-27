@@ -1,5 +1,5 @@
 //! The full-width strip injector: measure the tab, export its layout tree,
-//! wrap it in a root vertical split with a new pets pane as the bottom child,
+//! wrap it in a root vertical split with a new members pane as the bottom child,
 //! and apply. Pure ratio/tree helpers live here; socket + env orchestration is
 //! in [`place`]. See Phase 0 Spike A (design §5) for the verified wire protocol
 //! (newline-delimited JSON-RPC, dotted methods, a command-leaf with no
@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: a 1-row badge lane, 3 half-block pet rows, and
+/// Rows the strip should occupy: a 1-row badge lane, 3 half-block member rows, and
 /// 1 caption row — a slim status strip. Overlays/`+N` live in the lane so they
-/// never cover a pet, and the pet band is short (pets are a glanceable status,
+/// never cover a member, and the member band is short (members are a glanceable status,
 /// not the focus).
 pub const TARGET_ROWS: u16 = 5;
 
@@ -73,12 +73,13 @@ pub fn extract_export_root(reply: &str) -> io::Result<Value> {
 
 /// Build the `layout.export` request line for `tab_id`.
 pub fn export_request(tab_id: &str) -> String {
-    json!({"id": "pets-place", "method": "layout.export", "params": {"tab_id": tab_id}}).to_string()
+    json!({"id": "members-place", "method": "layout.export", "params": {"tab_id": tab_id}})
+        .to_string()
 }
 
 /// Build the `layout.apply` request line placing `root` on `tab_id`.
 pub fn apply_request(tab_id: &str, root: &Value) -> String {
-    json!({"id": "pets-place", "method": "layout.apply", "params": {"tab_id": tab_id, "root": root}})
+    json!({"id": "members-place", "method": "layout.apply", "params": {"tab_id": tab_id, "root": root}})
         .to_string()
 }
 
@@ -93,7 +94,7 @@ pub fn check_reply(reply: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Inject a full-width pets strip into the current tab. Reads `$HERDR_TAB_ID`
+/// Inject a full-width herd strip into the current tab. Reads `$HERDR_TAB_ID`
 /// (the target) and `$HERDR_SOCKET_PATH` (the control socket); measures the tab
 /// with `herdr pane layout --current` via `cli`, then `layout.export` +
 /// `layout.apply` over the socket to place the strip. `self_exe` is the
@@ -131,8 +132,8 @@ mod tests {
 
     #[test]
     fn target_rows_is_a_slim_status_strip() {
-        // 5 rows = 1 badge lane + 3 half-block pixel rows (PET_PX_H = 6) + 1
-        // caption row. Slim on purpose — the pets are a glanceable status line.
+        // 5 rows = 1 badge lane + 3 half-block pixel rows (MEMBER_PX_H = 6) + 1
+        // caption row. Slim on purpose — the members are a glanceable status line.
         assert_eq!(TARGET_ROWS, 5);
     }
 
@@ -163,7 +164,7 @@ mod tests {
     #[test]
     fn wrap_root_puts_a_command_leaf_with_no_pane_id_at_the_bottom() {
         let tree = json!({"type": "pane", "pane_id": "w1:p1", "cwd": "/x"});
-        let cmd = vec!["/abs/herdr-pets".to_string(), "render".to_string()];
+        let cmd = vec!["/abs/herdr-herd".to_string(), "render".to_string()];
         let root = wrap_root(tree.clone(), 0.89, &cmd, "/work");
         assert_eq!(root["type"], "split");
         assert_eq!(root["direction"], "down");
@@ -175,7 +176,7 @@ mod tests {
         );
         let bottom = &root["second"];
         assert_eq!(bottom["type"], "pane");
-        assert_eq!(bottom["command"], json!(["/abs/herdr-pets", "render"]));
+        assert_eq!(bottom["command"], json!(["/abs/herdr-herd", "render"]));
         assert_eq!(bottom["cwd"], "/work");
         assert!(
             bottom.get("pane_id").is_none(),

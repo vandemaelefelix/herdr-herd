@@ -3,7 +3,7 @@
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_herdr-pets"))
+    Command::new(env!("CARGO_BIN_EXE_herdr-herd"))
 }
 
 #[test]

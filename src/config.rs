@@ -86,12 +86,12 @@ pub struct Config {
     pub strip_rows: u16,
     /// Controller poll cadence in milliseconds.
     pub sweep_interval_ms: u64,
-    /// Calm pets — no wandering or bounce.
+    /// Calm members — no wandering or bounce.
     pub reduced_motion: bool,
     /// Which renderer backend to use.
     pub renderer: RendererKind,
-    /// Pet sprite scale factor (clamped to 1..=24).
-    pub pet_scale: usize,
+    /// Member sprite scale factor (clamped to 1..=24).
+    pub member_scale: usize,
     /// Notification-sound settings.
     pub sounds: SoundConfig,
 }
@@ -104,7 +104,7 @@ impl Default for Config {
             sweep_interval_ms: 3000,
             reduced_motion: false,
             renderer: RendererKind::Auto,
-            pet_scale: 7,
+            member_scale: 7,
             sounds: SoundConfig::default(),
         }
     }
@@ -155,9 +155,9 @@ impl Config {
                         _ => RendererKind::Auto, // "auto" or anything unrecognized
                     };
                 }
-                "pet_scale" => {
+                "member_scale" => {
                     if let Ok(v) = val.parse::<usize>() {
-                        cfg.pet_scale = v.clamp(1, 24);
+                        cfg.member_scale = v.clamp(1, 24);
                     }
                 }
                 "sounds_enabled" => {
@@ -213,11 +213,11 @@ pub fn load_from_dir(dir: &Path) -> Config {
 }
 
 /// Resolve the plugin config dir by asking herdr (`herdr plugin config-dir
-/// herdr-pets`, plain-path stdout). Thin glue; `None` on any failure.
+/// herdr-herd`, plain-path stdout). Thin glue; `None` on any failure.
 pub fn resolve_config_dir() -> Option<PathBuf> {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let out = Command::new(bin)
-        .args(["plugin", "config-dir", "herdr-pets"])
+        .args(["plugin", "config-dir", "herdr-herd"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -253,7 +253,7 @@ mod tests {
                 sweep_interval_ms: 3000,
                 reduced_motion: false,
                 renderer: RendererKind::Auto,
-                pet_scale: 7,
+                member_scale: 7,
                 sounds: SoundConfig::default(),
             }
         );
@@ -272,7 +272,7 @@ mod tests {
                 sweep_interval_ms: 1500,
                 reduced_motion: true,
                 renderer: RendererKind::Auto,
-                pet_scale: 7,
+                member_scale: 7,
                 sounds: SoundConfig::default(),
             }
         );
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn load_from_dir_reads_config_toml_when_present() {
-        let dir = std::env::temp_dir().join(format!("herdr-pets-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("herdr-herd-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), "strip_rows = 9\n").unwrap();
         assert_eq!(load_from_dir(&dir).strip_rows, 9);
@@ -310,23 +310,23 @@ mod tests {
     #[test]
     fn load_from_dir_defaults_when_the_file_is_absent() {
         let dir =
-            std::env::temp_dir().join(format!("herdr-pets-cfg-absent-{}", std::process::id()));
+            std::env::temp_dir().join(format!("herdr-herd-cfg-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load_from_dir(&dir), Config::default());
     }
 
     #[test]
     fn parses_renderer_and_scale() {
-        let c = Config::from_toml_str("renderer = kitty\npet_scale = 5\n");
+        let c = Config::from_toml_str("renderer = kitty\nmember_scale = 5\n");
         assert_eq!(c.renderer, RendererKind::Kitty);
-        assert_eq!(c.pet_scale, 5);
+        assert_eq!(c.member_scale, 5);
     }
 
     #[test]
     fn renderer_defaults_to_auto_and_scale_to_seven() {
         let c = Config::default();
         assert_eq!(c.renderer, RendererKind::Auto);
-        assert_eq!(c.pet_scale, 7);
+        assert_eq!(c.member_scale, 7);
     }
 
     #[test]

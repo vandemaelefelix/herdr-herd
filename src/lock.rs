@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn acquire_grants_the_lock_then_blocks_a_second_holder() {
-        let path = std::env::temp_dir().join(format!("herdr-pets-lock-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("herdr-herd-lock-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let first = acquire(&path).unwrap();

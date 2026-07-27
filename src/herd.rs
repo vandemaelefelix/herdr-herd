@@ -1,23 +1,23 @@
-//! The herd: the set of pets currently known, kept in sync with the live
+//! The herd: the set of members currently known, kept in sync with the live
 //! agent snapshot. Reconciles by `terminal_id`: survivors keep their identity
-//! and pick up status/label changes, new agents spawn a pet, departed agents
+//! and pick up status/label changes, new agents spawn a member, departed agents
 //! are dropped. Position and animation are not simulated here — see
 //! `motion::animate`, a pure function of time computed fresh at draw time, so
 //! every pane agrees without needing to share any of this state.
 
 use crate::agent::{Agent, AgentStatus};
 use crate::identity::identity_for;
+use crate::member::{Member, priority};
 use crate::motion::{Anchor, wander_position};
-use crate::pet::{Pet, priority};
 
-/// A herd of pets, kept in sync with the live agent snapshot.
+/// A herd of members, kept in sync with the live agent snapshot.
 #[derive(Default)]
 pub struct Herd {
-    pub pets: Vec<Pet>,
+    pub members: Vec<Member>,
 }
 
-/// An old→new status change detected for a surviving pet during `reconcile`.
-/// Never emitted for a pet's first appearance — there is no prior status to
+/// An old→new status change detected for a surviving member during `reconcile`.
+/// Never emitted for a member's first appearance — there is no prior status to
 /// transition from, so the initial snapshot never produces one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusTransition {
@@ -29,26 +29,28 @@ pub struct StatusTransition {
 impl Herd {
     /// An empty herd.
     pub fn new() -> Self {
-        Self { pets: Vec::new() }
+        Self {
+            members: Vec::new(),
+        }
     }
 
-    /// Sync `self.pets` to `agents`, keyed by `terminal_id`: update survivors'
-    /// status/label/`focused` flag, add new pets, and drop pets whose agent
+    /// Sync `self.members` to `agents`, keyed by `terminal_id`: update survivors'
+    /// status/label/`focused` flag, add new members, and drop members whose agent
     /// has departed. Returns the old→new status changes seen on survivors — a
-    /// freshly spawned pet has no prior status, so it never contributes one;
+    /// freshly spawned member has no prior status, so it never contributes one;
     /// this is what keeps the initial snapshot silent for sound notifications.
     ///
     /// `now_ms` is the current wall-clock instant (see `render::run_loop`):
     /// when a survivor leaves `Working`, its freeze anchor is captured here —
     /// `frozen_x` sampled from `motion::wander_position` at this exact
     /// instant, `settled_at_ms` set to it — so `motion::animate` can hold the
-    /// pet there instead of teleporting it to the identity rest position.
+    /// member there instead of teleporting it to the identity rest position.
     /// Re-entering `Working` clears the anchor; a transition between two
     /// non-Working statuses leaves an existing anchor untouched (it persists
-    /// until the pet works again). A pet's first-ever appearance already
+    /// until the member works again). A member's first-ever appearance already
     /// non-Working has no anchor to capture (there's no prior Working instant
     /// to sample) — accepted per-pane cosmetic tradeoff: a pane that only sees
-    /// the pet post-transition can't know where it was, so it falls back to
+    /// the member post-transition can't know where it was, so it falls back to
     /// the identity rest position, same as before anchors existed.
     pub fn reconcile(
         &mut self,
@@ -59,7 +61,7 @@ impl Herd {
         let mut transitions = Vec::new();
         for a in agents {
             if let Some(p) = self
-                .pets
+                .members
                 .iter_mut()
                 .find(|p| p.terminal_id == a.terminal_id)
             {
@@ -83,36 +85,36 @@ impl Herd {
                 p.label = a.display_label();
                 p.focused = a.focused;
             } else {
-                let mut pet = Pet::new(
+                let mut member = Member::new(
                     a.terminal_id.clone(),
                     identity_for(&a.terminal_id, species_count),
                     a.agent_status,
                 );
-                pet.label = a.display_label();
-                pet.focused = a.focused;
-                self.pets.push(pet);
+                member.label = a.display_label();
+                member.focused = a.focused;
+                self.members.push(member);
             }
         }
         // Remove departed.
-        self.pets
+        self.members
             .retain(|p| agents.iter().any(|a| a.terminal_id == p.terminal_id));
         transitions
     }
 }
 
-/// Priority-ranked visibility: keep the highest-priority `capacity` pets
+/// Priority-ranked visibility: keep the highest-priority `capacity` members
 /// (ties by terminal_id for stability); return their indices + hidden count.
-pub fn visible_and_hidden(pets: &[Pet], capacity: usize) -> (Vec<usize>, usize) {
-    let mut idx: Vec<usize> = (0..pets.len()).collect();
-    if pets.len() <= capacity {
+pub fn visible_and_hidden(members: &[Member], capacity: usize) -> (Vec<usize>, usize) {
+    let mut idx: Vec<usize> = (0..members.len()).collect();
+    if members.len() <= capacity {
         return (idx, 0);
     }
     idx.sort_by(|&a, &b| {
-        priority(pets[b].status)
-            .cmp(&priority(pets[a].status))
-            .then_with(|| pets[a].terminal_id.cmp(&pets[b].terminal_id))
+        priority(members[b].status)
+            .cmp(&priority(members[a].status))
+            .then_with(|| members[a].terminal_id.cmp(&members[b].terminal_id))
     });
-    let hidden = pets.len() - capacity;
+    let hidden = members.len() - capacity;
     idx.truncate(capacity);
     (idx, hidden)
 }
@@ -150,7 +152,7 @@ mod tests {
             2,
             0,
         );
-        assert_eq!(h.pets.len(), 2);
+        assert_eq!(h.members.len(), 2);
 
         // 'a' changes status, 'b' leaves, 'c' joins.
         h.reconcile(
@@ -161,10 +163,10 @@ mod tests {
             2,
             0,
         );
-        let a = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
+        let a = h.members.iter().find(|p| p.terminal_id == "a").unwrap();
         assert_eq!(a.status, AgentStatus::Blocked);
-        assert!(h.pets.iter().any(|p| p.terminal_id == "c"));
-        assert!(!h.pets.iter().any(|p| p.terminal_id == "b"));
+        assert!(h.members.iter().any(|p| p.terminal_id == "c"));
+        assert!(!h.members.iter().any(|p| p.terminal_id == "b"));
     }
 
     #[test]
@@ -172,35 +174,35 @@ mod tests {
         // A survivor's stable identity (species/hue) must not be re-rolled.
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Idle)], 3, 0);
-        let identity0 = h.pets[0].identity;
+        let identity0 = h.members[0].identity;
         h.reconcile(&[agent("a", AgentStatus::Working)], 3, 0);
-        assert_eq!(h.pets[0].identity, identity0);
+        assert_eq!(h.members[0].identity, identity0);
     }
 
     #[test]
-    fn reconcile_sets_and_updates_the_pet_label() {
+    fn reconcile_sets_and_updates_the_member_label() {
         let mut h = Herd::new();
         let mut a = agent("a", AgentStatus::Idle);
         a.name = Some("backend".into());
         h.reconcile(&[a], 1, 0);
-        assert_eq!(h.pets[0].label, "backend");
+        assert_eq!(h.members[0].label, "backend");
 
         // A survivor renamed mid-session picks up the new label.
         let mut a2 = agent("a", AgentStatus::Idle);
         a2.name = Some("frontend".into());
         h.reconcile(&[a2], 1, 0);
-        assert_eq!(h.pets[0].label, "frontend");
+        assert_eq!(h.members[0].label, "frontend");
     }
 
     #[test]
-    fn reconcile_carries_the_focused_flag_onto_new_and_surviving_pets() {
+    fn reconcile_carries_the_focused_flag_onto_new_and_surviving_members() {
         let mut h = Herd::new();
         let mut a = agent("a", AgentStatus::Idle);
         a.focused = true;
         h.reconcile(&[a], 1, 0);
         assert!(
-            h.pets[0].focused,
-            "a fresh pet picks up focused from the agent"
+            h.members[0].focused,
+            "a fresh member picks up focused from the agent"
         );
 
         // Focus moves to a new agent 'b'; 'a' survives but loses focus.
@@ -209,29 +211,32 @@ mod tests {
         let mut b = agent("b", AgentStatus::Idle);
         b.focused = true;
         h.reconcile(&[a2, b], 1, 0);
-        let a_pet = h.pets.iter().find(|p| p.terminal_id == "a").unwrap();
-        let b_pet = h.pets.iter().find(|p| p.terminal_id == "b").unwrap();
+        let a_member = h.members.iter().find(|p| p.terminal_id == "a").unwrap();
+        let b_member = h.members.iter().find(|p| p.terminal_id == "b").unwrap();
         assert!(
-            !a_pet.focused,
-            "surviving pet loses focus when it moves elsewhere"
+            !a_member.focused,
+            "surviving member loses focus when it moves elsewhere"
         );
-        assert!(b_pet.focused, "the newly focused agent's pet is focused");
+        assert!(
+            b_member.focused,
+            "the newly focused agent's member is focused"
+        );
     }
 
     #[test]
     fn reconcile_uses_the_resolved_hover_label_when_present() {
         let mut h = Herd::new();
-        // A fresh pet takes the resolved breadcrumb, not the legacy "claude".
+        // A fresh member takes the resolved breadcrumb, not the legacy "claude".
         let mut a = agent("a", AgentStatus::Working);
-        a.hover_label = Some("herdr-pets › renderer".into());
+        a.hover_label = Some("herdr-herd › renderer".into());
         h.reconcile(&[a], 1, 0);
-        assert_eq!(h.pets[0].label, "herdr-pets › renderer");
+        assert_eq!(h.members[0].label, "herdr-herd › renderer");
 
         // A survivor whose breadcrumb changes (moved tab) picks up the new one.
         let mut a2 = agent("a", AgentStatus::Working);
-        a2.hover_label = Some("herdr-pets › tests".into());
+        a2.hover_label = Some("herdr-herd › tests".into());
         h.reconcile(&[a2], 1, 0);
-        assert_eq!(h.pets[0].label, "herdr-pets › tests");
+        assert_eq!(h.members[0].label, "herdr-herd › tests");
     }
 
     #[test]
@@ -247,7 +252,7 @@ mod tests {
         );
         assert!(
             transitions.is_empty(),
-            "a pet's first appearance is not a transition, even if already blocked"
+            "a member's first appearance is not a transition, even if already blocked"
         );
     }
 
@@ -314,15 +319,15 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_anchors_a_pet_leaving_working_at_its_wander_position_and_instant() {
+    fn reconcile_anchors_a_member_leaving_working_at_its_wander_position_and_instant() {
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
-        assert_eq!(h.pets[0].anchor, None, "still working -> no anchor yet");
+        assert_eq!(h.members[0].anchor, None, "still working -> no anchor yet");
 
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 12_345);
         let (expected_x, _) = crate::motion::wander_position("a", 12_345);
         assert_eq!(
-            h.pets[0].anchor,
+            h.members[0].anchor,
             Some(Anchor {
                 frozen_x: expected_x,
                 settled_at_ms: 12_345,
@@ -335,11 +340,11 @@ mod tests {
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
-        assert!(h.pets[0].anchor.is_some());
+        assert!(h.members[0].anchor.is_some());
 
         h.reconcile(&[agent("a", AgentStatus::Working)], 1, 2_000);
         assert_eq!(
-            h.pets[0].anchor, None,
+            h.members[0].anchor, None,
             "re-entering Working clears the anchor"
         );
     }
@@ -349,52 +354,52 @@ mod tests {
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
-        let anchor = h.pets[0].anchor;
+        let anchor = h.members[0].anchor;
         assert!(anchor.is_some());
 
         // Idle -> Blocked much later: the anchor must persist unchanged, not
         // re-sample at the new instant.
         h.reconcile(&[agent("a", AgentStatus::Blocked)], 1, 99_999);
         assert_eq!(
-            h.pets[0].anchor, anchor,
+            h.members[0].anchor, anchor,
             "a non-working -> non-working change must not touch the anchor"
         );
     }
 
     #[test]
-    fn reconcile_leaves_a_freshly_seen_non_working_pet_unanchored() {
+    fn reconcile_leaves_a_freshly_seen_non_working_member_unanchored() {
         // First-ever appearance already non-working: no prior Working instant
         // was ever observed, so there's nothing to anchor to.
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 5_000);
-        assert_eq!(h.pets[0].anchor, None);
+        assert_eq!(h.members[0].anchor, None);
     }
 
     #[test]
     fn overflow_keeps_attention_states_and_drops_idle_first() {
-        let pets = vec![
-            crate::pet::Pet::new(
+        let members = vec![
+            crate::member::Member::new(
                 "i".into(),
                 crate::identity::identity_for("i", 2),
                 AgentStatus::Idle,
             ),
-            crate::pet::Pet::new(
+            crate::member::Member::new(
                 "b".into(),
                 crate::identity::identity_for("b", 2),
                 AgentStatus::Blocked,
             ),
-            crate::pet::Pet::new(
+            crate::member::Member::new(
                 "w".into(),
                 crate::identity::identity_for("w", 2),
                 AgentStatus::Working,
             ),
         ];
-        let (visible, hidden) = visible_and_hidden(&pets, 2);
+        let (visible, hidden) = visible_and_hidden(&members, 2);
         assert_eq!(hidden, 1);
-        // the blocked and working pets must be the visible ones; idle dropped.
+        // the blocked and working members must be the visible ones; idle dropped.
         let names: Vec<&str> = visible
             .iter()
-            .map(|&i| pets[i].terminal_id.as_str())
+            .map(|&i| members[i].terminal_id.as_str())
             .collect();
         assert!(names.contains(&"b") && names.contains(&"w"));
         assert!(!names.contains(&"i"));
