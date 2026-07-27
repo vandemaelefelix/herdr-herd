@@ -169,3 +169,28 @@ Proven live via throwaway spikes in a herdr pane: (1) a 4-color image renders th
 **Trade-off, deliberately accepted:** the old pairwise "nudge working pets apart so they don't overlap" behavior is gone. It depended on the *current set of visible pets*, which differs per pane (different tab widths → different overflow capacity) — keeping it would have reintroduced exactly the per-pane divergence this change exists to remove. Occasional brief visual overlap between two working (or several idle, if their identity hashes land close together) pets is the accepted cost of exact cross-pane sync.
 
 **Verification:** unit tests assert the core promise directly (`motion::tests::same_inputs_yield_the_identical_result_every_time`) plus the derived properties (working pets move over time, non-working pets don't, distinct agents don't move in lockstep, a static state's body motion pins but its icon still floats). Snapshot tests were regenerated (positions are no longer artificially spaced by spawn order, so the pixel layout looks different, not wrong). Live-verified across the maintainer's actual multi-tab, multi-workspace herdr session by restarting every `herdr-pets` strip pane and confirming the controller's non-destructive re-injection still works end to end.
+
+## 2026-07-26 — Packaging: fetch-or-build install (ships the deferred Phase 4 item)
+
+**Decision:** Ship the packaging/release that Phase 4 deferred (see the
+2026-07-23 entry). `scripts/build.sh` now downloads a prebuilt binary for the
+platform and only runs `cargo build --release` as a fallback, so installing
+needs **no Rust toolchain** on the four published targets
+(`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`). A tag-triggered `release.yml` cross-compiles and
+publishes those binaries to a GitHub Release; `ci.yml` (fmt/clippy/test) stays
+the PR gate.
+
+**Chosen over:** source-build-only (fails the "easy for others" goal — needs
+Rust) and prebuilt-only (drops the free robustness of the fallback). Fetch-or-
+build gives "no toolchain for the common case" and "never hard-fails" from one
+design. Spec: `docs/superpowers/specs/2026-07-26-packaging-and-install-design.md`.
+
+**Risk accepted:** `aarch64-unknown-linux-gnu` is cross-compiled with the
+`gcc-aarch64-linux-gnu` linker (no C deps in the tree, so this is safe). If that
+matrix leg ever proves fragile, drop it — arm64-Linux users then hit the
+source-build fallback, still a working install where Rust is present.
+
+**Manual maintainer step:** cutting the tag/release is done by the human (repo
+convention: no autonomous commits/pushes) — see the release checklist in the
+plan.
