@@ -45,18 +45,28 @@ const PAUSE_FRACTION: f64 = 0.05;
 /// Icon float cycle, matching the old `Member::ICON_CYCLE_MS`.
 const ICON_CYCLE_MS: f64 = 1800.0;
 
-/// Where a member was, and when, the instant it last left `Working` — captured
-/// by `Herd::reconcile` and threaded into [`animate`] so a Working->non-Working
-/// transition freezes the member in place instead of teleporting it to the
-/// identity-derived rest position. `None` means this member has never been
-/// observed making that transition (a fresh or late-attached pane), in which
-/// case `animate` falls back to the old identity-derived rest position.
+/// A member's freeze/resume reference point: where it settled and when — captured
+/// by `Herd::reconcile` and threaded into [`animate`]. It serves both directions
+/// of a `Working` transition:
+/// - **Leaving `Working`** (`frozen_x` = its on-screen spot, `settled_at_ms` =
+///   that instant): a non-`Working` member holds at `frozen_x` instead of
+///   teleporting to the identity-derived rest position.
+/// - **Re-entering `Working`** (`frozen_x` kept, `settled_at_ms` re-stamped to
+///   the resume instant): [`working_position`] eases the member out from
+///   `frozen_x` into the wander cycle over [`RESUME_EASE_MS`] instead of
+///   snapping onto the free-running cycle.
+///
+/// `None` means this member has never been observed settling out of `Working`
+/// (a fresh or late-attached pane), in which case `animate` falls back to the
+/// identity-derived rest position and applies no resume ease.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Anchor {
-    /// `x_fraction` sampled from `wander_position` at the instant this member
-    /// left `Working`.
+    /// The member's `x_fraction` when it settled — sampled on leaving `Working`
+    /// (via [`working_position`], so it captures a mid-ease spot faithfully) and
+    /// then held while non-`Working` and walked out from on resume.
     pub frozen_x: f32,
-    /// `now_ms` at the instant this member left `Working`.
+    /// `now_ms` when this anchor was (re-)stamped: the instant the member left
+    /// `Working`, or — after a re-stamp on resume — the instant it re-entered.
     pub settled_at_ms: u64,
 }
 
@@ -65,17 +75,59 @@ pub struct Anchor {
 /// design brief, then holds on the last (fully-dozing) frame indefinitely.
 const SETTLE_DURATION_MS: f64 = 1_000.0;
 
-/// A wandering (`Working`) member's horizontal position/facing at `now_ms` — the
-/// same computation [`animate`] uses for its `x_fraction`/`facing_left`,
-/// factored out so `Herd::reconcile` can sample "where was this member when it
-/// stopped working" without needing a `StateSpec` (position never depends on
-/// which sprite frames a species has).
-pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
+/// How long a member takes to "walk out" from its resting spot into the
+/// free-running wander cycle when it resumes `Working`. The wander cycle is a
+/// pure function of absolute time (see the module docstring) and so bears no
+/// relation to where the member happened to settle — snapping straight onto it
+/// reads as a teleport. Instead we blend `frozen_x -> cycle` over this window
+/// with `smoothstep`, so the member walks out from rest. Once it elapses the
+/// position is the plain cycle again, so independent panes re-converge — a pane
+/// that never observed the resume just shows the plain cycle throughout (the
+/// same per-pane cosmetic tradeoff the leave-anchor already makes). ~1s, to
+/// mirror the idle settle.
+const RESUME_EASE_MS: f64 = 1_000.0;
+
+/// A `Working` member's horizontal position/facing/`moving` at `now_ms`: the
+/// free wander cycle, eased out from `anchor` for the first [`RESUME_EASE_MS`]
+/// after it resumed (`anchor.settled_at_ms` is the resume instant, `frozen_x`
+/// the rest spot it walks out from). With no anchor — or once the ease window
+/// has elapsed — it's the plain, stateless cycle. Shared by [`animate`] and
+/// `Herd::reconcile` so the position captured when a member *leaves* Working is
+/// exactly what was on screen, even if it left mid-ease. Position never depends
+/// on which sprite frames a species has, so this needs no `StateSpec`.
+pub fn working_position(
+    terminal_id: &str,
+    now_ms: u64,
+    anchor: Option<Anchor>,
+) -> (f32, bool, bool) {
     let phase0 = unit_hash("wander-phase", terminal_id) as f64;
     let period_ms =
         WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
     let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
-    let (x_fraction, facing_left, _moving) = wander_segment(u);
+    let (wander_x, wander_facing, wander_moving) = wander_segment(u);
+    match anchor {
+        Some(a) => {
+            let elapsed = now_ms.saturating_sub(a.settled_at_ms) as f64;
+            let t = (elapsed / RESUME_EASE_MS) as f32;
+            if t >= 1.0 {
+                (wander_x, wander_facing, wander_moving)
+            } else {
+                let x = a.frozen_x + (wander_x - a.frozen_x) * smoothstep(t);
+                // Face the way it's actually walking out of rest, and keep the
+                // legs cycling — it's walking, not sliding.
+                (x, wander_x < a.frozen_x, true)
+            }
+        }
+        None => (wander_x, wander_facing, wander_moving),
+    }
+}
+
+/// A wandering (`Working`) member's horizontal position/facing at `now_ms`,
+/// ignoring any resume ease — the plain, stateless cycle. Kept as a thin
+/// convenience over [`working_position`] for callers that only need the bare
+/// cycle position/facing.
+pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
+    let (x_fraction, facing_left, _moving) = working_position(terminal_id, now_ms, None);
     (x_fraction, facing_left)
 }
 
@@ -144,12 +196,11 @@ pub fn animate(
     anchor: Option<Anchor>,
 ) -> Animated {
     let (x_fraction, facing_left, moving) = if status == AgentStatus::Working {
-        let phase0 = unit_hash("wander-phase", terminal_id) as f64;
-        // +/-25% period variation so working members don't all sweep in lockstep.
-        let period_ms =
-            WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
-        let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
-        wander_segment(u)
+        // The wander cycle, eased out from the resume anchor for its first
+        // second so a member resuming Working walks out from where it rested
+        // instead of teleporting onto the free-running cycle (see
+        // `working_position` / `RESUME_EASE_MS`).
+        working_position(terminal_id, now_ms, anchor)
     } else {
         let rest_facing_left = unit_hash("rest-facing", terminal_id) < 0.5;
         // Freeze in place at the anchor captured when this member left Working —
@@ -448,6 +499,51 @@ mod tests {
                 "{terminal_id}: a pause must stay short, got {longest_paused_run_ms}ms"
             );
         }
+    }
+
+    #[test]
+    fn resuming_working_walks_out_from_the_rest_anchor_not_the_free_cycle() {
+        // A member re-entering Working carries a resume anchor (where it rested,
+        // stamped at the resume instant). At that instant it must be *exactly*
+        // at the rest spot — walking out from there — not teleported onto the
+        // free-running wander cycle, which bears no relation to where it rested.
+        let st = state(AgentStatus::Working);
+        let now = 10_000u64;
+        let free_x = wander_position("term_x", now).0;
+        // A rest spot clearly distinct from wherever the free cycle sits now, so
+        // "used the anchor" is unambiguous however the identity hash lands.
+        let frozen_x = if free_x < 0.5 { 0.9 } else { 0.1 };
+        let anchor = Anchor {
+            frozen_x,
+            settled_at_ms: now,
+        };
+        let a = animate("term_x", AgentStatus::Working, &st, now, Some(anchor));
+        assert!(
+            (a.x_fraction - frozen_x).abs() < 1e-3,
+            "at the resume instant it must sit at the rest spot {frozen_x} \
+             (free cycle is at {free_x}), got {}",
+            a.x_fraction
+        );
+    }
+
+    #[test]
+    fn resume_ease_converges_back_to_the_free_cycle_after_its_window() {
+        // Once the ease window has elapsed the anchor stops influencing
+        // position, so independent panes (some of which never observed the
+        // resume) re-converge on the plain, stateless cycle.
+        let st = state(AgentStatus::Working);
+        let now = 10_000u64;
+        let anchor = Anchor {
+            frozen_x: 0.9,
+            settled_at_ms: now,
+        };
+        let later = now + 5_000; // well past RESUME_EASE_MS
+        let a = animate("term_x", AgentStatus::Working, &st, later, Some(anchor)).x_fraction;
+        let free = wander_position("term_x", later).0;
+        assert!(
+            (a - free).abs() < 1e-6,
+            "after the ease window it's back on the plain cycle: got {a}, free {free}"
+        );
     }
 
     #[test]

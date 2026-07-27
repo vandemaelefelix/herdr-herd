@@ -33,11 +33,12 @@ pub struct Member {
     /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
     /// derived here — `Member` has no access to the agent snapshot.
     pub focused: bool,
-    /// Where/when this member was last seen leaving `Working`, threaded into
-    /// `motion::animate` so a Working->non-Working transition freezes it in
-    /// place instead of teleporting to the identity rest position. `None`
-    /// until `Herd::reconcile` observes that transition; cleared again on
-    /// re-entering `Working`. See [`crate::motion::Anchor`].
+    /// Where/when this member settled out of `Working`, threaded into
+    /// `motion::animate` so leaving `Working` freezes it in place (not a
+    /// teleport to the identity rest position) and re-entering `Working` eases
+    /// it back out from that spot. `None` until `Herd::reconcile` first observes
+    /// it settle; re-stamped (not cleared) on re-entering `Working`. See
+    /// [`crate::motion::Anchor`].
     pub anchor: Option<Anchor>,
 }
 

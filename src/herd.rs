@@ -8,7 +8,7 @@
 use crate::agent::{Agent, AgentStatus};
 use crate::identity::identity_for;
 use crate::member::{Member, priority};
-use crate::motion::{Anchor, wander_position};
+use crate::motion::{Anchor, working_position};
 
 /// A herd of members, kept in sync with the live agent snapshot.
 #[derive(Default)]
@@ -40,18 +40,25 @@ impl Herd {
     /// freshly spawned member has no prior status, so it never contributes one;
     /// this is what keeps the initial snapshot silent for sound notifications.
     ///
-    /// `now_ms` is the current wall-clock instant (see `render::run_loop`):
-    /// when a survivor leaves `Working`, its freeze anchor is captured here —
-    /// `frozen_x` sampled from `motion::wander_position` at this exact
-    /// instant, `settled_at_ms` set to it — so `motion::animate` can hold the
-    /// member there instead of teleporting it to the identity rest position.
-    /// Re-entering `Working` clears the anchor; a transition between two
-    /// non-Working statuses leaves an existing anchor untouched (it persists
-    /// until the member works again). A member's first-ever appearance already
-    /// non-Working has no anchor to capture (there's no prior Working instant
-    /// to sample) — accepted per-pane cosmetic tradeoff: a pane that only sees
-    /// the member post-transition can't know where it was, so it falls back to
-    /// the identity rest position, same as before anchors existed.
+    /// `now_ms` is the current wall-clock instant (see `render::run_loop`) and
+    /// drives the freeze/resume anchor (see [`motion::Anchor`]):
+    /// - **Leaving `Working`**: capture the member's on-screen position via
+    ///   `motion::working_position` (so a mid-resume-ease spot is caught
+    ///   faithfully, not the raw cycle) and stamp `settled_at_ms = now_ms`, so
+    ///   `motion::animate` holds it there instead of teleporting to the identity
+    ///   rest position.
+    /// - **Re-entering `Working`**: keep `frozen_x` (the rest spot it walks out
+    ///   from) but re-stamp `settled_at_ms = now_ms`, so `motion` eases it out
+    ///   from there starting now rather than snapping onto the free cycle. A
+    ///   member with no anchor (never observed resting) stays on the plain
+    ///   cycle — nothing to walk out from.
+    ///
+    /// A transition between two non-`Working` statuses leaves an existing anchor
+    /// untouched (it persists until the member works again). A member's
+    /// first-ever appearance already non-`Working` has no anchor to capture —
+    /// accepted per-pane cosmetic tradeoff: a pane that only sees the member
+    /// post-transition can't know where it was, so it falls back to the identity
+    /// rest position, same as before anchors existed.
     pub fn reconcile(
         &mut self,
         agents: &[Agent],
@@ -72,13 +79,25 @@ impl Herd {
                         to: a.agent_status,
                     });
                     if p.status == AgentStatus::Working {
-                        let (frozen_x, _facing_left) = wander_position(&p.terminal_id, now_ms);
+                        // Leaving Working: freeze at exactly where it is on
+                        // screen this instant — the resume ease means that's
+                        // not necessarily the raw cycle position, so sample it
+                        // through the same helper `motion::animate` draws with.
+                        let (frozen_x, _facing, _moving) =
+                            working_position(&p.terminal_id, now_ms, p.anchor);
                         p.anchor = Some(Anchor {
                             frozen_x,
                             settled_at_ms: now_ms,
                         });
                     } else if a.agent_status == AgentStatus::Working {
-                        p.anchor = None;
+                        // Entering Working: keep the rest spot but restamp the
+                        // instant, so `motion` eases the member out from there
+                        // starting now. No prior anchor (a pane that never saw
+                        // it rest) leaves it on the plain cycle — nothing to
+                        // walk out from.
+                        if let Some(anchor) = p.anchor.as_mut() {
+                            anchor.settled_at_ms = now_ms;
+                        }
                     }
                 }
                 p.status = a.agent_status;
@@ -343,17 +362,69 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_clears_the_anchor_on_re_entering_working() {
+    fn reconcile_restamps_the_anchor_on_re_entering_working_to_start_the_ease() {
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
-        assert!(h.members[0].anchor.is_some());
+        let resting = h.members[0].anchor.expect("anchored on leaving Working");
 
-        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 2_000);
+        // Re-entering Working keeps the rest position (there's nothing to walk
+        // out FROM otherwise) but restamps the instant, so `motion` eases the
+        // member out from that spot starting now instead of clearing it and
+        // teleporting onto the free cycle.
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 8_000);
+        let resumed = h.members[0]
+            .anchor
+            .expect("anchor kept for the resume ease");
+        assert_eq!(resumed.frozen_x, resting.frozen_x, "keeps where it rested");
+        assert_eq!(
+            resumed.settled_at_ms, 8_000,
+            "restamps to the resume instant so the ease starts now"
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_a_never_rested_member_unanchored_on_entering_working() {
+        // A member first seen already Idle has no rest anchor; resuming Working
+        // has nothing to ease out from, so it stays unanchored (plain cycle) —
+        // the same per-pane fallback the leave-anchor makes.
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 0);
+        assert_eq!(h.members[0].anchor, None);
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 5_000);
         assert_eq!(
             h.members[0].anchor, None,
-            "re-entering Working clears the anchor"
+            "no rest spot to walk out from -> stays on the plain cycle"
         );
+    }
+
+    #[test]
+    fn reconcile_freezes_at_the_visible_eased_position_when_leaving_working_mid_resume() {
+        // Idle -> Working starts a ~1s ease out from the rest spot; going Idle
+        // again mid-ease must freeze at where the member VISUALLY is (partway
+        // out), not snap to the raw free-cycle position it hasn't reached yet.
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 1_000);
+        let rest_x = h.members[0].anchor.unwrap().frozen_x;
+
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 8_000); // resume
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 8_300); // settle 300ms in
+        let frozen = h.members[0].anchor.unwrap();
+
+        let (eased_x, _, _) = crate::motion::working_position(
+            "a",
+            8_300,
+            Some(Anchor {
+                frozen_x: rest_x,
+                settled_at_ms: 8_000,
+            }),
+        );
+        assert_eq!(
+            frozen.frozen_x, eased_x,
+            "freezes at the on-screen eased position, not the raw cycle"
+        );
+        assert_eq!(frozen.settled_at_ms, 8_300);
     }
 
     #[test]

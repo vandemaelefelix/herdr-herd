@@ -232,3 +232,60 @@ redirects the old URL, but `build.sh`'s hardcoded slug and the README install
 one-liner assume the new name), and rename the local working directory. Done
 pre-release (v0.1.0 unshipped), so the config-key/action-id/env-var changes break
 no installed users.
+
+## 2026-07-27 — Resume-Working ease: stop the position teleport when a sheep starts working again
+
+**Finding:** the maintainer noticed a sheep's position jumps suddenly on a status
+change. The existing `Anchor` (see the 2026-07-27 deterministic-animation entry
+and the anchor already in `motion.rs`) only handled *leaving* `Working` — it
+freezes a settling sheep in place instead of teleporting it to the identity rest
+spot. But *re-entering* `Working` **cleared** the anchor, and
+`motion::animate` then placed the sheep at `wander_segment(u)`, where `u` is a
+pure function of absolute wall-clock time. That free-running cycle bears no
+relation to where the sheep was resting, so the instant it resumed work it
+snapped to wherever the global amble clock happened to be — the teleport the
+maintainer saw. (Working→Idle itself was already jump-free; the visible jump is
+on the round-trip, when work resumes.)
+
+**Options considered:** (a) *walk out from the rest spot* — anchor the wander
+cycle's origin to the resume position/instant (a full mirror of the leave-anchor).
+Smoothest, but reintroduces per-pane state into the cycle itself and breaks the
+strict cross-pane agreement the deterministic-animation redesign exists to
+protect. (b) *ease from rest into the cycle* — keep the stateless global cycle,
+but blend `frozen_x → wander_segment(now)` over ~1s using the (re-stamped)
+anchor, then hand off to the plain cycle. (c) leave it — rejected, it's a real
+visible glitch.
+
+**Decision (maintainer chose): option (b).** On re-entering `Working`,
+`Herd::reconcile` now **keeps** `frozen_x` (the rest spot) and **re-stamps**
+`settled_at_ms` to the resume instant instead of clearing the anchor. A new
+shared `motion::working_position(terminal_id, now_ms, anchor)` computes the
+Working position for both `animate` (draw) and `reconcile` (leave-capture): it's
+the plain wander cycle, `smoothstep`-blended out from `frozen_x` for the first
+`RESUME_EASE_MS` (~1s) after resuming. It's C0-continuous at both ends — exactly
+`frozen_x` at the resume instant (matches the last idle frame, so no jump) and
+exactly the free cycle once the window elapses. During the ease the sheep faces
+its travel direction and cycles its legs, so it reads as walking out, not sliding.
+
+**Trade-offs, deliberately accepted:**
+- **Cross-pane divergence during the ~1s ease.** A pane that observed the resume
+  shows the walk-out; a fresh/late-attached pane (no anchor) shows the plain
+  cycle from the first frame with no ease-in. This is the *same* class of
+  per-pane cosmetic tradeoff the leave-anchor already makes, and it is bounded:
+  because the ease hands back to the stateless cycle after `RESUME_EASE_MS`, all
+  panes re-converge exactly once the window elapses. The core "every pane agrees"
+  invariant holds in steady state; only the ~1s transient can differ.
+- **Anchor is now dual-purpose.** The same `Anchor` means "frozen here" while
+  non-Working and "easing out from here" while Working; `animate` disambiguates
+  by status. Documented on the `Anchor` type and `reconcile`.
+- **Facing may flip once at resume** (ease uses the travel direction, which can
+  differ from the idle rest facing). Accepted: a single facing flip is far less
+  jarring than the position teleport it replaces, and no worse than before.
+
+**Verification:** TDD, red-then-green. New unit tests: `motion` — resume starts
+at the rest spot, and converges back to the plain cycle after the window; `herd`
+— re-stamp-not-clear on resume, unanchored-stays-unanchored, and (the reason for
+the shared helper) leaving Working *mid-ease* freezes at the on-screen eased
+position, not the raw cycle. The pre-existing `reconcile_clears_the_anchor…`
+test was updated to the new re-stamp behavior. Gate green: 232 tests, clippy
+clean, fmt clean.
