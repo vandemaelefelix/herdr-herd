@@ -109,15 +109,18 @@ impl SocketClient for RealSocket {
 /// `params.subscriptions` is required and each entry is an internally-tagged
 /// enum keyed by `type` (dotted names). We subscribe to the **global**
 /// structural events that signal the herd changed — panes/agents appearing,
-/// disappearing, or being detected — so the watcher refetches promptly. Pure
-/// status transitions (`idle`↔`working`↔`blocked`↔`done`) arrive only via the
-/// per-pane `pane.agent_status_changed` subscription (which requires a
-/// `pane_id`), so those are covered here by the watcher's slow poll rather than
-/// by an event. On connect herdr also replays current state, giving an
-/// immediate structural snapshot. (Stream event names use underscores, e.g.
-/// `pane_created`; the watcher ignores event contents and just refetches.)
+/// disappearing, or being detected — plus the **focus** events
+/// (`pane.focused`/`tab.focused`/`workspace.focused`) so the "active" hat
+/// tracks the focused agent promptly instead of lagging up to a slow-poll
+/// interval behind it. Pure status transitions
+/// (`idle`↔`working`↔`blocked`↔`done`) arrive only via the per-pane
+/// `pane.agent_status_changed` subscription (which requires a `pane_id`), so
+/// those are still covered by the watcher's slow poll rather than by an event.
+/// On connect herdr also replays current state, giving an immediate structural
+/// snapshot. (Stream event names use underscores, e.g. `pane_created`; the
+/// watcher ignores event contents and just refetches.)
 pub fn subscribe_request() -> String {
-    r#"{"id":"members","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"}]}}"#.to_string()
+    r#"{"id":"members","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.focused"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"},{"type":"tab.focused"},{"type":"workspace.focused"}]}}"#.to_string()
 }
 
 #[cfg(test)]
@@ -158,6 +161,12 @@ mod tests {
         let s = subscribe_request();
         assert!(s.contains("events.subscribe"));
         assert!(!s.contains('\n'));
+        // The focus event is what keeps the "active" hat in sync; without it,
+        // focus changes only surface on the slow poll (up to seconds late).
+        assert!(
+            s.contains(r#"{"type":"pane.focused"}"#),
+            "must subscribe to pane.focused so the active hat updates promptly"
+        );
     }
 
     #[test]

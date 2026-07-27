@@ -25,7 +25,7 @@ use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
-use crate::member::priority;
+use crate::member::{Member, priority};
 use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::sprite::{Frame as SpriteFrame, Role, Species};
@@ -640,6 +640,14 @@ pub fn run(
     result
 }
 
+/// The hover caption for the current cursor position: the hovered member's
+/// label when the cursor is over one (`hit`), or `None` over empty strip.
+/// Clearing on empty is deliberate — the name vanishes when you're not on a
+/// sheep, rather than sticking at the last one shown.
+fn next_hover(hit: Option<usize>, members: &[Member]) -> Option<String> {
+    hit.map(|i| members[i].label.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
@@ -696,17 +704,12 @@ where
                 }
                 Event::Mouse(MouseEvent { kind, column, .. }) => match kind {
                     MouseEventKind::Moved => {
-                        // Sticky hover: only update the caption when the cursor
-                        // is actually over a sheep, and otherwise keep the last
-                        // one shown. The sheep are small and sparse, so clearing
-                        // on every gap between them made the name flash on then
-                        // vanish as the mouse moved; now it stays put, top-right,
-                        // until you hover a different sheep.
-                        if let Some(i) =
-                            renderer.member_at_column(&herd, species, strip_w, column, now_ms)
-                        {
-                            hovered = Some(herd.members[i].label.clone());
-                        }
+                        // Follow the cursor: show the hovered member's name, and
+                        // clear it when the cursor is over empty strip — so the
+                        // caption disappears when you're not on a sheep.
+                        let hit =
+                            renderer.member_at_column(&herd, species, strip_w, column, now_ms);
+                        hovered = next_hover(hit, &herd.members);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
@@ -772,6 +775,23 @@ mod tests {
             .collect();
         h.reconcile(&agents, 1, NOW_MS);
         h
+    }
+
+    #[test]
+    fn hover_caption_follows_the_cursor_and_clears_over_empty_strip() {
+        let herd = fixed_herd(&[AgentStatus::Idle, AgentStatus::Working]);
+        // Over a member: its label is shown.
+        assert_eq!(
+            next_hover(Some(1), &herd.members),
+            Some(herd.members[1].label.clone())
+        );
+        // Over empty strip: the caption clears. Regression guard — a "sticky"
+        // hover that kept the last name here is the bug this restores.
+        assert_eq!(
+            next_hover(None, &herd.members),
+            None,
+            "moving off all sheep must hide the name"
+        );
     }
 
     #[test]
