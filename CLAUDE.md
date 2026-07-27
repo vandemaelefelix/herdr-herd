@@ -1,6 +1,6 @@
-# herdr-pets — project conventions
+# herdr-herd — project conventions
 
-A herdr plugin that gives every agent a pixel-art pet. See [`GOAL.md`](GOAL.md)
+A herdr plugin that gives every agent a pixel-art sheep. See [`GOAL.md`](GOAL.md)
 (north star + locked decisions), [`docs/PLAN.md`](docs/PLAN.md) (phase roadmap),
 and per-phase specs in `docs/superpowers/specs/`.
 
@@ -19,7 +19,7 @@ Always branch off `main`; never commit directly to `main`.
 
 `<type>(<optional-scope>): <description>` — e.g.
 `docs(phase-0): add foundations & spikes design spec`,
-`feat(render): draw agent list in the pets pane`,
+`feat(render): draw agent list in the herd pane`,
 `chore: scaffold cargo project`.
 
 - Same type vocabulary as branches, plus `build`, `style`, `revert`.

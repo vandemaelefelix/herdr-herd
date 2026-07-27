@@ -194,3 +194,41 @@ source-build fallback, still a working install where Rust is present.
 **Manual maintainer step:** cutting the tag/release is done by the human (repo
 convention: no autonomous commits/pushes) — see the release checklist in the
 plan.
+
+## 2026-07-27 — Rename: herdr-pets → herdr-herd, "pet" → herd/sheep
+
+**Decision:** Rename the project from `herdr-pets` to `herdr-herd`. The product
+is about *herding your herd of agents* and making it visual (a flock of sheep),
+not about "pets." Two layers changed together:
+
+- **Package/repo:** crate/binary `herdr-pets` → `herdr-herd`, lib ident
+  `herdr_pets` → `herdr_herd`, env vars `HERDR_PETS_*` → `HERDR_HERD_*`, release
+  asset/download slug, manifest `id`/`name`. `release.yml` publishes under the
+  dynamic `$GITHUB_REPOSITORY`, so it tracks the repo rename automatically;
+  `build.sh`'s download URL hardcodes `vandemaelefelix/herdr-herd`.
+- **Domain/concept:** the individual-unit type `Pet` → `Member`
+  (`src/pet.rs` → `src/member.rs`, `pets: Vec<Pet>` → `members: Vec<Member>`),
+  config key `pet_scale` → `member_scale`. `Herd` stays the collection type. UI
+  framing moves to "herd": pane id/title `pets`/`"Pets"` → `herd`/`"Herd"`,
+  actions `place-pets`/`start-pets-controller` → `place-herd`/`start-herd-controller`,
+  the strip is a "herd strip," and the pane-label recognizer tracks `"Herd"`.
+  Living docs (README, GOAL, CLAUDE) reframe the flavor to sheep — and the README
+  now truthfully names the two shipped species (sheep + goat) instead of the old
+  aspirational list.
+
+**Chosen noun (`Member` over `Sheep`):** `Herd` was already the collection type,
+so the unit needed a new word. `Member` is generic and survives future non-sheep
+sprites; "sheep" stays as flavor in prose. Insta snapshot files were renamed to
+the new crate prefix (and one test name `..._focused_pet_...` → `..._focused_member_...`).
+
+**Scope:** code, config, and living docs were renamed. Dated design artifacts
+(`docs/superpowers/**`, handoffs, `docs/PLAN.md`, earlier entries in this file)
+keep `herdr-pets` as an honest historical record of the name at the time. The
+`.claude/skills/**` example paths were left as-is.
+
+**Manual maintainer steps (outward-facing, not done by the agent):** rename the
+GitHub repo `vandemaelefelix/herdr-pets` → `vandemaelefelix/herdr-herd` (GitHub
+redirects the old URL, but `build.sh`'s hardcoded slug and the README install
+one-liner assume the new name), and rename the local working directory. Done
+pre-release (v0.1.0 unshipped), so the config-key/action-id/env-var changes break
+no installed users.
