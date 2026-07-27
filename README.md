@@ -5,11 +5,6 @@ sidebar gets its own colored, pixelated pet in a slim strip along the bottom of
 every tab. Each pet's behavior reflects its agent's live state — so you can feel
 the state of your whole fleet at a glance, without reading a thing.
 
-> Status: **in design.** This README describes what herdr-pets is meant to be.
-> The project's north star lives in [GOAL.md](GOAL.md), the phased roadmap in
-> [docs/PLAN.md](docs/PLAN.md); each phase's detailed design + plan land in
-> `docs/superpowers/specs/`.
-
 <!-- ![herdr-pets: a slim strip of pixel pets along the bottom of a herdr tab](assets/strip.png) -->
 
 ## What it is
@@ -59,15 +54,38 @@ Both read state from herdr's socket API; herdr is the single source of truth.
 ## Install
 
 ```sh
-# For local development, from a checkout of this repo:
-herdr plugin link .
-
-# From the plugin registry (release): builds from source via this repo's
-# `[[build]]` step in herdr-plugin.toml.
-herdr plugin install <owner>/herdr-pets
+herdr plugin install vandemaelefelix/herdr-pets
 ```
 
-herdr-pets requires **herdr ≥ 0.7.0**.
+That's it. herdr fetches a **prebuilt binary** for your platform (macOS on Apple
+Silicon or Intel, Linux on x86-64 or arm64) — **no Rust toolchain required**. On
+any other platform it falls back to building from source with `cargo`, so the
+install still succeeds wherever Rust is available.
+
+Requires **herdr ≥ 0.7.0**.
+
+To pin a specific version, pass a tag: `herdr plugin install
+vandemaelefelix/herdr-pets --ref v0.1.0`.
+
+### From a local checkout (development)
+
+```sh
+herdr plugin link .
+```
+
+## Quickstart
+
+After installing, start the watchdog once — it keeps a pets strip present in
+every eligible tab:
+
+```sh
+herdr plugin action invoke herdr-pets start-pets-controller
+```
+
+(herdr fires no plugin-start hook, so the watchdog doesn't auto-start on a fresh
+session — run this once per session, or from herdr's action picker.) For a
+one-off strip in just the current tab, use the **`place-pets`** action instead.
+See [Usage](#usage) for the difference between the two.
 
 ## Usage
 
@@ -178,4 +196,4 @@ Details will follow in the spec and `CONTRIBUTING`.
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
