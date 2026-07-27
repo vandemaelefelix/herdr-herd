@@ -1,9 +1,11 @@
-# herdr-herd
+# 🐑 herdr-herd
 
-**Herd your herd of agents.** Every agent in herdr's sidebar becomes a colored,
-pixel-art sheep in a slim strip along the bottom of every tab. Each sheep's
-behavior reflects its agent's live state — so you can feel the state of your
-whole flock at a glance, without reading a thing.
+**Herd your herd.** Every AI agent in herdr becomes a pixel-art sheep grazing
+along the bottom of your terminal — dozing when idle, sprinting when working, and
+turning red and stamping when it's blocked and needs you. Your whole fleet's
+state, felt at a glance.
+
+> Your terminal already knows which agents need you. Now you can feel it.
 
 <!-- ![herdr-herd: a slim strip of pixel sheep along the bottom of a herdr tab](assets/strip.png) -->
 
