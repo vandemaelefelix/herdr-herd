@@ -64,16 +64,18 @@ build_from_source() {
 [ -n "$url" ] || build_from_source
 
 echo "herdr-pets: fetching prebuilt $target" >&2
-mkdir -p "$BIN_DIR"
 tmp="$DEST.download"
-if curl -fsSL "$url" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-  chmod +x "$tmp"
-  mv "$tmp" "$DEST"
-  # Trust the binary only if it actually runs on this machine.
-  if "$DEST" --version >/dev/null 2>&1; then
-    echo "herdr-pets: installed prebuilt binary" >&2
-    exit 0
-  fi
+# Every step guarded: any failure short-circuits to the source build rather
+# than aborting under `set -e`. Verify the download runs on THIS machine
+# before moving it into place, so a broken binary never lands at $DEST.
+if mkdir -p "$BIN_DIR" \
+  && curl -fsSL "$url" -o "$tmp" 2>/dev/null \
+  && [ -s "$tmp" ] \
+  && chmod +x "$tmp" \
+  && "$tmp" --version >/dev/null 2>&1 \
+  && mv "$tmp" "$DEST"; then
+  echo "herdr-pets: installed prebuilt binary" >&2
+  exit 0
 fi
 rm -f "$tmp"
 echo "herdr-pets: prebuilt unavailable, falling back to source build" >&2
