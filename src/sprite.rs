@@ -1,13 +1,13 @@
 //! Sprite data format: role-painted text, one file per animal, all five states
 //! and their frames inside. Roles (not colors) so tinting + theming are free.
-//! Loaded embedded by default; `$HERDR_PETS_SPRITES` overrides by name.
+//! Loaded embedded by default; `$HERDR_HERD_SPRITES` overrides by name.
 
 use std::collections::BTreeMap;
 
 use crate::agent::AgentStatus;
 use crate::anim::{MotionSpec, OverlaySpec, parse_motion, parse_overlay};
 
-/// A legend symbol's meaning: what part of the pet a pixel paints.
+/// A legend symbol's meaning: what part of the member a pixel paints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Transparent,
@@ -229,10 +229,10 @@ pub fn embedded_species() -> Vec<Species> {
         .collect()
 }
 
-/// Embedded species, with any `$HERDR_PETS_SPRITES/*.sprite` overriding by name.
+/// Embedded species, with any `$HERDR_HERD_SPRITES/*.sprite` overriding by name.
 pub fn load_species() -> Vec<Species> {
     let mut out = embedded_species();
-    if let Some(dir) = std::env::var_os("HERDR_PETS_SPRITES")
+    if let Some(dir) = std::env::var_os("HERDR_HERD_SPRITES")
         && let Ok(entries) = std::fs::read_dir(&dir)
     {
         for e in entries.flatten() {
@@ -248,7 +248,7 @@ pub fn load_species() -> Vec<Species> {
                     out.retain(|x| x.name != sp.name);
                     out.push(sp);
                 }
-                Err(err) => eprintln!("herdr-pets: skipping sprite {path:?}: {err}"),
+                Err(err) => eprintln!("herdr-herd: skipping sprite {path:?}: {err}"),
             }
         }
     }
@@ -294,7 +294,7 @@ mod tests {
         use crate::anim::motion_offset;
 
         // Every shipped species must get the real-hop treatment, not just
-        // Sheep — a pet's species is identity-hashed per agent, so any
+        // Sheep — a member's species is identity-hashed per agent, so any
         // species left on the old near-duplicate frames silently ships a
         // broken-looking hop for whichever agents land on it.
         for species in embedded_species() {

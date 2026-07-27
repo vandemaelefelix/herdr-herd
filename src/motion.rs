@@ -1,33 +1,33 @@
-//! Deterministic, clockwork animation: every pet's position and pose is a
+//! Deterministic, clockwork animation: every member's position and pose is a
 //! **pure function** of `(terminal_id, status, state config, wall-clock time)`
 //! — no accumulated per-process state, no randomness, no coordination between
-//! panes. Any two `herdr-pets render` processes (one per tab/pane) calling
+//! panes. Any two `herdr-herd render` processes (one per tab/pane) calling
 //! [`animate`] for the same agent at the same real moment get the identical
-//! result, so the same agent's pet reads as the same pet wherever you look at
+//! result, so the same agent's member reads as the same member wherever you look at
 //! it — the whole point, since each pane is otherwise a fully independent
 //! process with no shared memory.
 //!
 //! This replaces the old model (an RNG-driven random walk in `Herd::step`,
-//! accumulated into `Pet.x`/`Pet.phase`): that was process-local state, so two
+//! accumulated into `Member.x`/`Member.phase`): that was process-local state, so two
 //! panes' independent RNG streams drifted apart from the first tick (real
-//! per-process tick timing, not the shared seed, decided the outcome). A pet's
+//! per-process tick timing, not the shared seed, decided the outcome). A member's
 //! "personality" (wander phase/speed, rest position, animation offset) is
 //! instead derived once per call from [`crate::identity::unit_hash`], keyed by
 //! its `terminal_id` — stable, and identical everywhere it's computed.
 //!
-//! Trade-off: the old pairwise "nudge working pets apart so they don't
+//! Trade-off: the old pairwise "nudge working members apart so they don't
 //! overlap" behavior is gone. It depended on the *current set of visible
-//! pets*, which differs per pane (different tab widths -> different overflow
+//! members*, which differs per pane (different tab widths -> different overflow
 //! capacity) — keeping it would have reintroduced the exact per-pane
 //! divergence this module exists to remove. Occasional brief overlap between
-//! two working pets is the accepted cost.
+//! two working members is the accepted cost.
 
 use crate::agent::AgentStatus;
 use crate::anim::{Offset, icon_wave_offset, motion_offset};
 use crate::identity::unit_hash;
 use crate::sprite::StateSpec;
 
-/// A full walk-out-and-back cycle for a wandering (working) pet. Slow enough
+/// A full walk-out-and-back cycle for a wandering (working) member. Slow enough
 /// to stay easily clickable, per the herd's original design intent — a
 /// gentle amble, not a run.
 const WANDER_PERIOD_MS: f64 = 60_000.0;
@@ -38,25 +38,25 @@ const WANDER_PERIOD_MS: f64 = 60_000.0;
 /// plus one pause is exactly half the cycle (there and back).
 const WALK_FRACTION: f64 = 0.45;
 /// Fraction of the period spent paused at *one* end. Short relative to
-/// `WALK_FRACTION`, so a working pet spends far more of its time walking
+/// `WALK_FRACTION`, so a working member spends far more of its time walking
 /// than standing still, and never stands still for long.
 const PAUSE_FRACTION: f64 = 0.05;
 
-/// Icon float cycle, matching the old `Pet::ICON_CYCLE_MS`.
+/// Icon float cycle, matching the old `Member::ICON_CYCLE_MS`.
 const ICON_CYCLE_MS: f64 = 1800.0;
 
-/// Where a pet was, and when, the instant it last left `Working` — captured
+/// Where a member was, and when, the instant it last left `Working` — captured
 /// by `Herd::reconcile` and threaded into [`animate`] so a Working->non-Working
-/// transition freezes the pet in place instead of teleporting it to the
-/// identity-derived rest position. `None` means this pet has never been
+/// transition freezes the member in place instead of teleporting it to the
+/// identity-derived rest position. `None` means this member has never been
 /// observed making that transition (a fresh or late-attached pane), in which
 /// case `animate` falls back to the old identity-derived rest position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Anchor {
-    /// `x_fraction` sampled from `wander_position` at the instant this pet
+    /// `x_fraction` sampled from `wander_position` at the instant this member
     /// left `Working`.
     pub frozen_x: f32,
-    /// `now_ms` at the instant this pet left `Working`.
+    /// `now_ms` at the instant this member left `Working`.
     pub settled_at_ms: u64,
 }
 
@@ -65,9 +65,9 @@ pub struct Anchor {
 /// design brief, then holds on the last (fully-dozing) frame indefinitely.
 const SETTLE_DURATION_MS: f64 = 1_000.0;
 
-/// A wandering (`Working`) pet's horizontal position/facing at `now_ms` — the
+/// A wandering (`Working`) member's horizontal position/facing at `now_ms` — the
 /// same computation [`animate`] uses for its `x_fraction`/`facing_left`,
-/// factored out so `Herd::reconcile` can sample "where was this pet when it
+/// factored out so `Herd::reconcile` can sample "where was this member when it
 /// stopped working" without needing a `StateSpec` (position never depends on
 /// which sprite frames a species has).
 pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
@@ -79,7 +79,7 @@ pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
     (x_fraction, facing_left)
 }
 
-/// A pet's fully-resolved, ready-to-draw state at one instant.
+/// A member's fully-resolved, ready-to-draw state at one instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Animated {
     /// Horizontal position as a fraction of the walkable width (`0.0..1.0`).
@@ -90,9 +90,9 @@ pub struct Animated {
     pub offset: Offset,
     /// Which of the state's frames to draw (walk-cycle leg swap etc.).
     pub frame_index: usize,
-    /// `true` if the pet is facing/moving left.
+    /// `true` if the member is facing/moving left.
     pub facing_left: bool,
-    /// `true` if `x_fraction` is currently changing (a working pet mid-walk,
+    /// `true` if `x_fraction` is currently changing (a working member mid-walk,
     /// as opposed to paused at one end of its amble). Gates the walk-cycle
     /// leg animation below — see `animate`.
     pub moving: bool,
@@ -133,7 +133,7 @@ fn wander_segment(u: f64) -> (f32, bool, bool) {
 
 /// Resolve `terminal_id`'s animated state for `status`/`state` at `now_ms`
 /// (milliseconds since the Unix epoch, or `0` under reduced motion — see
-/// `render::run_loop`). `anchor` is this pet's freeze anchor from
+/// `render::run_loop`). `anchor` is this member's freeze anchor from
 /// `Herd::reconcile` (see [`Anchor`]), or `None` if it's never been observed
 /// leaving `Working`. Pure: same inputs, same output, always.
 pub fn animate(
@@ -145,16 +145,16 @@ pub fn animate(
 ) -> Animated {
     let (x_fraction, facing_left, moving) = if status == AgentStatus::Working {
         let phase0 = unit_hash("wander-phase", terminal_id) as f64;
-        // +/-25% period variation so working pets don't all sweep in lockstep.
+        // +/-25% period variation so working members don't all sweep in lockstep.
         let period_ms =
             WANDER_PERIOD_MS * (0.75 + 0.5 * unit_hash("wander-period", terminal_id) as f64);
         let u = ((now_ms as f64 / period_ms) + phase0).rem_euclid(1.0);
         wander_segment(u)
     } else {
         let rest_facing_left = unit_hash("rest-facing", terminal_id) < 0.5;
-        // Freeze in place at the anchor captured when this pet left Working —
+        // Freeze in place at the anchor captured when this member left Working —
         // no teleport to the identity rest spot. `Unknown` is exempted (stays
-        // on the plain identity rest-x, unchanged) and a pet with no anchor
+        // on the plain identity rest-x, unchanged) and a member with no anchor
         // (never observed leaving Working) falls back to that same rest-x.
         let rest = if status != AgentStatus::Unknown {
             anchor.map(|a| a.frozen_x)
@@ -198,7 +198,7 @@ pub fn animate(
         frame_count - 1
     } else if status == AgentStatus::Idle {
         // One-shot "settle" (stand -> lie down): steps through the idle
-        // state's frames once, driven by time since this pet's anchor was
+        // state's frames once, driven by time since this member's anchor was
         // captured, then holds on the last (fully-dozing) frame. No anchor
         // (never observed settling) skips straight to that resting frame —
         // there is no reference instant to animate the lie-down from.
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn working_pets_wander_over_time() {
+    fn working_members_wander_over_time() {
         let st = state(AgentStatus::Working);
         let a = animate("term_x", AgentStatus::Working, &st, 0, None);
         let b = animate("term_x", AgentStatus::Working, &st, 5_000, None);
@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn non_working_pets_hold_a_fixed_position_over_time() {
+    fn non_working_members_hold_a_fixed_position_over_time() {
         for status in [
             AgentStatus::Idle,
             AgentStatus::Done,
@@ -369,7 +369,7 @@ mod tests {
             } else {
                 assert_eq!(
                     a.frame_index, planted,
-                    "paused pet must hold the planted (standing) frame, ms={ms}"
+                    "paused member must hold the planted (standing) frame, ms={ms}"
                 );
                 saw_paused_instant = true;
             }
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn anchored_non_working_pet_freezes_at_the_anchor_instead_of_teleporting() {
+    fn anchored_non_working_member_freezes_at_the_anchor_instead_of_teleporting() {
         let anchor = Anchor {
             frozen_x: 0.37,
             settled_at_ms: 1_000,
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn unanchored_non_working_pet_falls_back_to_the_identity_rest_x() {
+    fn unanchored_non_working_member_falls_back_to_the_identity_rest_x() {
         let st = state(AgentStatus::Idle);
         let with_none = animate("term_x", AgentStatus::Idle, &st, 1_000, None);
         let without_arg = animate("term_x", AgentStatus::Idle, &st, 60_000, None);
@@ -531,8 +531,8 @@ mod tests {
     }
 
     #[test]
-    fn idle_settle_sequence_is_relative_to_when_this_pet_settled() {
-        // Two pets settling at different wall-clock instants must each play
+    fn idle_settle_sequence_is_relative_to_when_this_member_settled() {
+        // Two members settling at different wall-clock instants must each play
         // their own ~1s settle from their own settled_at_ms, not from t=0.
         let st = sheep_idle_state();
         let doze = st.frames.len() - 1;
@@ -574,14 +574,14 @@ mod tests {
 
     #[test]
     fn non_working_states_keep_animating_regardless_of_the_moving_gate() {
-        // Non-working pets never wander (`moving` is always false for them),
+        // Non-working members never wander (`moving` is always false for them),
         // but their own motion (bounce/breathe/hop/sway) must still animate
         // freely on its own clock — the `moving` gate only freezes Working's
         // walk cycle.
         let st = state(AgentStatus::Blocked); // frame_ms=110, motion=bounce
         let a = animate("term_x", AgentStatus::Blocked, &st, 0, None);
         let b = animate("term_x", AgentStatus::Blocked, &st, 55, None);
-        assert!(!a.moving && !b.moving, "non-working pets never wander");
+        assert!(!a.moving && !b.moving, "non-working members never wander");
         assert_ne!(
             a.offset, b.offset,
             "blocked's bounce motion must keep animating regardless of the moving gate"

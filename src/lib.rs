@@ -1,4 +1,4 @@
-//! herdr-pets — a herd of pixel-art pets for your herdr agents.
+//! herdr-herd — a herd of pixel-art sheep for your herdr agents, one per agent.
 //!
 //! Phase 0: foundations. Modules are added task-by-task.
 
@@ -15,9 +15,9 @@ pub mod identity;
 pub mod kitty;
 pub mod kitty_render;
 pub mod lock;
+pub mod member;
 pub mod motion;
 pub mod palette;
-pub mod pet;
 pub mod place;
 pub mod raster;
 pub mod render;

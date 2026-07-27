@@ -12,7 +12,7 @@ pub struct Rgba {
 }
 
 /// Turn `frame` into RGBA at `scale` px per sprite pixel. `flip` mirrors on x
-/// (so a pet can face left). Transparent roles get alpha 0.
+/// (so a member can face left). Transparent roles get alpha 0.
 pub fn rasterize(
     frame: &Frame,
     hue: u16,

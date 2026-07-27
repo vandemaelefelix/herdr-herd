@@ -1,20 +1,20 @@
 [package]
-name = "herdr-pets"
+name = "herdr-herd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A herd of pixel-art pets for your herdr agents."
 license = "MIT"
-repository = "https://github.com/vandemaelefelix/herdr-pets"
+repository = "https://github.com/vandemaelefelix/herdr-herd"
 keywords = ["herdr", "tui", "ratatui", "agents"]
 categories = ["command-line-utilities"]
 
 [lib]
-name = "herdr_pets"
+name = "herdr_herd"
 path = "src/lib.rs"
 
 [[bin]]
-name = "herdr-pets"
+name = "herdr-herd"
 path = "src/main.rs"
 
 [dependencies]

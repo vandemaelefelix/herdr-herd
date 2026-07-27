@@ -55,10 +55,10 @@ mod tests {
     fn parses_workspace_labels_by_id() {
         let j = r#"{"result":{"workspaces":[
             {"workspace_id":"w1","label":"vbrb-pinb","number":1},
-            {"workspace_id":"w1T","label":"herdr-pets","number":5}]}}"#;
+            {"workspace_id":"w1T","label":"herdr-herd","number":5}]}}"#;
         let m = parse_workspace_labels(j);
         assert_eq!(m.get("w1").map(String::as_str), Some("vbrb-pinb"));
-        assert_eq!(m.get("w1T").map(String::as_str), Some("herdr-pets"));
+        assert_eq!(m.get("w1T").map(String::as_str), Some("herdr-herd"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! One pet: identity, live status, label, and focus. Priority drives both
+//! One member: identity, live status, label, and focus. Priority drives both
 //! draw order (z-index) and overflow selection. Position and animation are
 //! *not* stored here — they're resolved fresh every draw by
 //! `motion::animate`, a pure function of `(terminal_id, status, wall-clock
@@ -21,19 +21,19 @@ pub fn priority(status: AgentStatus) -> u8 {
     }
 }
 
-/// One pet: a stable identity plus the live status/label the herd simulation
+/// One member: a stable identity plus the live status/label the herd simulation
 /// updates on reconcile.
 #[derive(Debug, Clone)]
-pub struct Pet {
+pub struct Member {
     pub terminal_id: String,
     pub identity: Identity,
     pub status: AgentStatus,
     pub label: String,
-    /// Mirrors `Agent::focused`: this pet's owning agent is the current one,
+    /// Mirrors `Agent::focused`: this member's owning agent is the current one,
     /// so the renderer draws a focus hat on it. Set by `Herd::reconcile`, not
-    /// derived here — `Pet` has no access to the agent snapshot.
+    /// derived here — `Member` has no access to the agent snapshot.
     pub focused: bool,
-    /// Where/when this pet was last seen leaving `Working`, threaded into
+    /// Where/when this member was last seen leaving `Working`, threaded into
     /// `motion::animate` so a Working->non-Working transition freezes it in
     /// place instead of teleporting to the identity rest position. `None`
     /// until `Herd::reconcile` observes that transition; cleared again on
@@ -41,8 +41,8 @@ pub struct Pet {
     pub anchor: Option<Anchor>,
 }
 
-impl Pet {
-    /// Build a pet with an empty label (filled in by `reconcile`), unfocused
+impl Member {
+    /// Build a member with an empty label (filled in by `reconcile`), unfocused
     /// and unanchored until `Herd::reconcile` says otherwise.
     pub fn new(terminal_id: String, identity: Identity, status: AgentStatus) -> Self {
         Self {
@@ -55,7 +55,7 @@ impl Pet {
         }
     }
 
-    /// This pet's current draw/overflow priority, from its live status.
+    /// This member's current draw/overflow priority, from its live status.
     pub fn z_priority(&self) -> u8 {
         priority(self.status)
     }
@@ -67,14 +67,14 @@ mod tests {
     use crate::agent::AgentStatus;
     use crate::identity::identity_for;
 
-    fn pet(status: AgentStatus) -> Pet {
-        Pet::new("term_x".into(), identity_for("term_x", 3), status)
+    fn member(status: AgentStatus) -> Member {
+        Member::new("term_x".into(), identity_for("term_x", 3), status)
     }
 
     #[test]
-    fn new_pet_starts_unfocused() {
+    fn new_member_starts_unfocused() {
         assert!(
-            !pet(AgentStatus::Idle).focused,
+            !member(AgentStatus::Idle).focused,
             "focus is only granted by Herd::reconcile, never by default"
         );
     }
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn z_priority_matches_the_free_function() {
         assert_eq!(
-            pet(AgentStatus::Blocked).z_priority(),
+            member(AgentStatus::Blocked).z_priority(),
             priority(AgentStatus::Blocked)
         );
     }

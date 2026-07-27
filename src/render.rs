@@ -25,12 +25,12 @@ use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
+use crate::member::priority;
 use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
-use crate::pet::priority;
 use crate::sprite::{Frame as SpriteFrame, Role, Species};
 
-/// Rows the focus hat occupies above a pet's head, plus the 1px hop/bounce
+/// Rows the focus hat occupies above a member's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
 pub(crate) const HAT_H: usize = 3;
 /// Columns the focus hat occupies, centered over the head anchor.
@@ -48,7 +48,7 @@ pub(crate) const HAT_FILL: Rgb = Rgb(0xd6, 0x2b, 0x2b);
 const HAT_OVERLAP: i32 = 1;
 
 /// Milliseconds since the Unix epoch — the same absolute reference on every
-/// process on this machine (all `herdr-pets render` panes run server-side, so
+/// process on this machine (all `herdr-herd render` panes run server-side, so
 /// there's no cross-machine clock-skew concern even under `herdr --remote`).
 /// This is what makes `motion::animate` agree across every independent pane.
 fn wall_clock_now_ms() -> u64 {
@@ -58,11 +58,11 @@ fn wall_clock_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Height of the pet band in pixels. Sprites are 16x14 (see sprites/*.sprite);
+/// Height of the member band in pixels. Sprites are 16x14 (see sprites/*.sprite);
 /// the band is the sprite height, plus 1px of headroom for the hop/bounce
 /// lift, plus [`HAT_H`] rows so the focus hat has room above even the tallest
 /// (standing) pose without clipping.
-pub const PET_PX_H: usize = 15 + HAT_H;
+pub const MEMBER_PX_H: usize = 15 + HAT_H;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
@@ -223,13 +223,13 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     }
 }
 
-/// Blit every visible pet's body — and, for the focused pet, its focus hat —
+/// Blit every visible member's body — and, for the focused member, its focus hat —
 /// into a fresh pixel buffer, in priority z-order (blocked draws last, i.e. on
-/// top). The hat is composited into the same buffer right after its pet's
+/// top). The hat is composited into the same buffer right after its member's
 /// body, at the same offset, so it shares the body's full transform (motion
 /// offset, bottom-anchor, facing flip) and never detaches during motion.
 /// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
-/// reduced motion) drives every pet's position/pose via `motion::animate` — a
+/// reduced motion) drives every member's position/pose via `motion::animate` — a
 /// pure function, so this is fully deterministic given the same inputs.
 /// Returns the buffer plus the visible set's z-order (draw order, lowest
 /// priority first) so the caller can reuse it for overlays without
@@ -241,29 +241,35 @@ fn build_band(
     theme: Theme,
     now_ms: u64,
 ) -> (PixelBuf, Vec<usize>) {
-    let mut buf = PixelBuf::new(strip_w, PET_PX_H);
+    let mut buf = PixelBuf::new(strip_w, MEMBER_PX_H);
 
-    let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - pet_w as f32).max(0.0);
-    let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
-    let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let max_x = (strip_w as f32 - member_w as f32).max(0.0);
+    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
+    let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
 
     // z-order: lowest priority first so blocked draws last (on top).
     let mut order = visible;
-    order.sort_by_key(|&i| priority(herd.pets[i].status));
+    order.sort_by_key(|&i| priority(herd.members[i].status));
 
     for &i in &order {
-        let pet = &herd.pets[i];
+        let member = &herd.members[i];
         let Some(sp) = species
-            .get(pet.identity.species_index)
+            .get(member.identity.species_index)
             .or_else(|| species.first())
         else {
             continue;
         };
-        let Some(state) = sp.states.get(&pet.status) else {
+        let Some(state) = sp.states.get(&member.status) else {
             continue;
         };
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
+        let animated = animate(
+            &member.terminal_id,
+            member.status,
+            state,
+            now_ms,
+            member.anchor,
+        );
         let fr = &state.frames[animated.frame_index];
         let style = StateStyle {
             dim: state.dim,
@@ -271,8 +277,8 @@ fn build_band(
         };
         let ox = (animated.x_fraction * max_x + animated.offset.dx).round() as i32;
         // Bottom-anchor: feet rest on the band floor; motion (dy<=0) lifts the
-        // pet up into the headroom above it, so a hop/bounce never clips.
-        let floor = PET_PX_H as i32 - fr.h as i32;
+        // member up into the headroom above it, so a hop/bounce never clips.
+        let floor = MEMBER_PX_H as i32 - fr.h as i32;
         let oy = floor + animated.offset.dy.round() as i32;
         for y in 0..fr.h {
             for x in 0..fr.w {
@@ -281,13 +287,14 @@ fn build_band(
                 } else {
                     x
                 };
-                if let Some(c) = role_color(fr.cells[y * fr.w + sx], pet.identity.hue, theme, style)
+                if let Some(c) =
+                    role_color(fr.cells[y * fr.w + sx], member.identity.hue, theme, style)
                 {
                     buf.set(ox + x as i32, oy + y as i32, c);
                 }
             }
         }
-        if pet.focused {
+        if member.focused {
             let (head_row, head_col) = head_anchor(fr, animated.facing_left);
             draw_hat(&mut buf, ox, oy, head_row, head_col);
         }
@@ -295,12 +302,12 @@ fn build_band(
     (buf, order)
 }
 
-/// Draw the whole strip: visible pets in priority z-order (blocked draws
-/// last, i.e. on top), their overlays (bubbles/badges), the hovered pet's
-/// caption, and a `+N` marker for any pets the strip has no room for. All of
-/// these live in a reserved top lane (`lane_y`); the pet band is drawn below
-/// it, so nothing in the lane ever covers a pet. `now_ms` (milliseconds since
-/// the Unix epoch, or a frozen value under reduced motion) drives every pet's
+/// Draw the whole strip: visible members in priority z-order (blocked draws
+/// last, i.e. on top), their overlays (bubbles/badges), the hovered member's
+/// caption, and a `+N` marker for any members the strip has no room for. All of
+/// these live in a reserved top lane (`lane_y`); the member band is drawn below
+/// it, so nothing in the lane ever covers a member. `now_ms` (milliseconds since
+/// the Unix epoch, or a frozen value under reduced motion) drives every member's
 /// position/pose via `motion::animate` — a pure function, so this is fully
 /// deterministic given the same inputs.
 pub fn draw_herd(
@@ -315,41 +322,41 @@ pub fn draw_herd(
     let strip_w = area.width as usize;
     let (buf, order) = build_band(herd, species, strip_w, theme, now_ms);
 
-    let pet_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - pet_w as f32).max(0.0);
-    let capacity = (strip_w / (pet_w * 3 / 4).max(1)).max(1);
-    let (_visible, hidden) = visible_and_hidden(&herd.pets, capacity);
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let max_x = (strip_w as f32 - member_w as f32).max(0.0);
+    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
+    let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
 
     // Bottom-align the whole strip so it reads as a slim status line whatever
     // the pane's height (herdr enforces a minimum pane height, so the pane can be
-    // taller than the content needs): the pet band bottom-aligns to the pane
+    // taller than the content needs): the member band bottom-aligns to the pane
     // floor, and the icon lane sits just above it. Any extra rows fall at the
     // top, blending with the pane above. The icon lane keeps overlays/`+N`/the
-    // caption off the pet.
-    let band_rows = PET_PX_H.div_ceil(2) as u16;
+    // caption off the member.
+    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
     let band_top = area.bottom().saturating_sub(band_rows);
     let lane_y = band_top.saturating_sub(1);
-    let pet_area = Rect {
+    let member_area = Rect {
         x: area.x,
         y: band_top,
         width: area.width,
         // Clamped so a pane shorter than the band (below herdr's enforced
-        // minimum) crops the top of the pets instead of handing
+        // minimum) crops the top of the members instead of handing
         // `draw_pixels` a Rect that overruns the real frame buffer.
         height: band_rows.min(area.height.saturating_sub(band_top)),
     };
-    draw_pixels(frame, pet_area, &buf);
+    draw_pixels(frame, member_area, &buf);
 
-    // Overlays (bubbles/badges) as text cells above each visible pet.
+    // Overlays (bubbles/badges) as text cells above each visible member.
     for &i in &order {
-        let pet = &herd.pets[i];
+        let member = &herd.members[i];
         let Some(sp) = species
-            .get(pet.identity.species_index)
+            .get(member.identity.species_index)
             .or_else(|| species.first())
         else {
             continue;
         };
-        let Some(state) = sp.states.get(&pet.status) else {
+        let Some(state) = sp.states.get(&member.status) else {
             continue;
         };
         let (glyph, _kind) = match &state.overlay.kind {
@@ -362,7 +369,13 @@ pub fn draw_herd(
             OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
             OverlayColor::Default => Color::Gray,
         };
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
+        let animated = animate(
+            &member.terminal_id,
+            member.status,
+            state,
+            now_ms,
+            member.anchor,
+        );
         let cx = area.x
             + ((animated.x_fraction * max_x).round() as u16)
                 .saturating_add(3)
@@ -391,13 +404,13 @@ pub fn draw_herd(
     draw_caption(frame, area, lane_y, hover_label, hidden);
 }
 
-/// Ochre — the hovered pet's caption color, distinct from the `+N` marker's
+/// Ochre — the hovered member's caption color, distinct from the `+N` marker's
 /// neutral dark gray.
 const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
 
 /// Draw the hover caption top-right in the reserved top lane (row `y`),
 /// right-aligned and ochre, or nothing when `label` is `None`. When `hidden`
-/// pets overflow (the `+N` marker also lives in this lane, further right) the
+/// members overflow (the `+N` marker also lives in this lane, further right) the
 /// caption stops one column short of it; either way it's truncated so it
 /// never overruns the strip width.
 pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, hidden: usize) {
@@ -428,14 +441,14 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
     );
 }
 
-/// The index of the visible pet drawn under terminal column `col`, if any.
+/// The index of the visible member drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
-/// Only pets that are actually drawn (the visible set on overflow) are
-/// hit-testable; when pets overlap, the topmost — highest `priority`, matching
+/// Only members that are actually drawn (the visible set on overflow) are
+/// hit-testable; when members overlap, the topmost — highest `priority`, matching
 /// the draw z-order — wins. Returns `None` over a gap or out of range. `now_ms`
 /// must match whatever was passed to `draw_herd` this frame, so hit-testing
 /// agrees with what's actually on screen.
-pub fn pet_at_column(
+pub fn member_at_column(
     herd: &Herd,
     species: &[Species],
     strip_w: usize,
@@ -445,28 +458,34 @@ pub fn pet_at_column(
     let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
     let max_x = (strip_w as f32 - base_w as f32).max(0.0);
     let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
-    let (visible, _hidden) = visible_and_hidden(&herd.pets, capacity);
+    let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
 
     let x = col as i32;
     let mut best: Option<usize> = None;
     for &i in &visible {
-        let pet = &herd.pets[i];
+        let member = &herd.members[i];
         let Some(sp) = species
-            .get(pet.identity.species_index)
+            .get(member.identity.species_index)
             .or_else(|| species.first())
         else {
             continue;
         };
-        let Some(state) = sp.states.get(&pet.status) else {
+        let Some(state) = sp.states.get(&member.status) else {
             continue;
         };
         let w = sp.size().0 as i32;
-        let animated = animate(&pet.terminal_id, pet.status, state, now_ms, pet.anchor);
+        let animated = animate(
+            &member.terminal_id,
+            member.status,
+            state,
+            now_ms,
+            member.anchor,
+        );
         let left = (animated.x_fraction * max_x).round() as i32;
         if x >= left && x < left + w {
             let take = match best {
                 None => true,
-                Some(b) => priority(pet.status) >= priority(herd.pets[b].status),
+                Some(b) => priority(member.status) >= priority(herd.members[b].status),
             };
             if take {
                 best = Some(i);
@@ -476,13 +495,13 @@ pub fn pet_at_column(
     best
 }
 
-/// A pluggable pet-strip renderer. The simulation is shared; only drawing and
+/// A pluggable member-strip renderer. The simulation is shared; only drawing and
 /// hit-testing differ between backends (half-block vs kitty graphics).
-pub trait PetRenderer {
-    /// Draw the whole strip for this frame: the pet band, and (where the
+pub trait MemberRenderer {
+    /// Draw the whole strip for this frame: the member band, and (where the
     /// backend supports it) overlays/`+N`/the hover caption. `now_ms` drives
-    /// every pet's position/pose (see `motion::animate`). `hover_label` is the
-    /// hovered pet's name, if any, drawn top-right in the reserved lane.
+    /// every member's position/pose (see `motion::animate`). `hover_label` is the
+    /// hovered member's name, if any, drawn top-right in the reserved lane.
     fn draw(
         &mut self,
         frame: &mut Frame,
@@ -492,9 +511,9 @@ pub trait PetRenderer {
         now_ms: u64,
         hover_label: Option<&str>,
     );
-    /// The visible pet under terminal column `col`, if any (for hover/click).
+    /// The visible member under terminal column `col`, if any (for hover/click).
     /// `now_ms` must match the value passed to `draw` this frame.
-    fn pet_at_column(
+    fn member_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
@@ -514,7 +533,7 @@ pub trait PetRenderer {
 /// The universal half-block renderer (ratatui `▀▄` cells).
 pub struct HalfBlockRenderer;
 
-impl PetRenderer for HalfBlockRenderer {
+impl MemberRenderer for HalfBlockRenderer {
     fn draw(
         &mut self,
         frame: &mut Frame,
@@ -526,7 +545,7 @@ impl PetRenderer for HalfBlockRenderer {
     ) {
         draw_herd(frame, herd, species, theme, now_ms, hover_label);
     }
-    fn pet_at_column(
+    fn member_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
@@ -534,7 +553,7 @@ impl PetRenderer for HalfBlockRenderer {
         col: u16,
         now_ms: u64,
     ) -> Option<usize> {
-        pet_at_column(herd, species, strip_w, col, now_ms)
+        member_at_column(herd, species, strip_w, col, now_ms)
     }
     fn backend_name(&self) -> &'static str {
         "half-block"
@@ -548,7 +567,7 @@ pub fn select_renderer(
     kind: crate::config::RendererKind,
     caps: &mut dyn crate::caps::TerminalCaps,
     scale: usize,
-) -> Box<dyn PetRenderer> {
+) -> Box<dyn MemberRenderer> {
     use crate::config::RendererKind::*;
     let use_kitty = match kind {
         HalfBlock => false,
@@ -582,7 +601,7 @@ pub fn run(
     focus: Box<dyn HerdrCli>,
     reduced_motion: bool,
     renderer_kind: crate::config::RendererKind,
-    pet_scale: usize,
+    member_scale: usize,
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
 ) -> io::Result<()> {
@@ -593,7 +612,7 @@ pub fn run(
     // with no mouse-event bytes to wade through, and any reply is fully consumed
     // before rendering starts. Raw mode (enabled above) is all the probe needs.
     let mut caps = crate::caps::RealCaps::new();
-    let mut renderer = select_renderer(renderer_kind, &mut caps, pet_scale);
+    let mut renderer = select_renderer(renderer_kind, &mut caps, member_scale);
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -629,7 +648,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     theme: Theme,
     focus: &dyn HerdrCli,
     reduced_motion: bool,
-    renderer: &mut dyn PetRenderer,
+    renderer: &mut dyn MemberRenderer,
     sound_cfg: &crate::config::SoundConfig,
     sound_player: &dyn crate::sound::SoundPlayer,
 ) -> io::Result<()>
@@ -641,10 +660,10 @@ where
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
     loop {
-        // Reduced motion freezes every pet at one fixed instant (0) instead of
+        // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
         // so "frozen" falls out for free with no separate code path. Computed
-        // up front so `herd.reconcile`'s freeze-anchor capture (which pet left
+        // up front so `herd.reconcile`'s freeze-anchor capture (which member left
         // Working, and where) uses the same instant this frame draws at.
         let now_ms = if reduced_motion {
             0
@@ -684,16 +703,16 @@ where
                         // vanish as the mouse moved; now it stays put, top-right,
                         // until you hover a different sheep.
                         if let Some(i) =
-                            renderer.pet_at_column(&herd, species, strip_w, column, now_ms)
+                            renderer.member_at_column(&herd, species, strip_w, column, now_ms)
                         {
-                            hovered = Some(herd.pets[i].label.clone());
+                            hovered = Some(herd.members[i].label.clone());
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
-                            renderer.pet_at_column(&herd, species, strip_w, column, now_ms)
+                            renderer.member_at_column(&herd, species, strip_w, column, now_ms)
                         {
-                            let tid = herd.pets[i].terminal_id.clone();
+                            let tid = herd.members[i].terminal_id.clone();
                             // Swallow focus errors: the strip must keep running.
                             let _ = focus_agent(focus, &tid);
                         }
@@ -712,8 +731,8 @@ mod tests {
     use crate::agent::{Agent, AgentStatus};
     use crate::herd::Herd;
     use crate::identity::identity_for;
+    use crate::member::Member;
     use crate::palette::Theme;
-    use crate::pet::Pet;
     use crate::sprite::parse_species;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -768,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_hat_above_the_focused_pet_and_nothing_above_the_rest() {
+    fn renders_a_hat_above_the_focused_member_and_nothing_above_the_rest() {
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
         let mut h = Herd::new();
@@ -777,7 +796,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| {
                 let mut a = agent(&format!("t{i}"), *s);
-                a.focused = i == 0; // only the first pet is focused
+                a.focused = i == 0; // only the first member is focused
                 a
             })
             .collect();
@@ -816,9 +835,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pet_leaving_working_freezes_in_place_instead_of_teleporting_when_drawn() {
+    fn a_member_leaving_working_freezes_in_place_instead_of_teleporting_when_drawn() {
         // End-to-end: reconcile captures the anchor on the Working->Idle
-        // transition, and draw_herd's own animate() call (via pet.anchor)
+        // transition, and draw_herd's own animate() call (via member.anchor)
         // must actually use it — not just the unit-level animate() tests.
         use crate::agent::AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
@@ -840,7 +859,7 @@ mod tests {
         assert_eq!(
             frozen,
             render_at(20_000),
-            "a frozen pet must not drift or teleport as time passes"
+            "a frozen member must not drift or teleport as time passes"
         );
         assert_eq!(
             frozen,
@@ -850,21 +869,21 @@ mod tests {
     }
 
     #[test]
-    fn pet_at_column_returns_the_topmost_pet_when_they_overlap() {
+    fn member_at_column_returns_the_topmost_member_when_they_overlap() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        herd.pets.push(Pet::new(
+        herd.members.push(Member::new(
             "idle".into(),
             identity_for("idle", 1),
             AgentStatus::Idle,
         ));
-        herd.pets.push(Pet::new(
+        herd.members.push(Member::new(
             "blk".into(),
             identity_for("blk", 1),
             AgentStatus::Blocked,
         ));
-        // A strip narrower than 2x the pet width (test-blob is 4px wide)
-        // guarantees any two pets' hit ranges intersect, however their
+        // A strip narrower than 2x the member width (test-blob is 4px wide)
+        // guarantees any two members' hit ranges intersect, however their
         // identity-derived rest positions land — no need to know the exact
         // hash values.
         let strip_w = 7usize;
@@ -892,27 +911,27 @@ mod tests {
             .round() as i32;
         let overlap_col = idle_left.max(blk_left) as u16;
 
-        let hit = pet_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
-            .expect("a pet under the overlap column");
+        let hit = member_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
+            .expect("a member under the overlap column");
         assert_eq!(
-            herd.pets[hit].terminal_id, "blk",
+            herd.members[hit].terminal_id, "blk",
             "blocked draws on top, so it wins the hit"
         );
     }
 
     #[test]
-    fn pet_at_column_breaks_ties_by_draw_order_topmost_wins() {
+    fn member_at_column_breaks_ties_by_draw_order_topmost_wins() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
         // Same-priority overlap: "b" is pushed later, so the stable sort in
         // draw_herd keeps it later in z-order and it draws on top. Same
         // narrow-strip trick as above forces the overlap.
-        herd.pets.push(Pet::new(
+        herd.members.push(Member::new(
             "a".into(),
             identity_for("a", 1),
             AgentStatus::Idle,
         ));
-        herd.pets.push(Pet::new(
+        herd.members.push(Member::new(
             "b".into(),
             identity_for("b", 1),
             AgentStatus::Idle,
@@ -927,11 +946,11 @@ mod tests {
             .round() as i32;
         let overlap_col = a_left.max(b_left) as u16;
 
-        let hit = pet_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
-            .expect("a pet under the overlap column");
+        let hit = member_at_column(&herd, &species, strip_w, overlap_col, NOW_MS)
+            .expect("a member under the overlap column");
         assert_eq!(
-            herd.pets[hit].terminal_id, "b",
-            "later-pushed same-priority pet draws on top, so it wins the hit"
+            herd.members[hit].terminal_id, "b",
+            "later-pushed same-priority member draws on top, so it wins the hit"
         );
     }
 
@@ -949,7 +968,7 @@ mod tests {
     #[test]
     fn caption_renders_top_right_in_ochre() {
         // A pane exactly the band's height + 1 lane row, so the lane sits at
-        // row 0 (matching `overlays_never_occlude_the_pet`'s convention).
+        // row 0 (matching `overlays_never_occlude_the_member`'s convention).
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -971,8 +990,8 @@ mod tests {
 
     #[test]
     fn caption_no_longer_reserves_the_bottom_row() {
-        // Freeing the bottom row means the pet band now bottom-aligns exactly
-        // to the pane floor: the last row is pet pixels, not blank/caption.
+        // Freeing the bottom row means the member band now bottom-aligns exactly
+        // to the pane floor: the last row is member pixels, not blank/caption.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Idle]);
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -1031,9 +1050,9 @@ mod tests {
     }
 
     #[test]
-    fn overlays_never_occlude_the_pet() {
-        // A done pet shows a '!' badge. The badge must live in the top lane
-        // (row 0) with NO pet pixels, and the pet must be drawn in the band
+    fn overlays_never_occlude_the_member() {
+        // A done member shows a '!' badge. The badge must live in the top lane
+        // (row 0) with NO member pixels, and the member must be drawn in the band
         // below (row 1+), so the icon can never cover the animal.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Done]);
@@ -1045,16 +1064,19 @@ mod tests {
         assert!(rows[0].contains('!'), "badge sits in the top lane (row 0)");
         assert!(
             !rows[0].contains('▀') && !rows[0].contains('▄'),
-            "the top lane holds no pet pixels — nothing to occlude"
+            "the top lane holds no member pixels — nothing to occlude"
         );
-        let band_has_pet = rows[1..].iter().any(|r| r.contains('▀') || r.contains('▄'));
-        assert!(band_has_pet, "the pet is drawn in the band below the lane");
+        let band_has_member = rows[1..].iter().any(|r| r.contains('▀') || r.contains('▄'));
+        assert!(
+            band_has_member,
+            "the member is drawn in the band below the lane"
+        );
     }
 
     #[test]
     fn overflow_counter_lives_in_the_top_lane() {
-        // With many pets, +N must render in the reserved top lane (row 0),
-        // never mid-band on top of a pet.
+        // With many members, +N must render in the reserved top lane (row 0),
+        // never mid-band on top of a member.
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Idle; 30]);
         let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
@@ -1066,19 +1088,19 @@ mod tests {
     }
 
     #[test]
-    fn pet_at_column_is_none_over_a_gap() {
+    fn member_at_column_is_none_over_a_gap() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
-        herd.pets.push(Pet::new(
+        herd.members.push(Member::new(
             "a".into(),
             identity_for("a", 1),
             AgentStatus::Idle,
         ));
-        // A pet's occupied range never reaches past `strip_w` itself (its
+        // A member's occupied range never reaches past `strip_w` itself (its
         // rest fraction is in [0,1] of the walkable width), so the column
         // right at the strip's edge is a gap regardless of the identity hash.
         assert!(
-            pet_at_column(&herd, &species, 200, 200, NOW_MS).is_none(),
+            member_at_column(&herd, &species, 200, 200, NOW_MS).is_none(),
             "column past the strip's edge is empty"
         );
     }
@@ -1105,8 +1127,8 @@ mod tests {
     }
 
     #[test]
-    fn left_facing_pet_is_mirrored() {
-        // A working pet's facing flips as it wanders back and forth. Find two
+    fn left_facing_member_is_mirrored() {
+        // A working member's facing flips as it wanders back and forth. Find two
         // instants where the same agent faces opposite ways (motion::animate
         // as an oracle, rather than forcing the field directly — it's derived
         // now, not stored), and assert the rendered band differs between them.
@@ -1152,7 +1174,7 @@ mod tests {
     fn auto_picks_kitty_when_supported_else_half_block() {
         use crate::caps::FakeCaps;
         use crate::config::RendererKind;
-        let is_kitty = |r: &dyn PetRenderer| r.backend_name() == "kitty";
+        let is_kitty = |r: &dyn MemberRenderer| r.backend_name() == "kitty";
         let mut yes = FakeCaps { supported: true };
         assert!(is_kitty(
             select_renderer(RendererKind::Auto, &mut yes, 7).as_ref()
@@ -1188,7 +1210,7 @@ mod tests {
 
     #[test]
     fn draw_herd_does_not_panic_in_a_pane_shorter_than_the_band() {
-        // Growing PET_PX_H for the focus hat also grew the band's minimum
+        // Growing MEMBER_PX_H for the focus hat also grew the band's minimum
         // height; a pane too short to fit it must crop gracefully instead of
         // handing draw_pixels a Rect that overruns the real frame buffer.
         let species = vec![parse_species(BLOB).unwrap()];
@@ -1213,7 +1235,7 @@ mod tests {
     /// Scan `now_ms` in `[0, period_ms)` for the instant where `state`'s
     /// motion lifts `terminal_id` highest (most negative `offset.dy`) — the
     /// tightest case for top-clipping. Uses `motion::animate` as an oracle
-    /// (same trick as `left_facing_pet_is_mirrored` below) rather than
+    /// (same trick as `left_facing_member_is_mirrored` below) rather than
     /// reverse-engineering `identity::unit_hash`.
     fn peak_lift_ms(
         terminal_id: &str,
@@ -1232,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn build_band_draws_a_hat_only_for_the_focused_pet() {
+    fn build_band_draws_a_hat_only_for_the_focused_member() {
         let species = vec![parse_species(BLOB).unwrap()];
         let mut herd = Herd::new();
         // "wearer"'s hash-derived rest position sits safely away from either
@@ -1240,14 +1262,14 @@ mod tests {
         // right edge and would clip the hat there) — this test is about
         // focused-vs-unfocused, not edge clipping (see the dedicated
         // clipping tests below).
-        let mut focused = Pet::new(
+        let mut focused = Member::new(
             "wearer".into(),
             identity_for("wearer", 1),
             AgentStatus::Idle,
         );
         focused.focused = true;
-        herd.pets.push(focused);
-        herd.pets.push(Pet::new(
+        herd.members.push(focused);
+        herd.members.push(Member::new(
             "unfocused".into(),
             identity_for("unfocused", 1),
             AgentStatus::Idle,
@@ -1256,7 +1278,7 @@ mod tests {
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
-            "exactly one hat is drawn, for the focused pet"
+            "exactly one hat is drawn, for the focused member"
         );
     }
 
@@ -1270,9 +1292,9 @@ mod tests {
         let state = &species[0].states[&AgentStatus::Working];
         let peak_ms = peak_lift_ms("f", AgentStatus::Working, state, 20_000);
         let mut herd = Herd::new();
-        let mut pet = Pet::new("f".into(), identity_for("f", 1), AgentStatus::Working);
-        pet.focused = true;
-        herd.pets.push(pet);
+        let mut member = Member::new("f".into(), identity_for("f", 1), AgentStatus::Working);
+        member.focused = true;
+        herd.members.push(member);
         let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
@@ -1293,7 +1315,7 @@ mod tests {
         let state = &species[sheep_index].states[&AgentStatus::Blocked];
         let peak_ms = peak_lift_ms("f", AgentStatus::Blocked, state, 20_000);
         let mut herd = Herd::new();
-        let mut pet = Pet::new(
+        let mut member = Member::new(
             "f".into(),
             crate::identity::Identity {
                 species_index: sheep_index,
@@ -1301,8 +1323,8 @@ mod tests {
             },
             AgentStatus::Blocked,
         );
-        pet.focused = true;
-        herd.pets.push(pet);
+        member.focused = true;
+        herd.members.push(member);
         let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
@@ -1316,7 +1338,7 @@ mod tests {
         let species = crate::sprite::embedded_species();
         let sheep_index = species.iter().position(|s| s.name == "Sheep").unwrap();
         let mut herd = Herd::new();
-        let mut pet = Pet::new(
+        let mut member = Member::new(
             "f".into(),
             crate::identity::Identity {
                 species_index: sheep_index,
@@ -1324,8 +1346,8 @@ mod tests {
             },
             AgentStatus::Idle,
         );
-        pet.focused = true;
-        herd.pets.push(pet);
+        member.focused = true;
+        herd.members.push(member);
         let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),

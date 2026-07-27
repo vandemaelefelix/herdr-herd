@@ -1,4 +1,4 @@
-//! The controller/watchdog: keep a slim full-width pet strip in every eligible
+//! The controller/watchdog: keep a slim full-width herd strip in every eligible
 //! tab via a non-destructive `pane split` (never `layout.apply`, which kills
 //! processes — Phase 3 spike). Pure sweep logic here; the loop + I/O are thin
 //! shells over the `herdr` CLI seam. See the Phase 3 design spec.
@@ -18,7 +18,7 @@ use crate::{lock, socket};
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
 /// fresh controller after a restart) recognise it and never stack a second one.
-pub const STRIP_LABEL: &str = "herdr-pets";
+pub const STRIP_LABEL: &str = "herdr-herd";
 
 /// A tab as seen by `herdr tab list`.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,10 +35,10 @@ pub struct PaneRef {
     pub label: Option<String>,
 }
 
-/// `true` if a pane label marks it as a pets strip — the controller's own
+/// `true` if a pane label marks it as a herd strip — the controller's own
 /// marker or the manifest pane title (so a `place`/manual strip is deduped too).
 pub fn is_strip_label(label: &str) -> bool {
-    label == STRIP_LABEL || label == "Pets"
+    label == STRIP_LABEL || label == "Herd"
 }
 
 /// The pane to split for a full-width strip, plus its row count. The split
@@ -172,7 +172,7 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
         .collect()
 }
 
-/// Non-destructively place a slim full-width pets strip below `target_pane`
+/// Non-destructively place a slim full-width herd strip below `target_pane`
 /// (a full-width bottom pane found by [`find_bottom_strip_target`]): split it
 /// `down` at the slim ratio, run the renderer in the new pane, and stamp the
 /// de-dup label. The ratio is relative to `pane_rows` (the target pane's own
@@ -239,7 +239,7 @@ pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::R
             }
         })();
         if let Err(e) = result {
-            eprintln!("herdr-pets: could not place strip in {tab_id}: {e}");
+            eprintln!("herdr-herd: could not place strip in {tab_id}: {e}");
         }
     }
     Ok(())
@@ -259,13 +259,13 @@ pub fn control(
     let _guard = match lock::acquire(lock_path)? {
         Some(g) => g,
         None => {
-            eprintln!("herdr-pets: another controller is already running; exiting");
+            eprintln!("herdr-herd: another controller is already running; exiting");
             return Ok(());
         }
     };
     loop {
         if let Err(e) = sweep_once(cli, self_exe, target_rows) {
-            eprintln!("herdr-pets: sweep failed: {e}");
+            eprintln!("herdr-herd: sweep failed: {e}");
         }
         std::thread::sleep(interval);
     }
@@ -282,10 +282,10 @@ pub fn controller_lock_path() -> PathBuf {
             let parent = p.parent()?.to_path_buf();
             let mut hasher = DefaultHasher::new();
             p.to_string_lossy().hash(&mut hasher);
-            let file_name = format!("herdr-pets-controller-{:x}.lock", hasher.finish());
+            let file_name = format!("herdr-herd-controller-{:x}.lock", hasher.finish());
             Some(parent.join(file_name))
         })
-        .unwrap_or_else(|| std::env::temp_dir().join("herdr-pets-controller.lock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("herdr-herd-controller.lock"))
 }
 
 #[cfg(test)]
@@ -343,7 +343,7 @@ mod tests {
     fn inject_strip_splits_runs_and_labels_in_order() {
         let cli = FakeCli::new();
         // pane_rows = 64 (the target pane's own height) -> slim_ratio(64, 7).
-        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-pets", 7).unwrap();
+        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7).unwrap();
         let calls = cli.calls.borrow();
         // No self-fetch of layout: the sweep already resolved the target + rows.
         // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
@@ -362,9 +362,9 @@ mod tests {
         );
         assert_eq!(
             calls[1],
-            vec!["pane", "run", "w1:pNEW", "'/abs/herdr-pets' render"]
+            vec!["pane", "run", "w1:pNEW", "'/abs/herdr-herd' render"]
         );
-        assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-pets"]);
+        assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
     }
 
     fn tab(id: &str, panes: u32) -> TabRef {
@@ -394,16 +394,16 @@ mod tests {
     fn parse_panes_reads_optional_label() {
         let j = r#"{"result":{"panes":[
             {"pane_id":"w1:p1","tab_id":"w1:t1"},
-            {"pane_id":"w1:p2","tab_id":"w1:t1","label":"herdr-pets"}]}}"#;
+            {"pane_id":"w1:p2","tab_id":"w1:t1","label":"herdr-herd"}]}}"#;
         let panes = parse_panes(j).unwrap();
         assert_eq!(panes[0], pane("w1:p1", "w1:t1", None));
-        assert_eq!(panes[1], pane("w1:p2", "w1:t1", Some("herdr-pets")));
+        assert_eq!(panes[1], pane("w1:p2", "w1:t1", Some("herdr-herd")));
     }
 
     #[test]
     fn is_strip_label_matches_the_marker_and_the_manifest_title() {
-        assert!(is_strip_label("herdr-pets"));
-        assert!(is_strip_label("Pets"));
+        assert!(is_strip_label("herdr-herd"));
+        assert!(is_strip_label("Herd"));
         assert!(!is_strip_label("claude"));
     }
 
@@ -411,7 +411,7 @@ mod tests {
     fn tabs_with_strip_collects_tabs_that_hold_a_marked_pane() {
         let panes = vec![
             pane("w1:p1", "w1:t1", None),
-            pane("w1:p2", "w1:t1", Some("herdr-pets")),
+            pane("w1:p2", "w1:t1", Some("herdr-herd")),
             pane("w1:p3", "w1:t2", Some("claude")),
         ];
         let with = tabs_with_strip(&panes);
@@ -441,7 +441,7 @@ mod tests {
             pane("w1:p1", "w1:t1", None), // candidate
             pane("w1:p2", "w1:t2", None), // multi-pane, now also a candidate
             pane("w1:p9", "w1:t2", None),
-            pane("w1:pA", "w1:t3", Some("Pets")), // already stripped -> skipped
+            pane("w1:pA", "w1:t3", Some("Herd")), // already stripped -> skipped
         ];
         let plan = plan_injections(&tabs, &panes);
         assert_eq!(
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
         let cli = FailableCli::new("", "", "w1:p1");
-        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-pets", 7);
+        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
         assert!(result.is_err(), "a failed split must surface as an error");
         let calls = cli.calls.borrow();
         assert!(
@@ -587,7 +587,7 @@ mod tests {
                 {"pane_id":"w1:p2","tab_id":"w1:t2"}]}}"#,
             "w1:p1",
         );
-        let result = sweep_once(&cli, "/abs/herdr-pets", 7);
+        let result = sweep_once(&cli, "/abs/herdr-herd", 7);
         assert!(
             result.is_ok(),
             "one failing tab must not abort the whole sweep"
@@ -624,13 +624,13 @@ mod tests {
                 {"pane_id":"w1:p1","tab_id":"w1:t1"},
                 {"pane_id":"w1:p2","tab_id":"w1:t2"},
                 {"pane_id":"w1:p9","tab_id":"w1:t2"},
-                {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-pets"},
+                {"pane_id":"w1:pA","tab_id":"w1:t3","label":"herdr-herd"},
                 {"pane_id":"w1:pB","tab_id":"w1:t3"},
                 {"pane_id":"w1:pCOL","tab_id":"w1:t4"},
                 {"pane_id":"w1:pD","tab_id":"w1:t4"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-pets", 7).unwrap();
+        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
         let calls = cli.calls.borrow();
         let split_targets: Vec<&str> = calls
             .iter()

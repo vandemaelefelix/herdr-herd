@@ -1,4 +1,4 @@
-//! Notification sounds: play a short clip when a pet's status transitions
+//! Notification sounds: play a short clip when a member's status transitions
 //! into a notifying state (e.g. `blocked`), behind a trait seam so tests
 //! never make noise.
 //!

@@ -1,18 +1,18 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use herdr_pets::herdr::LiveHerdr;
-use herdr_pets::palette::Theme;
-use herdr_pets::render;
-use herdr_pets::socket::{RealSocket, SocketClient, socket_path};
-use herdr_pets::sprite::load_species;
-use herdr_pets::watcher::{RealClock, watch};
+use herdr_herd::herdr::LiveHerdr;
+use herdr_herd::palette::Theme;
+use herdr_herd::render;
+use herdr_herd::socket::{RealSocket, SocketClient, socket_path};
+use herdr_herd::sprite::load_species;
+use herdr_herd::watcher::{RealClock, watch};
 
 fn main() -> ExitCode {
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
         Some("render") => {
-            let cfg = herdr_pets::config::load();
+            let cfg = herdr_herd::config::load();
             let species = load_species();
             let (tx, rx) = mpsc::channel();
             let cli = Box::new(LiveHerdr::from_env());
@@ -28,13 +28,13 @@ fn main() -> ExitCode {
                 focus,
                 cfg.reduced_motion,
                 cfg.renderer,
-                cfg.pet_scale,
+                cfg.member_scale,
                 cfg.sounds,
-                Box::new(herdr_pets::sound::SystemSoundPlayer),
+                Box::new(herdr_herd::sound::SystemSoundPlayer),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("herdr-pets: {e}");
+                    eprintln!("herdr-herd: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -44,32 +44,32 @@ fn main() -> ExitCode {
             let self_exe = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "herdr-pets".to_string());
+                .unwrap_or_else(|| "herdr-herd".to_string());
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| ".".to_string());
-            match herdr_pets::place::place(&cli, &self_exe, &cwd) {
+            match herdr_herd::place::place(&cli, &self_exe, &cwd) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("herdr-pets: {e}");
+                    eprintln!("herdr-herd: {e}");
                     ExitCode::FAILURE
                 }
             }
         }
         Some("control") => {
-            let cfg = herdr_pets::config::load();
+            let cfg = herdr_herd::config::load();
             if !cfg.enabled {
-                eprintln!("herdr-pets: disabled by config; not starting the controller");
+                eprintln!("herdr-herd: disabled by config; not starting the controller");
                 return ExitCode::SUCCESS;
             }
             let cli = LiveHerdr::from_env();
             let self_exe = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "herdr-pets".to_string());
-            let lock_path = herdr_pets::control::controller_lock_path();
-            match herdr_pets::control::control(
+                .unwrap_or_else(|| "herdr-herd".to_string());
+            let lock_path = herdr_herd::control::controller_lock_path();
+            match herdr_herd::control::control(
                 &cli,
                 &self_exe,
                 &lock_path,
@@ -78,17 +78,17 @@ fn main() -> ExitCode {
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("herdr-pets: {e}");
+                    eprintln!("herdr-herd: {e}");
                     ExitCode::FAILURE
                 }
             }
         }
         Some("--version") | Some("-V") => {
-            println!("herdr-pets {}", env!("CARGO_PKG_VERSION"));
+            println!("herdr-herd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: herdr-pets render|place|control");
+            eprintln!("usage: herdr-herd render|place|control");
             ExitCode::FAILURE
         }
     }

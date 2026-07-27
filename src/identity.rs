@@ -1,4 +1,4 @@
-//! Deterministic pet identity: hash(terminal_id) -> (species, hue).
+//! Deterministic member identity: hash(terminal_id) -> (species, hue).
 //!
 //! Uses `terminal_id` (stable per terminal, survives the `pane_id` churn that
 //! `layout.apply` causes — see Phase 0 Spike A). Independent salts keep species
@@ -7,7 +7,7 @@
 
 use std::hash::{Hash, Hasher};
 
-/// A pet's stable visual identity.
+/// A member's stable visual identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identity {
     pub species_index: usize,
