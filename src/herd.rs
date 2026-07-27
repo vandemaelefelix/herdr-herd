@@ -110,8 +110,15 @@ pub fn visible_and_hidden(members: &[Member], capacity: usize) -> (Vec<usize>, u
         return (idx, 0);
     }
     idx.sort_by(|&a, &b| {
-        priority(members[b].status)
-            .cmp(&priority(members[a].status))
+        // Focus wins outright: the selected agent's member must never be
+        // dropped from the visible set, whatever its status — otherwise its
+        // sheep (and the focus hat) disappear when the strip overflows. Below
+        // focus, keep the highest-priority statuses (attention states first),
+        // ties by terminal_id for stability.
+        members[b]
+            .focused
+            .cmp(&members[a].focused)
+            .then_with(|| priority(members[b].status).cmp(&priority(members[a].status)))
             .then_with(|| members[a].terminal_id.cmp(&members[b].terminal_id))
     });
     let hidden = members.len() - capacity;
@@ -373,6 +380,33 @@ mod tests {
         let mut h = Herd::new();
         h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 5_000);
         assert_eq!(h.members[0].anchor, None);
+    }
+
+    #[test]
+    fn the_focused_member_stays_visible_even_over_capacity_and_low_priority() {
+        // capacity 1: an unfocused Blocked (highest priority) vs a focused Idle
+        // (lowest). Focus must win the slot — otherwise the selected agent's
+        // sheep, and its focus hat, vanish from an overflowing strip. This is
+        // the "the hat isn't showing on my selected agent" bug.
+        let blocked = crate::member::Member::new(
+            "aaa".into(),
+            crate::identity::identity_for("aaa", 2),
+            AgentStatus::Blocked,
+        );
+        let mut focused_idle = crate::member::Member::new(
+            "zzz".into(),
+            crate::identity::identity_for("zzz", 2),
+            AgentStatus::Idle,
+        );
+        focused_idle.focused = true;
+        let members = vec![blocked, focused_idle];
+        let (visible, hidden) = visible_and_hidden(&members, 1);
+        assert_eq!(hidden, 1);
+        assert_eq!(
+            visible,
+            vec![1],
+            "the focused member must take the visible slot over an unfocused higher-priority one"
+        );
     }
 
     #[test]
