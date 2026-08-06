@@ -390,3 +390,58 @@ several, per-tab), the sweep's close calls, rollback of an unlabellable
 injection, `binary_changed`'s unreadable-stamp handling, and reload's ownership
 scope. The control loop itself stays a thin untested shell over tested parts.
 Gate green: 252 tests, clippy clean, fmt clean.
+
+## 2026-08-06 — A dead strip is a corpse, not a strip
+
+**Context:** Reported as "the red hat is not always on the active agent's sheep —
+there is always a sheep with a hat, but not the focused one, and it does not
+match the agents sidebar."
+
+**Root cause (investigated, not guessed):** the hat logic is correct at every
+layer. `herdr agent list` reports exactly one `focused` agent and it agrees with
+`pane list`; `Herd::reconcile` assigns `focused` on both the update and insert
+paths; `visible_and_hidden` protects the focused member from overflow; the kitty
+`ImgKey` includes `focused` so a hatted image is never reused for another sheep.
+
+The strips were simply **not running**. Every strip pane in the reporting
+session had `herdr-herd render` exited and its shell back in the foreground
+(`process-info` → `name: zsh`, against `name: herdr-herd` for a live one). Under
+the kitty backend that is invisible: placements are only deleted by `teardown` on
+a *clean* exit, so the last frame drawn stays frozen on screen — including the
+hat, pinned to whichever agent was focused at the moment the renderer died.
+
+It never self-healed because the pane **keeps its label** when the renderer
+exits, and `plan_injections` treats any strip-labelled pane as proof the tab is
+covered. Liveness was "is there a labelled pane", not "is there a running
+renderer".
+
+**Decisions:**
+
+- **Inject with `exec`.** `pane run <id> "exec '<self_exe>' render"` makes the
+  renderer replace the pane's shell, so when it exits the pane exits with it.
+  The corpse cannot form in the first place. This is the primary fix.
+- **Also reap dead strips.** `exec` prevents new corpses but cannot heal the ones
+  already out there, so each sweep checks `pane process-info` per controller
+  strip and closes any whose renderer is gone. Belt and braces, and it is what
+  repairs an existing session.
+- **Close now, inject next sweep.** Re-injecting in the same pass would race the
+  layout that sweep already read.
+- **Unreadable process-info counts as live.** A transient failure must never
+  close a healthy strip, so every parse failure, missing field, and empty process
+  list resolves to "live".
+
+**Trade-offs, deliberately accepted:**
+- **One `process-info` call per strip per sweep.** Comparable to the per-tab
+  `pane layout` the sweep already makes, at a 3s cadence.
+- **A brief race on a just-injected strip.** A strip is labelled moments after
+  `pane run`, so a sweep landing in that window could see a shell and close it.
+  Self-correcting (the next sweep re-injects) and made rare by `exec`.
+- **`teardown` on abnormal exit is still not solved.** A SIGKILLed renderer
+  leaves its images on screen until the pane closes. `exec` makes the pane close
+  with it, which is what actually clears them.
+
+**Verification:** TDD, red-then-green. Unit tests cover live/dead/unreadable
+process-info, the sweep closing a dead strip, and the control case that a live
+strip is never closed. Verified live in the `herd-test` session: killing a
+renderer removed its pane entirely (`w1:pD` gone, not a shell) and the sweep
+injected `w1:pG` to replace it. Gate green: 257 tests, clippy clean, fmt clean.
