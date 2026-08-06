@@ -1,7 +1,7 @@
 # herdr-plugin.toml — manifest for herdr-herd.
 id = "herdr-herd"
 name = "herdr-herd"
-version = "0.2.0"
+version = "0.2.1"
 description = "A herd of pixel-art sheep for your herdr agents — one per agent."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
