@@ -220,6 +220,35 @@ Its controller log is at `target/herd-test-controller.log`, its config dir is
 plugin's global config), and `HERDR_HERD_TEST_SESSION` overrides the session
 name.
 
+### Hot reload
+
+You do not need to restart anything after a change. Each sweep the controller
+compares the binary on disk against the one it started from; when they differ it
+closes every strip it injected and re-execs itself, so the controller is running
+the new build too. The next sweep re-injects the strips from the new binary.
+
+So the loop is just:
+
+```sh
+cargo build --release --features dev-marker
+```
+
+Within about one sweep interval (`sweep_interval_ms`, 3s by default) the strips
+blink and come back on the new build. Watch the marker's timestamp change to
+confirm. This applies to renderer *and* controller changes, since the controller
+replaces itself.
+
+Reload only ever closes strips the controller injected (labelled `herdr-herd`).
+A strip opened by hand from the manifest keeps running, because the sweep cannot
+always put one back — a tab whose bottom edge is split into columns has no
+full-width pane to split.
+
+Each sweep also reaps duplicates: if a tab somehow ends up with more than one
+strip, every strip after the first is closed, so a tab holds exactly one. The
+main way that used to happen is now closed off too — an injected pane that
+cannot be labelled is removed rather than left as an orphan the next sweep
+cannot see.
+
 ### Knowing which build you are looking at
 
 `scripts/herd-test.sh` builds with the `dev-marker` feature, which draws a
