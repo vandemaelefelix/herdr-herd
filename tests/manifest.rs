@@ -14,7 +14,7 @@ fn manifest_has_required_top_level_fields() {
     let m = manifest();
     assert_eq!(m.get("id").and_then(Value::as_str), Some("herdr-herd"));
     assert_eq!(m.get("name").and_then(Value::as_str), Some("herdr-herd"));
-    assert_eq!(m.get("version").and_then(Value::as_str), Some("0.1.0"));
+    assert_eq!(m.get("version").and_then(Value::as_str), Some("0.2.0"));
     assert_eq!(
         m.get("min_herdr_version").and_then(Value::as_str),
         Some("0.7.0")
