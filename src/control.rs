@@ -172,6 +172,60 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
         .collect()
 }
 
+/// `true` if a `herdr pane process-info` reply shows this pane's foreground
+/// process is our renderer.
+///
+/// A strip pane whose renderer exited falls back to its shell but **keeps its
+/// label**, so every later sweep counts the tab as covered and never re-injects.
+/// Under the kitty backend the corpse is invisible: placements are only deleted
+/// by `teardown` on a clean exit, so the last frame drawn — sheep, hat and all —
+/// stays frozen on screen, looking like a live strip that has silently stopped
+/// tracking focus.
+///
+/// Tolerant: anything unreadable counts as **live**, so a transient failure
+/// never closes a healthy strip.
+pub fn renderer_is_running(process_info_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(process_info_json) else {
+        return true;
+    };
+    let Some(procs) = v
+        .get("result")
+        .and_then(|r| r.get("process_info"))
+        .and_then(|p| p.get("foreground_processes"))
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    if procs.is_empty() {
+        return true;
+    }
+    procs.iter().any(|p| {
+        ["name", "argv0"]
+            .iter()
+            .filter_map(|k| p.get(*k).and_then(Value::as_str))
+            .any(|n| n.trim_start_matches('-') == RENDERER_PROCESS_NAME)
+    })
+}
+
+/// The process name a running strip renderer reports — this crate's own binary.
+const RENDERER_PROCESS_NAME: &str = "herdr-herd";
+
+/// The strip panes whose renderer is no longer running, so the sweep can close
+/// them and re-inject a live strip next time round.
+fn plan_dead_strips(cli: &dyn HerdrCli, panes: &[PaneRef]) -> Vec<String> {
+    controller_strips(panes)
+        .into_iter()
+        .filter(|id| {
+            // An unreadable reply counts as live, same as a malformed one:
+            // never reap on doubt.
+            match cli.run_json(&["pane", "process-info", "--pane", id]) {
+                Ok(reply) => !renderer_is_running(&reply),
+                Err(_) => false,
+            }
+        })
+        .collect()
+}
+
 /// The strips the *controller* injected — the subset a reload may restart.
 /// Narrower than [`strip_panes`] on purpose: the sweep can only put back what
 /// it created, so closing a manifest-opened `Herd` pane could lose a strip for
@@ -252,7 +306,10 @@ pub fn inject_strip(
         "--no-focus",
     ])?;
     let strip_pane = parse_split_pane_id(&split_reply)?;
-    let render_cmd = format!("'{self_exe}' render");
+    // `exec` so the renderer *replaces* the pane's shell: when it exits the
+    // pane exits with it, rather than lingering as a labelled corpse that every
+    // later sweep counts as a working strip.
+    let render_cmd = format!("exec '{self_exe}' render");
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     // An unlabelled strip is invisible to every later sweep, which would then
     // inject a second one into the same tab. Rather than leave that orphan
@@ -291,6 +348,15 @@ pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::R
     for extra in plan_reap(&panes) {
         if let Err(e) = cli.run_json(&["pane", "close", &extra]) {
             eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
+        }
+    }
+    // Close strips whose renderer has died. Left alone they keep their label
+    // forever, so the tab looks covered and never gets a working strip back.
+    // The next sweep injects the replacement — closing and re-injecting in one
+    // pass would race the layout this sweep already read.
+    for dead in plan_dead_strips(cli, &panes) {
+        if let Err(e) = cli.run_json(&["pane", "close", &dead]) {
+            eprintln!("herdr-herd: could not close dead strip {dead}: {e}");
         }
     }
     for (tab_id, probe_pane) in plan_injections(&tabs, &panes) {
@@ -468,9 +534,12 @@ mod tests {
                 "--no-focus"
             ]
         );
+        // `exec` so the renderer replaces the pane's shell: when it exits the
+        // pane exits with it, instead of lingering as a labelled corpse that
+        // every later sweep counts as a working strip.
         assert_eq!(
             calls[1],
-            vec!["pane", "run", "w1:pNEW", "'/abs/herdr-herd' render"]
+            vec!["pane", "run", "w1:pNEW", "exec '/abs/herdr-herd' render"]
         );
         assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
     }
@@ -487,6 +556,77 @@ mod tests {
             tab_id: tab.into(),
             label: label.map(String::from),
         }
+    }
+
+    /// `herdr pane process-info` for a pane whose foreground process is the
+    /// named one.
+    fn process_info(name: &str) -> String {
+        format!(
+            r#"{{"result":{{"process_info":{{"foreground_processes":[{{"argv0":"{name}","name":"{name}","pid":1}}],"pane_id":"w1:p1"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_strip_running_the_renderer_is_live() {
+        assert!(renderer_is_running(&process_info("herdr-herd")));
+    }
+
+    /// The bug this exists for: when the renderer exits, the pane falls back to
+    /// a shell but keeps its label. Kitty placements are not deleted on an
+    /// abnormal exit, so the last frame — sheep, hat and all — stays frozen on
+    /// screen and looks like a working strip that has stopped tracking focus.
+    #[test]
+    fn a_strip_that_fell_back_to_a_shell_is_dead() {
+        assert!(!renderer_is_running(&process_info("zsh")));
+    }
+
+    /// Never reap on a reply we could not read: a transient failure must not
+    /// close a healthy strip.
+    #[test]
+    fn an_unreadable_process_info_counts_as_live() {
+        assert!(renderer_is_running(r#"{"result":{}}"#));
+        assert!(renderer_is_running("not json"));
+        assert!(renderer_is_running(
+            r#"{"result":{"process_info":{"foreground_processes":[]}}}"#
+        ));
+    }
+
+    #[test]
+    fn sweep_closes_a_strip_whose_renderer_has_died() {
+        let cli = SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":2}]}}"#.into(),
+            panes: r#"{"result":{"panes":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1"},
+                {"pane_id":"w1:pDEAD","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
+                .into(),
+        };
+        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        let calls = cli.calls.borrow();
+        let closes: Vec<&str> = calls
+            .iter()
+            .filter(|c| c[..2] == ["pane", "close"])
+            .map(|c| c[2].as_str())
+            .collect();
+        assert_eq!(closes, vec!["w1:pDEAD"], "the dead strip is closed");
+    }
+
+    #[test]
+    fn sweep_leaves_a_live_strip_running() {
+        let cli = SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":2}]}}"#.into(),
+            panes: r#"{"result":{"panes":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1"},
+                {"pane_id":"w1:p2","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
+                .into(),
+        };
+        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        let calls = cli.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c[..2] == ["pane", "close"]),
+            "a live strip must never be closed: {calls:?}"
+        );
     }
 
     #[test]
@@ -747,6 +887,12 @@ mod tests {
                 ["pane", "list"] => Ok(self.panes.clone()),
                 // A probe pane id containing "COL" models a columned-bottom tab
                 // (no full-width bottom pane); anything else is top+bottom.
+                // A pane id containing "DEAD" models a strip whose renderer
+                // exited and left the pane back at its shell.
+                ["pane", "process-info", "--pane", id] if id.contains("DEAD") => {
+                    Ok(process_info("zsh"))
+                }
+                ["pane", "process-info", ..] => Ok(process_info("herdr-herd")),
                 ["pane", "layout", "--pane", id] if id.contains("COL") => {
                     Ok(columned_bottom_layout())
                 }
