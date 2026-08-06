@@ -336,3 +336,57 @@ fixes ahead, "is my fix in this pane?" was unanswerable by looking.
 
 **Verification:** TDD, red-then-green throughout. Gate green: 242 tests default,
 247 with `--features dev-marker`, clippy clean, fmt clean.
+
+## 2026-08-06 — Hot reload on binary change, and one strip per tab
+
+**Context:** With the dedicated test session in place, the remaining manual step
+was restarting strips after a rebuild: strip panes and the controller are
+long-running processes still executing the binary image they started from, so a
+rebuild changed nothing visible.
+
+**Decisions:**
+
+- **The controller watches its own binary and re-execs.** Each sweep it compares
+  `binary_stamp(self_exe)` against the stamp taken at startup. On a change it
+  closes its strips and `exec`s itself, so a change to `control.rs` or
+  `place.rs` is hot too, not just renderer changes. One mechanism covers both.
+- **On by default, in shipped builds too.** Chosen over gating it behind
+  `dev-marker`: today a user who updates the plugin keeps running the old strips
+  until they restart herdr, which is a real (if quiet) bug. The cost is a brief
+  strip blink at plugin-update time.
+- **The lock is not dropped before `exec`.** Rust opens files `O_CLOEXEC`, so a
+  successful `exec` releases the controller lock at exactly the right moment —
+  past the point of no return — and the successor image can take it. Dropping it
+  early would open a window where a second controller could start while this one
+  is still alive.
+- **A failed re-exec adopts the new stamp and keeps sweeping.** Otherwise a
+  binary that cannot be exec'd would close every strip on every sweep forever.
+  Stale-but-stable beats flapping, and the sweep re-injects what it just closed.
+- **Reload is scoped to strips the controller owns** (label `herdr-herd`), not
+  everything [`is_strip_label`] matches. The sweep can only re-create what it
+  injected; closing a manifest-opened `Herd` pane in a columned-bottom tab would
+  lose that strip for good.
+- **The sweep reaps duplicates.** `plan_reap` closes every strip after the first
+  in each tab, so "one strip per tab" is enforced rather than merely intended.
+  Injection alone could not guarantee it — it only ever adds.
+- **An unlabellable injection is rolled back.** If `pane rename` fails after the
+  split, the new pane is closed and the injection reported failed. That orphan
+  was the main way a tab ended up with two strips: unlabelled, it was invisible
+  to every later sweep, which then injected another.
+
+**Trade-offs, deliberately accepted:**
+- **Reload is a blink, not a seamless swap.** Strips close and come back a sweep
+  later. Making it seamless would mean injecting the new strip before closing the
+  old, which transiently violates the one-strip-per-tab invariant we just made
+  explicit.
+- **`plan_reap` keeps the first strip in `pane list` order,** not the
+  best-placed one. Deterministic and testable; there is no signal available that
+  would make a smarter choice.
+- **mtime, not content hash,** for change detection. Cheap, and cargo/`build.sh`
+  both install by atomic rename, so a torn read is not a concern.
+
+**Verification:** TDD, red-then-green. New unit tests cover reaping (none, one,
+several, per-tab), the sweep's close calls, rollback of an unlabellable
+injection, `binary_changed`'s unreadable-stamp handling, and reload's ownership
+scope. The control loop itself stays a thin untested shell over tested parts.
+Gate green: 252 tests, clippy clean, fmt clean.

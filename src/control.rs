@@ -172,6 +172,61 @@ pub fn plan_injections(tabs: &[TabRef], panes: &[PaneRef]) -> Vec<(String, Strin
         .collect()
 }
 
+/// The strips the *controller* injected — the subset a reload may restart.
+/// Narrower than [`strip_panes`] on purpose: the sweep can only put back what
+/// it created, so closing a manifest-opened `Herd` pane could lose a strip for
+/// good in a tab the sweep cannot inject into.
+pub fn controller_strips(panes: &[PaneRef]) -> Vec<String> {
+    panes
+        .iter()
+        .filter(|p| p.label.as_deref() == Some(STRIP_LABEL))
+        .map(|p| p.pane_id.clone())
+        .collect()
+}
+
+/// The strip panes to close so each tab is left holding exactly one: every
+/// strip after the first in each tab. Injection alone cannot guarantee this —
+/// it only ever *adds* — so the sweep reaps whatever a lost label, a restored
+/// session, or a `place` racing the sweep left behind.
+pub fn plan_reap(panes: &[PaneRef]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    panes
+        .iter()
+        .filter(|p| p.label.as_deref().is_some_and(is_strip_label))
+        .filter(|p| !seen.insert(p.tab_id.as_str()))
+        .map(|p| p.pane_id.clone())
+        .collect()
+}
+
+/// Close every strip pane. Best-effort and unordered: a pane that will not
+/// close is logged and skipped, because the alternative — aborting — would
+/// leave the herd in a half-restarted state.
+pub fn close_strips(cli: &dyn HerdrCli, panes: &[PaneRef]) {
+    for pane_id in controller_strips(panes) {
+        if let Err(e) = cli.run_json(&["pane", "close", &pane_id]) {
+            eprintln!("herdr-herd: could not close strip {pane_id}: {e}");
+        }
+    }
+}
+
+/// `true` when the binary on disk is not the one this process started from.
+/// Both stamps must be readable: a transient stat failure must never look like
+/// a change, or a single unreadable moment would restart every strip on a loop.
+pub fn binary_changed(baseline: Option<u64>, current: Option<u64>) -> bool {
+    match (baseline, current) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// The binary's modification time as opaque nanoseconds, or `None` if it cannot
+/// be read. Only ever compared for equality — the value itself means nothing.
+pub fn binary_stamp(path: &str) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since.as_nanos() as u64)
+}
+
 /// Non-destructively place a slim full-width herd strip below `target_pane`
 /// (a full-width bottom pane found by [`find_bottom_strip_target`]): split it
 /// `down` at the slim ratio, run the renderer in the new pane, and stamp the
@@ -199,7 +254,14 @@ pub fn inject_strip(
     let strip_pane = parse_split_pane_id(&split_reply)?;
     let render_cmd = format!("'{self_exe}' render");
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
-    cli.run_json(&["pane", "rename", &strip_pane, STRIP_LABEL])?;
+    // An unlabelled strip is invisible to every later sweep, which would then
+    // inject a second one into the same tab. Rather than leave that orphan
+    // behind, close it and report the injection as failed — the next sweep
+    // retries from a clean tab.
+    if let Err(e) = cli.run_json(&["pane", "rename", &strip_pane, STRIP_LABEL]) {
+        let _ = cli.run_json(&["pane", "close", &strip_pane]);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -224,6 +286,13 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
 pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::Result<()> {
     let tabs = parse_tabs(&cli.run_json(&["tab", "list"])?)?;
     let panes = parse_panes(&cli.run_json(&["pane", "list"])?)?;
+    // Reap before injecting: collapsing a tab to one strip must not be undone
+    // by this same sweep deciding the tab still needs one.
+    for extra in plan_reap(&panes) {
+        if let Err(e) = cli.run_json(&["pane", "close", &extra]) {
+            eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
+        }
+    }
     for (tab_id, probe_pane) in plan_injections(&tabs, &panes) {
         let result = (|| -> io::Result<()> {
             let layout = cli.run_json(&["pane", "layout", "--pane", &probe_pane])?;
@@ -263,12 +332,51 @@ pub fn control(
             return Ok(());
         }
     };
+    let mut baseline = binary_stamp(self_exe);
     loop {
+        if binary_changed(baseline, binary_stamp(self_exe)) {
+            let err = reload(cli, self_exe);
+            // Only reached if the re-exec failed. Adopt the new stamp anyway,
+            // so a binary we cannot exec does not restart the herd on every
+            // sweep forever, then keep sweeping: this image is stale, but the
+            // sweep re-injects the strips just closed, and a stale herd beats
+            // no herd.
+            eprintln!("herdr-herd: could not re-exec {self_exe}: {err}; staying on this build");
+            baseline = binary_stamp(self_exe);
+        }
         if let Err(e) = sweep_once(cli, self_exe, target_rows) {
             eprintln!("herdr-herd: sweep failed: {e}");
         }
         std::thread::sleep(interval);
     }
+}
+
+/// The binary changed under us: close every strip so none keeps running the old
+/// image, then re-exec so the controller is new too. The fresh process sweeps
+/// immediately and re-injects the strips from the new binary.
+///
+/// Only returns if the re-exec failed, in which case this process still holds
+/// the controller lock. The lock is *not* dropped first, deliberately: Rust
+/// opens files `O_CLOEXEC`, so a successful `exec` releases it at exactly the
+/// right moment — after the point of no return — and the successor can take it.
+fn reload(cli: &dyn HerdrCli, self_exe: &str) -> io::Error {
+    eprintln!("herdr-herd: binary changed; restarting the herd");
+    match cli.run_json(&["pane", "list"]).map(|s| parse_panes(&s)) {
+        Ok(Ok(panes)) => close_strips(cli, &panes),
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("herdr-herd: could not list panes to restart them: {e}");
+        }
+    }
+    exec_self(self_exe)
+}
+
+/// Replace this process with a fresh `self_exe`, preserving argv. Only returns
+/// on failure — a successful `exec` never comes back.
+#[cfg(unix)]
+fn exec_self(self_exe: &str) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::Command::new(self_exe).args(args).exec()
 }
 
 /// Session-scoped path for the controller lock: next to the herdr socket if
@@ -379,6 +487,143 @@ mod tests {
             tab_id: tab.into(),
             label: label.map(String::from),
         }
+    }
+
+    #[test]
+    fn a_tab_with_one_strip_has_nothing_to_reap() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", None),
+            pane("w1:p2", "w1:t1", Some("herdr-herd")),
+        ];
+        assert!(plan_reap(&panes).is_empty());
+    }
+
+    /// The invariant: one strip per tab, always. Whatever produced the second
+    /// one (a lost label, a restored session, a `place` racing the sweep), the
+    /// next sweep collapses it back to one.
+    #[test]
+    fn a_tab_with_two_strips_reaps_all_but_the_first() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t1", Some("Herd")),
+            pane("w1:p3", "w1:t1", Some("herdr-herd")),
+        ];
+        assert_eq!(plan_reap(&panes), vec!["w1:p2".to_string(), "w1:p3".into()]);
+    }
+
+    #[test]
+    fn reaping_is_per_tab_so_one_strip_each_across_tabs_is_untouched() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t2", Some("herdr-herd")),
+        ];
+        assert!(plan_reap(&panes).is_empty());
+    }
+
+    #[test]
+    fn sweep_closes_a_duplicate_strip() {
+        let cli = SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":3}]}}"#.into(),
+            panes: r#"{"result":{"panes":[
+                {"pane_id":"w1:pA","tab_id":"w1:t1","label":"herdr-herd"},
+                {"pane_id":"w1:pB","tab_id":"w1:t1","label":"herdr-herd"},
+                {"pane_id":"w1:pC","tab_id":"w1:t1"}]}}"#
+                .into(),
+        };
+        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        let calls = cli.calls.borrow();
+        let closes: Vec<&str> = calls
+            .iter()
+            .filter(|c| c.first().map(String::as_str) == Some("pane"))
+            .filter(|c| c.get(1).map(String::as_str) == Some("close"))
+            .map(|c| c[2].as_str())
+            .collect();
+        assert_eq!(closes, vec!["w1:pB"], "the duplicate strip is closed");
+    }
+
+    /// A split that succeeds but cannot be labelled leaves a pane the next
+    /// sweep cannot recognise — the classic source of a second strip. Close it
+    /// rather than leaving an orphan behind.
+    #[test]
+    fn inject_strip_closes_the_new_pane_when_it_cannot_be_labelled() {
+        struct RenameFails {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl HerdrCli for RenameFails {
+            fn run_json(&self, args: &[&str]) -> io::Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(args.iter().map(|s| s.to_string()).collect());
+                match args {
+                    ["pane", "split", ..] => {
+                        Ok(r#"{"result":{"pane":{"pane_id":"w1:pNEW"}}}"#.into())
+                    }
+                    ["pane", "rename", ..] => Err(io::Error::other("rename failed")),
+                    _ => Ok(r#"{"result":{}}"#.into()),
+                }
+            }
+        }
+        let cli = RenameFails {
+            calls: RefCell::new(Vec::new()),
+        };
+        let err = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
+        assert!(err.is_err(), "an unlabellable strip is a failed injection");
+        let calls = cli.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c[..2] == ["pane".to_string(), "close".to_string()] && c[2] == "w1:pNEW"),
+            "the orphan pane is closed: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn controller_strips_excludes_a_manifest_opened_herd_pane() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t1", None),
+            pane("w1:p3", "w1:t2", Some("Herd")),
+        ];
+        assert_eq!(controller_strips(&panes), vec!["w1:p1".to_string()]);
+    }
+
+    #[test]
+    fn a_rebuilt_binary_counts_as_changed() {
+        assert!(binary_changed(Some(100), Some(200)));
+    }
+
+    #[test]
+    fn an_unchanged_binary_does_not_trigger_a_reload() {
+        assert!(!binary_changed(Some(100), Some(100)));
+    }
+
+    /// An unreadable binary must never look like a change: a transient stat
+    /// failure would otherwise restart every strip on a loop.
+    #[test]
+    fn an_unreadable_binary_never_triggers_a_reload() {
+        assert!(!binary_changed(None, Some(200)));
+        assert!(!binary_changed(Some(100), None));
+        assert!(!binary_changed(None, None));
+    }
+
+    /// A reload restarts what the controller owns and can put back. A
+    /// manifest-opened `Herd` pane belongs to whoever opened it, and the sweep
+    /// may not be able to re-create it (a columned-bottom tab has no
+    /// full-width target), so closing it would silently lose a strip.
+    #[test]
+    fn close_strips_restarts_the_controllers_own_strips_only() {
+        let cli = FakeCli::new();
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t2", Some("Herd")),
+            pane("w1:p3", "w1:t2", None),
+        ];
+        close_strips(&cli, &panes);
+        let calls = cli.calls.borrow();
+        let closed: Vec<&str> = calls.iter().map(|c| c[2].as_str()).collect();
+        assert_eq!(closed, vec!["w1:p1"]);
+        assert!(calls.iter().all(|c| c[..2] == ["pane", "close"]));
     }
 
     #[test]
