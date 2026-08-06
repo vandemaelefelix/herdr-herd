@@ -289,3 +289,50 @@ the shared helper) leaving Working *mid-ease* freezes at the on-screen eased
 position, not the raw cycle. The pre-existing `reconcile_clears_the_anchor…`
 test was updated to the new re-stamp behavior. Gate green: 232 tests, clippy
 clean, fmt clean.
+
+## 2026-08-06 — Dev test harness: dedicated session + feature-gated build marker
+
+**Context:** Testing herdr-herd meant running it in the one session the user
+works in, so a dev controller injected strips over live agents. And because the
+installed plugin is pinned to a release commit while a local build may be several
+fixes ahead, "is my fix in this pane?" was unanswerable by looking.
+
+**Decisions:**
+
+- **No new isolation mechanism.** Session scoping was already load-bearing:
+  `socket::socket_path` reads `$HERDR_SOCKET_PATH`, `LiveHerdr` shells out to a
+  CLI that inherits it, and `controller_lock_path` hashes the socket path into
+  the lock filename. The harness is just "second session, controller pointed at
+  its socket". The controller runs as an outside socket client; it never needs
+  to live in a pane.
+- **Cargo feature `dev-marker`, off by default,** rather than an env var or
+  `debug_assertions`. It is the only option where the marker code is absent from
+  a shipped binary: an env var ships the code and can be flipped on by accident,
+  and `debug_assertions` would force dev builds into the debug profile, which we
+  do not want for animation smoothness.
+- **The build stamp comes from `build.rs` with no `rerun-if-changed`
+  directives.** With none present Cargo reruns the script whenever any package
+  file changes, so every rebuild restamps and two dev builds of one commit are
+  still distinguishable. Dirty trees are flagged `*`, not `+`, which the
+  overflow counter already owns in the same lane.
+- **The marker draws from `MemberRenderer::draw`, not `draw_herd`.** This keeps
+  the herd itself feature-independent, so the layout snapshots keep asserting
+  the shipped strip whichever way the crate is built. Mirrors the kitty path.
+- **`HERDR_HERD_CONFIG_DIR` instead of a second plugin id.** An earlier sketch
+  linked the dev checkout as `herdr-herd-dev` for a separate config dir.
+  Rejected: the id lives in `herdr-plugin.toml`, so a second id means a
+  duplicate manifest, and the dev build need not be a registered plugin at all.
+  One env var buys the same isolation.
+
+**Trade-offs, deliberately accepted:**
+- **`jq` is a dev-only dependency** of `scripts/herd-test.sh`, used to read
+  `herdr session list --json`. The script fails with a clear message without it.
+- **The marker costs overlay-lane columns in dev builds,** so a hover caption
+  truncates earlier there than in a shipped build. `marker::reserved_cols()` is
+  `0` when the feature is off, so shipped layout is byte-identical.
+- **Config sharing is opt-out, not opt-in.** With `HERDR_HERD_CONFIG_DIR` unset,
+  dev and installed builds share one config, which is usually what you want when
+  testing against your real settings.
+
+**Verification:** TDD, red-then-green throughout. Gate green: 242 tests default,
+247 with `--features dev-marker`, clippy clean, fmt clean.
