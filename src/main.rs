@@ -84,7 +84,10 @@ fn main() -> ExitCode {
             }
         }
         Some("--version") | Some("-V") => {
-            println!("herdr-herd {}", env!("CARGO_PKG_VERSION"));
+            match herdr_herd::marker::build_marker() {
+                Some(marker) => println!("herdr-herd {} [{marker}]", env!("CARGO_PKG_VERSION")),
+                None => println!("herdr-herd {}", env!("CARGO_PKG_VERSION")),
+            }
             ExitCode::SUCCESS
         }
         _ => {
