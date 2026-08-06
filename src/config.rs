@@ -212,9 +212,27 @@ pub fn load_from_dir(dir: &Path) -> Config {
     }
 }
 
-/// Resolve the plugin config dir by asking herdr (`herdr plugin config-dir
-/// herdr-herd`, plain-path stdout). Thin glue; `None` on any failure.
+/// `Some(path)` when `HERDR_HERD_CONFIG_DIR` names one, else `None`. Split out
+/// as a pure function so the precedence is testable without touching process
+/// env (same seam style as [`crate::herdr::resolve_program`]).
+///
+/// The override exists for the dev test harness: the installed plugin's config
+/// dir is global, so without it a config change made while testing would leak
+/// into the session the user actually works in.
+pub fn config_dir_override(var: Option<String>) -> Option<PathBuf> {
+    match var {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => None,
+    }
+}
+
+/// Resolve the plugin config dir: `HERDR_HERD_CONFIG_DIR` if set, else ask
+/// herdr (`herdr plugin config-dir herdr-herd`, plain-path stdout). Thin glue;
+/// `None` on any failure.
 pub fn resolve_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = config_dir_override(std::env::var("HERDR_HERD_CONFIG_DIR").ok()) {
+        return Some(dir);
+    }
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let out = Command::new(bin)
         .args(["plugin", "config-dir", "herdr-herd"])
@@ -242,6 +260,20 @@ pub fn load() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_dir_override_wins_over_asking_herdr() {
+        assert_eq!(
+            config_dir_override(Some("/tmp/herd-test/config".to_string())),
+            Some(PathBuf::from("/tmp/herd-test/config"))
+        );
+    }
+
+    #[test]
+    fn an_unset_or_empty_override_falls_through_to_asking_herdr() {
+        assert_eq!(config_dir_override(None), None);
+        assert_eq!(config_dir_override(Some(String::new())), None);
+    }
 
     #[test]
     fn default_config_has_the_opinionated_values() {
