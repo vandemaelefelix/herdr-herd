@@ -25,6 +25,7 @@ use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
+use crate::marker;
 use crate::member::{Member, priority};
 use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
@@ -335,7 +336,7 @@ pub fn draw_herd(
     // caption off the member.
     let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
     let band_top = area.bottom().saturating_sub(band_rows);
-    let lane_y = band_top.saturating_sub(1);
+    let lane_y = overlay_lane_y(area);
     let member_area = Rect {
         x: area.x,
         y: band_top,
@@ -404,6 +405,38 @@ pub fn draw_herd(
     draw_caption(frame, area, lane_y, hover_label, hidden);
 }
 
+/// The row of the overlay lane that holds `+N`, the caption, and the build
+/// marker: one row above the bottom-aligned member band.
+pub fn overlay_lane_y(area: Rect) -> u16 {
+    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
+    area.bottom().saturating_sub(band_rows).saturating_sub(1)
+}
+
+/// Dim gray — the build marker reads as chrome, never competing with the
+/// caption's ochre or a member's colors.
+const MARKER_GRAY: Color = Color::Rgb(0x6b, 0x7a, 0x6b);
+
+/// Draw the dev build marker at the left of the overlay lane, or nothing in a
+/// shipped build (where [`marker::build_marker`] is `None`). The lane's other
+/// occupants — the caption and `+N` — are right-aligned, so the two ends never
+/// contend for the same columns.
+pub fn draw_build_marker(frame: &mut Frame, area: Rect, y: u16) {
+    let Some(text) = marker::build_marker() else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text: String = text.chars().take(area.width as usize).collect();
+    let w = text.chars().count() as u16;
+    frame.buffer_mut().set_span(
+        area.x,
+        y,
+        &Span::styled(text, Style::default().fg(MARKER_GRAY)),
+        w,
+    );
+}
+
 /// Ochre — the hovered member's caption color, distinct from the `+N` marker's
 /// neutral dark gray.
 const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
@@ -426,7 +459,11 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
         0
     };
     let right = area.right().saturating_sub(1 + hidden_w);
-    let max_chars = right.saturating_sub(area.x) as usize;
+    // The dev build marker owns the left of this lane, so the caption's room
+    // starts after it. `reserved_cols` is 0 in a shipped build, leaving the
+    // shipped layout unchanged.
+    let left = area.x.saturating_add(marker::reserved_cols());
+    let max_chars = right.saturating_sub(left) as usize;
     if max_chars == 0 {
         return;
     }
@@ -544,6 +581,11 @@ impl MemberRenderer for HalfBlockRenderer {
         hover_label: Option<&str>,
     ) {
         draw_herd(frame, herd, species, theme, now_ms, hover_label);
+        // Drawn here rather than inside `draw_herd` so the herd itself stays
+        // feature-independent: the layout snapshots keep asserting the shipped
+        // strip whichever way the crate is built. Mirrors the kitty path, which
+        // emits its marker from its own `MemberRenderer::draw`.
+        draw_build_marker(frame, frame.area(), overlay_lane_y(frame.area()));
     }
     fn member_at_column(
         &self,
@@ -1061,6 +1103,63 @@ mod tests {
         assert!(row0.chars().count() <= 24, "never overruns the strip width");
     }
 
+    /// A dev build has to answer "which build is in this pane?" at a glance,
+    /// so the marker takes the left of the overlay lane the caption already
+    /// shares with `+N` on the right.
+    #[test]
+    #[cfg(feature = "dev-marker")]
+    fn a_dev_build_draws_the_build_marker_at_the_left_of_the_overlay_lane() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                MemberRenderer::draw(
+                    &mut HalfBlockRenderer,
+                    f,
+                    &herd,
+                    &species,
+                    Theme::Dark,
+                    NOW_MS,
+                    None,
+                )
+            })
+            .unwrap();
+        let lane = &rows_of(terminal.backend())[0];
+        let marker = crate::marker::build_marker().unwrap();
+        assert!(
+            lane.starts_with(marker),
+            "marker should own the left of the lane: {lane:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dev-marker")]
+    fn a_long_caption_is_truncated_rather_than_overwriting_the_build_marker() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                MemberRenderer::draw(
+                    &mut HalfBlockRenderer,
+                    f,
+                    &herd,
+                    &species,
+                    Theme::Dark,
+                    NOW_MS,
+                    Some("a-very-long-agent-name-that-does-not-fit"),
+                )
+            })
+            .unwrap();
+        let lane = &rows_of(terminal.backend())[0];
+        let marker = crate::marker::build_marker().unwrap();
+        assert!(
+            lane.starts_with(marker),
+            "the caption must not eat into the marker: {lane:?}"
+        );
+    }
+
     /// Dump a TestBackend as one `String` per terminal row (symbols only).
     fn rows_of<B: std::fmt::Display>(backend: &B) -> Vec<String> {
         format!("{backend}")
@@ -1210,8 +1309,12 @@ mod tests {
         ));
     }
 
+    /// The trait impl delegates the herd itself to the free function; the only
+    /// thing it adds on top is the dev build marker, which is absent from a
+    /// shipped build. So the two agree everywhere except the marker's own
+    /// columns in the overlay lane.
     #[test]
-    fn half_block_renderer_matches_the_free_function() {
+    fn half_block_renderer_matches_the_free_function_outside_the_marker_columns() {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut via_trait = Terminal::new(TestBackend::new(60, 11)).unwrap();
@@ -1222,10 +1325,20 @@ mod tests {
         via_fn
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
-        assert_eq!(
-            format!("{}", via_trait.backend()),
-            format!("{}", via_fn.backend())
-        );
+
+        let lane = overlay_lane_y(Rect::new(0, 0, 60, 11)) as usize;
+        let reserved = marker::reserved_cols() as usize;
+        let trait_rows = rows_of(via_trait.backend());
+        let fn_rows = rows_of(via_fn.backend());
+        for (y, (a, b)) in trait_rows.iter().zip(fn_rows.iter()).enumerate() {
+            // On the lane row, skip the columns the marker owns.
+            let (a, b) = if y == lane {
+                (&a[reserved.min(a.len())..], &b[reserved.min(b.len())..])
+            } else {
+                (&a[..], &b[..])
+            };
+            assert_eq!(a, b, "row {y} should match");
+        }
     }
 
     #[test]
