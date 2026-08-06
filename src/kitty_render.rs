@@ -538,8 +538,14 @@ impl KittyRenderer {
         let width = area.width as usize;
         let mut s = String::new();
         s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        // The dev build marker takes the left of the lane; a shipped build has
+        // none, so the emitted bytes are unchanged there.
+        if let Some(text) = crate::marker::build_marker() {
+            let text: String = text.chars().take(width).collect();
+            s.push_str(&format!("\x1b[38;2;107;122;107m{text}\x1b[0m"));
+        }
         if let Some(label) = hover_label {
-            let max = width.saturating_sub(1);
+            let max = width.saturating_sub(1 + crate::marker::reserved_cols() as usize);
             let text: String = label.chars().take(max).collect();
             let tw = text.chars().count();
             // Right-aligned, ochre, with a 1-column margin from the edge.
@@ -886,6 +892,50 @@ mod tests {
         assert!(
             out.contains(&format!("\x1b[{row};")),
             "the caption is positioned on the 1-indexed name row {row}"
+        );
+    }
+
+    /// The kitty path bypasses ratatui, so the marker has to be emitted as its
+    /// own escape at column 1 of the same lane the caption uses.
+    #[test]
+    #[cfg(feature = "dev-marker")]
+    fn draw_writes_the_build_marker_at_column_one_of_the_name_row() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let pane_h = 10u16;
+        let mut terminal = Terminal::new(TestBackend::new(80, pane_h)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        let out = sink.take();
+        let marker = crate::marker::build_marker().unwrap();
+        assert!(out.contains(marker), "the marker is emitted: {out:?}");
+        let row = overlay_lane_row(pane_h);
+        assert!(
+            out.contains(&format!("\x1b[{row};1H")),
+            "the marker sits at column 1 of the name row {row}"
+        );
+    }
+
+    /// The shipped binary must not carry the marker at all — this is the test
+    /// that would catch it leaking out of the `dev-marker` feature.
+    #[test]
+    #[cfg(not(feature = "dev-marker"))]
+    fn a_shipped_build_emits_no_build_marker_on_the_name_row() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        let out = sink.take();
+        assert!(
+            !out.contains(env!("CARGO_PKG_VERSION")),
+            "no build identity in a shipped build: {out:?}"
         );
     }
 

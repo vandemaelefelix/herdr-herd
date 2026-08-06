@@ -196,6 +196,49 @@ you know the prerequisites are met.)
 Built in Rust. Development uses `herdr plugin link` for a fast iterate loop.
 Details will follow in the spec and `CONTRIBUTING`.
 
+### Testing changes in a dedicated session
+
+Testing in the herdr session you actually work in means a dev controller lands
+on top of live agents. Instead, run the herd in a session of its own:
+
+```sh
+sh scripts/herd-test.sh
+```
+
+Run it from a **plain terminal tab** — herdr refuses to nest by default, so this
+cannot start from inside an existing herdr session. It builds the binary, opens
+(or reattaches) a session named `herd-test`, and starts the controller against
+that session's socket. Everything is scoped by `HERDR_SOCKET_PATH`, including
+the controller's own lock, so your working session is never touched.
+
+Strips are placed by the controller sweeping the session, exactly as they are
+in real use — never by opening panes by hand. Give the test session single-pane
+tabs: automatic injection needs a full-width bottom pane to split.
+
+Its controller log is at `target/herd-test-controller.log`, its config dir is
+`.herd-test/config` (so settings you try out do not leak into the installed
+plugin's global config), and `HERDR_HERD_TEST_SESSION` overrides the session
+name.
+
+### Knowing which build you are looking at
+
+`scripts/herd-test.sh` builds with the `dev-marker` feature, which draws a
+marker at the left of each strip's overlay lane:
+
+```
+v0.1.0 2bc0efa* 13:57:36
+```
+
+Version, commit, and build time; `*` means the working tree was dirty. The time
+changes on every rebuild, so after a fix you can tell at a glance whether the
+strip in front of you contains it. `herdr-herd --version` prints the same
+string.
+
+The feature is **off by default**, so the marker and its layout cost are absent
+from a shipped binary rather than hidden at runtime. Release builds pass no
+extra features. `cargo test` covers the shipped layout; `cargo test --features
+dev-marker` covers the marker on top of it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

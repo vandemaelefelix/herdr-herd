@@ -15,6 +15,7 @@ pub mod identity;
 pub mod kitty;
 pub mod kitty_render;
 pub mod lock;
+pub mod marker;
 pub mod member;
 pub mod motion;
 pub mod palette;

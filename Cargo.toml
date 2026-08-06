@@ -26,3 +26,6 @@ serde_json = "1"
 [dev-dependencies]
 insta = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[features]
+dev-marker = []
