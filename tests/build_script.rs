@@ -27,7 +27,7 @@ fn macos_arm64_maps_to_the_apple_silicon_asset_at_the_manifest_version() {
         "got: {url}"
     );
     // Ties the URL's version to the manifest so version drift fails the gate.
-    assert!(url.contains("/releases/download/v0.1.0/"), "got: {url}");
+    assert!(url.contains("/releases/download/v0.2.0/"), "got: {url}");
 }
 
 #[test]

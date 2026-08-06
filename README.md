@@ -67,7 +67,7 @@ install still succeeds wherever Rust is available.
 Requires **herdr ≥ 0.7.0**.
 
 To pin a specific version, pass a tag: `herdr plugin install
-vandemaelefelix/herdr-herd --ref v0.1.0`.
+vandemaelefelix/herdr-herd --ref v0.2.0`.
 
 ### From a local checkout (development)
 
@@ -255,7 +255,7 @@ cannot see.
 marker at the left of each strip's overlay lane:
 
 ```
-v0.1.0 2bc0efa* 13:57:36
+v0.2.0 31d0743 16:30:06
 ```
 
 Version, commit, and build time; `*` means the working tree was dirty. The time
