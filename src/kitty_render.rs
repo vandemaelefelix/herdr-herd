@@ -142,6 +142,16 @@ fn overlay_lane_row(pane_h: u16) -> u16 {
     member_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
 }
 
+/// How many members a `strip_w`-wide strip has room for; the rest overflow and
+/// are reported by the `+N` counter. Derived from the first species' frame
+/// width (all species share one size) and mirrors the half-block path's own
+/// capacity in `render::draw_herd`. Shared by drawing, hit-testing and the
+/// counter so all three agree on which members are on screen.
+fn member_capacity(strip_w: usize, species: &[Species]) -> usize {
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    (strip_w / (member_w * 3 / 4).max(1)).max(1)
+}
+
 /// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
 /// the sprite's aspect under an assumed ~1:2.1 cell width:height ratio. herdr
 /// hides the real cell size, so we approximate it; the worst case is a slight
@@ -267,7 +277,7 @@ impl KittyRenderer {
         let strip_w = area.width as usize;
         let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-        let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
+        let capacity = member_capacity(strip_w, species);
         let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
 
         let mut order = visible.clone();
@@ -524,13 +534,21 @@ impl KittyRenderer {
         Ok(())
     }
 
-    /// Draw the hover caption as direct terminal escapes on the dedicated name
-    /// row — bypassing ratatui, whose text the
-    /// per-frame kitty re-placement clobbers and then never redraws (see
-    /// [`KittyRenderer::draw`]). The row carries no member image, so it's cleared
-    /// and rewritten every frame with no stale trail. Row/column are 1-indexed
-    /// within this pane's own terminal.
-    fn draw_overlay_text(&mut self, area: Rect, hover_label: Option<&str>) -> io::Result<()> {
+    /// Draw the hover caption and the `+{hidden}` overflow counter as direct
+    /// terminal escapes on the dedicated name row — bypassing ratatui, whose
+    /// text the per-frame kitty re-placement clobbers and then never redraws
+    /// (see [`KittyRenderer::draw`]). The row carries no member image, so it's
+    /// cleared and rewritten every frame with no stale trail. Row/column are
+    /// 1-indexed within this pane's own terminal. The lane's layout mirrors the
+    /// half-block path's (`render::draw_herd` / `render::draw_caption`): marker
+    /// at the left, then the caption, then `+N` hard right — so the two
+    /// backends read the same way.
+    fn draw_overlay_text(
+        &mut self,
+        area: Rect,
+        hover_label: Option<&str>,
+        hidden: usize,
+    ) -> io::Result<()> {
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
@@ -544,12 +562,28 @@ impl KittyRenderer {
             let text: String = text.chars().take(width).collect();
             s.push_str(&format!("\x1b[38;2;107;122;107m{text}\x1b[0m"));
         }
+        // `+N` for the members the strip has no room for, dim gray (SGR 90 —
+        // ratatui's `Color::DarkGray` on the half-block side), rightmost in the
+        // lane with the same 1-column margin the caption keeps. Without it the
+        // default renderer silently under-reported the herd on overflow (#36).
+        let counter: Option<String> = (hidden > 0)
+            .then(|| format!("+{hidden}"))
+            .map(|l| l.chars().take(width).collect());
+        // Columns the counter (plus a separating gap) takes off the caption's
+        // right edge — 0 when nothing is hidden, so a non-overflowing strip
+        // lays out byte-identically to before.
+        let counter_w = counter.as_ref().map_or(0, |l| l.chars().count() + 1);
+        if let Some(label) = &counter {
+            let col = width.saturating_sub(label.chars().count()).max(1);
+            s.push_str(&format!("\x1b[{row};{col}H\x1b[90m{label}\x1b[0m"));
+        }
         if let Some(label) = hover_label {
-            let max = width.saturating_sub(1 + crate::marker::reserved_cols() as usize);
+            let max = width.saturating_sub(1 + counter_w + crate::marker::reserved_cols() as usize);
             let text: String = label.chars().take(max).collect();
             let tw = text.chars().count();
-            // Right-aligned, ochre, with a 1-column margin from the edge.
-            let col = width.saturating_sub(tw).max(1);
+            // Right-aligned, ochre, with a 1-column margin from the edge — and
+            // clear of `+N` by a further column when the strip is overflowing.
+            let col = width.saturating_sub(tw + counter_w).max(1);
             s.push_str(&format!(
                 "\x1b[{row};{col}H\x1b[38;2;217;164;65m{text}\x1b[0m"
             ));
@@ -583,6 +617,10 @@ impl MemberRenderer for KittyRenderer {
     ) {
         let area = frame.area();
         let _ = self.render_members(herd, species, area, theme, now_ms);
+        // The same visible-set split `render_members` made, so the counter
+        // reports exactly the members it decided not to draw.
+        let capacity = member_capacity(area.width as usize, species);
+        let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
         // Draw the name (and the temp build marker) as DIRECT terminal escapes,
         // in the same layer as the members — NOT ratatui text via `frame`. The
         // per-frame kitty image re-placement clobbers ratatui's text cells, and
@@ -590,7 +628,7 @@ impl MemberRenderer for KittyRenderer {
         // drawn through the frame flashed on for one frame and then vanished
         // (the long-standing name-disappears bug). Writing straight to the sink
         // every frame keeps it stable, on its own dedicated top row.
-        let _ = self.draw_overlay_text(area, hover_label);
+        let _ = self.draw_overlay_text(area, hover_label, hidden);
     }
 
     /// Hit-test using the same visible set as `render_members`. A member's hit range
@@ -612,7 +650,7 @@ impl MemberRenderer for KittyRenderer {
     ) -> Option<usize> {
         let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let max_x = (strip_w as f32 - base_w as f32).max(0.0);
-        let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
+        let capacity = member_capacity(strip_w, species);
         let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
         // Match render_members' z-order exactly: lowest priority first, so the
         // topmost (on-top) member is the LAST one covering the column.
@@ -940,6 +978,119 @@ mod tests {
         assert!(
             !out.contains(env!("CARGO_PKG_VERSION")),
             "no build identity in a shipped build: {out:?}"
+        );
+    }
+
+    /// The 1-based column and text of the lane run styled with `sgr` (the
+    /// counter's dim gray or the caption's ochre). The kitty lane's layout only
+    /// exists in the emitted escapes — there is no ratatui buffer to snapshot —
+    /// so parsing them back is how it gets asserted.
+    fn lane_run(out: &str, sgr: &str) -> (usize, String) {
+        let at = out.find(sgr).expect("the styled run is emitted");
+        let cup = out[..at]
+            .rfind("\x1b[")
+            .expect("a cursor move positions the run");
+        let cup_end = cup + out[cup..].find('H').expect("a terminated cursor move");
+        let col: usize = out[cup..cup_end]
+            .rsplit(';')
+            .next()
+            .expect("row;col in the cursor move")
+            .parse()
+            .expect("a numeric column");
+        let rest = &out[at + sgr.len()..];
+        let end = rest.find("\x1b[0m").expect("the run resets its style");
+        (col, rest[..end].to_string())
+    }
+
+    /// `n` working members. Capacity comes from the strip width, so a narrow
+    /// terminal plus several members is what forces the overflow the `+N`
+    /// counter reports.
+    fn herd_of(n: usize) -> Herd {
+        let mut h = Herd::new();
+        for i in 0..n {
+            let tid = format!("t{i}");
+            h.members.push(Member::new(
+                tid.clone(),
+                identity_for(&tid, 1),
+                AgentStatus::Working,
+            ));
+        }
+        h
+    }
+
+    #[test]
+    fn an_overflowing_strip_draws_the_plus_n_counter_right_aligned_in_the_lane() {
+        // #36: the kitty lane drew only the marker and the caption, so the
+        // DEFAULT renderer silently under-reported the herd whenever more
+        // agents existed than fit. Mirrors the half-block path's `+N`.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        // capacity = width / (member_w * 3 / 4) = 12 / 3 = 4, so 6 members
+        // leave 2 hidden.
+        let (w, pane_h) = (12u16, 10u16);
+        let herd = herd_of(6);
+        let mut terminal = Terminal::new(TestBackend::new(w, pane_h)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        let out = sink.take();
+        let (col, text) = lane_run(&out, "\x1b[90m");
+        assert_eq!(text, "+2", "two of the six members did not fit");
+        assert_eq!(
+            col,
+            (w - 2) as usize,
+            "right-aligned with the same 1-column margin the caption keeps"
+        );
+        let row = overlay_lane_row(pane_h);
+        assert!(
+            out.contains(&format!("\x1b[{row};{col}H\x1b[90m")),
+            "the counter sits on the name row {row}: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_strip_that_fits_every_member_draws_no_counter() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        assert!(
+            !sink.take().contains("\x1b[90m"),
+            "no overflow means no counter, and no reserved room for one"
+        );
+    }
+
+    #[test]
+    fn the_caption_stops_short_of_the_plus_n_counter() {
+        // The half-block caption already reserves horizontal room for `+N`
+        // (`render::draw_caption`); the kitty caption did not, so the two lanes
+        // laid out differently. They must not collide here either.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        // capacity = 60 / 3 = 20, so 23 members leave 3 hidden.
+        let (w, pane_h) = (60u16, 10u16);
+        let herd = herd_of(23);
+        let mut terminal = Terminal::new(TestBackend::new(w, pane_h)).unwrap();
+        terminal
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
+            })
+            .unwrap();
+        let out = sink.take();
+        let (counter_col, counter) = lane_run(&out, "\x1b[90m");
+        let (caption_col, caption) = lane_run(&out, "\x1b[38;2;217;164;65m");
+        assert_eq!(counter, "+3");
+        assert_eq!(caption, "agent-x", "this width has room for the whole name");
+        let caption_end = caption_col + caption.chars().count();
+        assert!(
+            caption_end < counter_col,
+            "the caption ({caption_col}..{caption_end}) must stop clear of `+3` at {counter_col}"
         );
     }
 
