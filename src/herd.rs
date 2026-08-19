@@ -14,6 +14,19 @@ use crate::motion::{Anchor, working_position};
 #[derive(Default)]
 pub struct Herd {
     pub members: Vec<Member>,
+    /// The `terminal_id` last observed wearing the focus hat, so the hat stays
+    /// put while a *non-agent* pane holds focus (the strip itself, a shell, an
+    /// editor) and herdr therefore reports zero focused agents (#32). Cleared
+    /// when that agent leaves the herd, so the hat never lingers on a dead
+    /// sheep.
+    ///
+    /// Stickiness is inherently per render process: a strip that starts *after*
+    /// the last focus change has never observed one, so it has no anchor and
+    /// shows no hat until the next real focus event, while older strips show
+    /// one. Nothing here can fix that: the anchor is a memory of an event, and
+    /// herdr's snapshot carries no "who was focused last" field to recover it
+    /// from. Accepted, and documented in `GOAL.md`.
+    sticky_focus: Option<String>,
 }
 
 /// The one agent allowed to wear the focus hat in this snapshot: among the
@@ -48,6 +61,7 @@ impl Herd {
     pub fn new() -> Self {
         Self {
             members: Vec::new(),
+            sticky_focus: None,
         }
     }
 
@@ -71,9 +85,12 @@ impl Herd {
     ///   cycle — nothing to walk out from.
     ///
     /// Focus is resolved for the whole snapshot, not copied per agent, so the
-    /// "exactly one hatted sheep" invariant holds by construction: more than one
-    /// agent reporting `focused` collapses to one deterministic winner
-    /// ([`reported_focus`]) instead of hatting the whole herd (#33).
+    /// "exactly one hatted sheep" invariant holds by construction:
+    /// - more than one agent reporting `focused` collapses to one deterministic
+    ///   winner ([`reported_focus`]) instead of hatting the whole herd (#33);
+    /// - zero agents reporting `focused` (a non-agent pane holds focus) keeps
+    ///   the hat on the last agent that held it, dropped once that agent leaves
+    ///   the herd (#32, see [`Herd::sticky_focus`]).
     ///
     /// A transition between two non-`Working` statuses leaves an existing anchor
     /// untouched (it persists until the member works again). A member's
@@ -89,8 +106,25 @@ impl Herd {
     ) -> Vec<StatusTransition> {
         let mut transitions = Vec::new();
         // Resolve the single hat holder for this snapshot before touching any
-        // member, so exactly one member can come out focused (#33).
-        let focused = reported_focus(agents).map(str::to_string);
+        // member, so exactly one member can come out focused (#33) and so the
+        // sticky anchor (#32) is applied uniformly to new and surviving members.
+        match reported_focus(agents) {
+            // A genuine focus report always wins and replaces the anchor at once.
+            Some(id) => self.sticky_focus = Some(id.to_string()),
+            // Zero agents focused means a non-agent pane holds focus: keep the
+            // hat on the agent last worked with, unless it has departed. A
+            // hat on a dead sheep would be worse than no hat at all.
+            None => {
+                if !self
+                    .sticky_focus
+                    .as_deref()
+                    .is_some_and(|id| agents.iter().any(|a| a.terminal_id == id))
+                {
+                    self.sticky_focus = None;
+                }
+            }
+        }
+        let focused = self.sticky_focus.clone();
         let is_focused = |terminal_id: &str| focused.as_deref() == Some(terminal_id);
         for a in agents {
             if let Some(p) = self
@@ -336,6 +370,97 @@ mod tests {
         );
         h.reconcile(&[focused_agent("a"), focused_agent("b")], 1, 0);
         assert_eq!(hatted(&h), vec!["a"]);
+    }
+
+    #[test]
+    fn reconcile_keeps_the_hat_on_the_last_focused_agent_when_nothing_is_focused() {
+        // #32: focusing the strip itself (or any shell/editor pane) means zero
+        // agents report focused. The hat must stay on the agent last worked
+        // with instead of vanishing from every sheep.
+        let mut h = Herd::new();
+        h.reconcile(&[focused_agent("a"), agent("b", AgentStatus::Idle)], 1, 0);
+        assert_eq!(hatted(&h), vec!["a"]);
+
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Working),
+                agent("b", AgentStatus::Idle),
+            ],
+            1,
+            0,
+        );
+        assert_eq!(
+            hatted(&h),
+            vec!["a"],
+            "no agent focused -> the hat stays on the remembered one"
+        );
+
+        // And it survives an arbitrary number of unfocused snapshots.
+        for _ in 0..5 {
+            h.reconcile(
+                &[agent("a", AgentStatus::Idle), agent("b", AgentStatus::Idle)],
+                1,
+                0,
+            );
+        }
+        assert_eq!(hatted(&h), vec!["a"]);
+    }
+
+    #[test]
+    fn reconcile_moves_the_hat_at_once_when_focus_genuinely_changes() {
+        // A real focus report always beats the remembered one: stickiness must
+        // never lag a deliberate switch by even one frame.
+        let mut h = Herd::new();
+        h.reconcile(&[focused_agent("a"), agent("b", AgentStatus::Idle)], 1, 0);
+        h.reconcile(
+            &[agent("a", AgentStatus::Working), focused_agent("b")],
+            1,
+            0,
+        );
+        assert_eq!(hatted(&h), vec!["b"]);
+    }
+
+    #[test]
+    fn reconcile_clears_the_hat_when_the_remembered_agent_leaves_the_herd() {
+        // The anchor is dropped with its agent, so the hat never lingers, and
+        // must not silently hop onto whoever is left either.
+        let mut h = Herd::new();
+        h.reconcile(&[focused_agent("a"), agent("b", AgentStatus::Idle)], 1, 0);
+        h.reconcile(&[agent("b", AgentStatus::Idle)], 1, 0);
+        assert!(
+            hatted(&h).is_empty(),
+            "the departed agent's hat is gone and no survivor inherits it"
+        );
+
+        // Cleared for good: a later unfocused snapshot must not resurrect it if
+        // the agent comes back, since no focus event has been observed since.
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Working),
+                agent("b", AgentStatus::Idle),
+            ],
+            1,
+            0,
+        );
+        assert!(hatted(&h).is_empty());
+    }
+
+    #[test]
+    fn reconcile_hats_nobody_before_any_focus_has_ever_been_observed() {
+        // The known edge case, pinned rather than papered over: stickiness is a
+        // memory of a focus event, so a strip that starts while a non-agent
+        // pane holds focus has nothing to remember and shows no hat until the
+        // next real focus change. See Herd::sticky_focus.
+        let mut h = Herd::new();
+        h.reconcile(
+            &[
+                agent("a", AgentStatus::Working),
+                agent("b", AgentStatus::Idle),
+            ],
+            1,
+            0,
+        );
+        assert!(hatted(&h).is_empty());
     }
 
     #[test]

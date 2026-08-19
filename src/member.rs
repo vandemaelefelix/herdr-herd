@@ -32,7 +32,9 @@ pub struct Member {
     /// This member wears the focus hat: the session's global "you are here"
     /// marker. Resolved by `Herd::reconcile` for the herd as a whole, never
     /// copied verbatim from `Agent::focused`, so at most one member is ever
-    /// focused. Not derived here: `Member` has no access to the agent snapshot.
+    /// focused and the hat sticks to the last focused agent while a non-agent
+    /// pane holds focus. Not derived here: `Member` has no access to the agent
+    /// snapshot.
     pub focused: bool,
     /// Where/when this member settled out of `Working`, threaded into
     /// `motion::animate` so leaving `Working` freezes it in place (not a
