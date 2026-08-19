@@ -7,9 +7,9 @@ use crate::base64;
 const CHUNK: usize = 4096; // max base64 chars per APC chunk (protocol limit)
 
 /// Wrap `control` (and optional `payload`) in a kitty graphics APC sequence.
-/// The `;` delimiter is only valid when a payload follows — omitting it for
-/// an empty payload keeps `delete_all()` byte-for-byte `\x1b_Ga=d,d=A\x1b\\`,
-/// with no trailing `;`.
+/// The `;` delimiter is only valid when a payload follows — omitting it for an
+/// empty payload keeps a payload-less command (`delete_image`, `place`) as bare
+/// `\x1b_G<control>\x1b\\`, with no trailing `;`.
 fn apc(control: &str, payload: &str) -> String {
     if payload.is_empty() {
         format!("\x1b_G{control}\x1b\\")
@@ -93,9 +93,17 @@ pub fn delete_placement(id: u32, pid: u32) -> String {
     apc(&format!("a=d,d=i,i={id},p={pid},q=2"), "")
 }
 
-/// Delete all images and placements (teardown / clean exit).
-pub fn delete_all() -> String {
-    apc("a=d,d=A", "")
+/// Delete image `id` outright: uppercase `d=I` frees the image *data* and every
+/// placement of it, unlike `delete_placement`'s lowercase `d=i`, which only
+/// takes the placement off screen and leaks the data (issue #30).
+///
+/// This is deliberately the only delete that frees data. The protocol's
+/// terminal-global `a=d,d=A` is never emitted: every strip pane forwards its
+/// escapes to one outer terminal, so `d=A` from one pane destroys every other
+/// pane's images while their caches still map to the dead ids, leaving them
+/// permanently blank (issue #28). Deletes must name ids this process owns.
+pub fn delete_image(id: u32) -> String {
+    apc(&format!("a=d,d=I,i={id},q=2"), "")
 }
 
 /// The capability-probe query: transmit+query a 1x1 image under `id` (`a=q`).
@@ -144,8 +152,20 @@ mod tests {
             "explicit cell footprint + stacking index"
         );
         assert!(delete_placement(7, 3).contains("a=d") && delete_placement(7, 3).contains("i=7"));
-        assert_eq!(delete_all(), "\x1b_Ga=d,d=A\x1b\\");
         assert!(probe_query(9).contains("a=q") && probe_query(9).contains("i=9"));
+    }
+
+    #[test]
+    fn delete_image_frees_data_with_uppercase_i_and_names_one_id() {
+        // Lowercase `d=i` (delete_placement) keeps the data; only uppercase
+        // `d=I` frees it. And the id is always named: an unscoped delete would
+        // reach into other panes' images.
+        let d = delete_image(4242);
+        assert_eq!(d, "\x1b_Ga=d,d=I,i=4242,q=2\x1b\\");
+        assert!(
+            !d.contains("d=A"),
+            "the terminal-global delete must never be emitted"
+        );
     }
 
     #[test]

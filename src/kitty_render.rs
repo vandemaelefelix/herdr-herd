@@ -4,6 +4,14 @@
 //! or fell out of the visible set. Escapes are written to an injected
 //! `io::Write` sink (real stdout in production, a `Vec<u8>`-backed sink in
 //! tests) so the encoding is unit-testable without a real terminal.
+//!
+//! This renderer does NOT own the terminal. Every strip pane is a separate
+//! process forwarding escapes to one outer terminal, so image ids, deletes and
+//! image memory are all terminal-global and shared. Three rules follow, and the
+//! tests at the bottom pin each of them by driving *two* renderers at once:
+//! ids come from this pane's own block of the id space (see [`crate::kitty_ids`]),
+//! deletes always name an id this pane owns (never `d=A`), and images this pane
+//! stopped placing are freed rather than left resident forever.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -15,7 +23,8 @@ use crate::agent::AgentStatus;
 use crate::anim::{Overlay, OverlayColor};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::icon::{IconKind, icon_size, rasterize_icon};
-use crate::kitty::{Crop, delete_all, delete_placement, place_cropped, transmit_rgba};
+use crate::kitty::{Crop, delete_image, delete_placement, place_cropped, transmit_rgba};
+use crate::kitty_ids::{ImageIds, PlacementIds};
 use crate::member::priority;
 use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
@@ -187,6 +196,62 @@ fn opaque_col_span(frame: &SpriteFrame, flip: bool) -> Option<(usize, usize)> {
 /// reuse one image id instead of retransmitting.
 type ImgKey = (usize, AgentStatus, usize, bool, u16, bool);
 
+/// A transmitted image: the id it lives under in the terminal, and the frame
+/// this renderer last placed it on. The frame stamp drives eviction — without
+/// it nothing ever frees image data, so a long-lived pane accumulates every
+/// hue/status/frame combination it has ever drawn (issue #30).
+#[derive(Debug, Clone, Copy)]
+struct Cached {
+    id: u32,
+    last_used: u64,
+}
+
+/// Frames an image is kept after the last time it was placed. The render loop
+/// ticks at ~12 fps, so ~60s of not being drawn. Counted in frames rather than
+/// `now_ms` because reduced-motion mode pins `now_ms` to 0 for the life of the
+/// process, which would make a wall-clock TTL never fire.
+const IMAGE_TTL_FRAMES: u64 = 720;
+
+/// Backstop cap on cached images (members and icons counted separately), for
+/// bursts that churn faster than the TTL — a herd cycling through many distinct
+/// agent ids, each contributing its own hue. Comfortably above the live working
+/// set (visible members x animation frames), and images placed on the current
+/// frame are never evicted, so this can only reclaim images that are off screen.
+const MAX_CACHED_IMAGES: usize = 256;
+
+/// Drop every entry of `cache` that has not been placed for
+/// [`IMAGE_TTL_FRAMES`], then the oldest entries above [`MAX_CACHED_IMAGES`],
+/// returning the image ids whose terminal-side data must now be freed. Entries
+/// placed on `frame` itself are never dropped — they are on screen.
+fn evict_from<K: Eq + std::hash::Hash + Clone>(
+    cache: &mut HashMap<K, Cached>,
+    frame: u64,
+) -> Vec<u32> {
+    let mut freed = Vec::new();
+    cache.retain(|_, c| {
+        let stale = frame.saturating_sub(c.last_used) > IMAGE_TTL_FRAMES;
+        if stale {
+            freed.push(c.id);
+        }
+        !stale
+    });
+    if cache.len() > MAX_CACHED_IMAGES {
+        let mut by_age: Vec<(K, u64)> = cache
+            .iter()
+            .filter(|(_, c)| c.last_used < frame)
+            .map(|(k, c)| (k.clone(), c.last_used))
+            .collect();
+        by_age.sort_by_key(|(_, last_used)| *last_used);
+        let excess = cache.len() - MAX_CACHED_IMAGES;
+        for (key, _) in by_age.into_iter().take(excess) {
+            if let Some(c) = cache.remove(&key) {
+                freed.push(c.id);
+            }
+        }
+    }
+    freed
+}
+
 /// Draws the herd via the kitty graphics protocol instead of ratatui cells.
 /// Images are transmitted once per distinct `ImgKey` and cached; each visible
 /// member gets a placement that is re-created every frame (draw-then-delete-old,
@@ -194,7 +259,7 @@ type ImgKey = (usize, AgentStatus, usize, bool, u16, bool);
 pub struct KittyRenderer {
     scale: usize,
     out: Box<dyn Write + Send>,
-    cache: HashMap<ImgKey, u32>,
+    cache: HashMap<ImgKey, Cached>,
     /// `terminal_id -> (image_id, placement_id)` of that member's current
     /// placement. The image id is tracked alongside the placement id (not
     /// just the placement id, per the plan's original shape) because a
@@ -207,13 +272,22 @@ pub struct KittyRenderer {
     /// resolved overlay color) since an icon's pixels don't depend on
     /// species/hue/facing, but `done` and `blocked` share `IconKind::Alert`
     /// (both use `!`) and must render as distinct images (accent vs. red).
-    icon_cache: HashMap<(IconKind, bool, OverlayColor), u32>,
+    icon_cache: HashMap<(IconKind, bool, OverlayColor), Cached>,
     /// `terminal_id -> (image_id, placement_id)` of that member's current icon
     /// placement, if its state has an overlay. Tracked separately from
     /// `placements` because a member can lose its overlay (e.g. idle -> working)
     /// while staying visible, which must delete the icon but keep the member.
     icon_placements: HashMap<String, (u32, u32)>,
-    next_id: u32,
+    /// This pane's own block of the terminal-global image-id space. Counting
+    /// from 1 in every process would have panes overwrite each other's images
+    /// (issue #29).
+    image_ids: ImageIds,
+    /// Placement ids come from their own counter: they are allocated per member
+    /// per frame, and sharing the image counter (as this once did) would burn
+    /// through the id block at frame rate.
+    placement_ids: PlacementIds,
+    /// Frames drawn, the clock for image eviction. See [`IMAGE_TTL_FRAMES`].
+    frame: u64,
     /// The pane area the last frame was drawn against. When it changes (a
     /// resize), the terminal may have dropped our transmitted images, so we
     /// invalidate the cache and clear the screen state to force a fresh
@@ -228,6 +302,14 @@ impl KittyRenderer {
     /// on-screen size is set separately by the explicit cell footprint
     /// (`member_rows`/`member_cols`) at placement time.
     pub fn new(scale: usize, out: Box<dyn Write + Send>) -> Self {
+        Self::with_image_ids(scale, out, ImageIds::for_process())
+    }
+
+    /// Build a renderer over an explicit id block. Production goes through
+    /// [`KittyRenderer::new`], which derives the block from the process; the
+    /// block is injected here so a test can drive two renderers — standing in
+    /// for two panes — with disjoint id spaces inside one process.
+    pub fn with_image_ids(scale: usize, out: Box<dyn Write + Send>, image_ids: ImageIds) -> Self {
         Self {
             scale,
             out,
@@ -235,9 +317,48 @@ impl KittyRenderer {
             placements: HashMap::new(),
             icon_cache: HashMap::new(),
             icon_placements: HashMap::new(),
-            next_id: 1,
+            image_ids,
+            placement_ids: PlacementIds::new(),
+            frame: 0,
             last_area: None,
         }
+    }
+
+    /// Free every image this pane transmitted, and with them (uppercase `d=I`)
+    /// their placements. Scoped to ids from this pane's own block: the
+    /// protocol's `a=d,d=A` would take every *other* pane's images down too,
+    /// and their caches would keep placing the dead ids forever (issue #28).
+    fn free_all_images(&mut self) -> io::Result<()> {
+        let ids: Vec<u32> = self
+            .cache
+            .values()
+            .chain(self.icon_cache.values())
+            .map(|c| c.id)
+            .collect();
+        for id in ids {
+            self.out.write_all(delete_image(id).as_bytes())?;
+        }
+        self.cache.clear();
+        self.icon_cache.clear();
+        // The placements died with their images; forget them so no later frame
+        // tries to delete a placement of an image that is already gone.
+        self.placements.clear();
+        self.icon_placements.clear();
+        Ok(())
+    }
+
+    /// Free images this pane has not placed for [`IMAGE_TTL_FRAMES`], plus the
+    /// oldest ones above [`MAX_CACHED_IMAGES`]. Nothing placed on the current
+    /// frame is touched, so this can only reclaim images that are off screen.
+    fn evict_stale_images(&mut self) -> io::Result<()> {
+        let frame = self.frame;
+        let mut freed = Vec::new();
+        freed.extend(evict_from(&mut self.cache, frame));
+        freed.extend(evict_from(&mut self.icon_cache, frame));
+        for id in freed {
+            self.out.write_all(delete_image(id).as_bytes())?;
+        }
+        Ok(())
     }
 
     /// Write all escapes for the current frame's visible members to `self.out`,
@@ -251,16 +372,16 @@ impl KittyRenderer {
         theme: Theme,
         now_ms: u64,
     ) -> io::Result<()> {
+        self.frame += 1;
+
         // On a geometry change (resize), the terminal may have dropped our
         // transmitted images. Purge everything and re-transmit fresh this
         // frame, or `place` would reference gone images and leave the strip
         // blank. The per-member positions below already reflow to the new area.
+        // The purge frees only *this* pane's ids — a resize here must not
+        // disturb any other pane's images (issue #28).
         if self.last_area != Some(area) {
-            self.out.write_all(delete_all().as_bytes())?;
-            self.cache.clear();
-            self.placements.clear();
-            self.icon_cache.clear();
-            self.icon_placements.clear();
+            self.free_all_images()?;
             self.last_area = Some(area);
         }
 
@@ -306,8 +427,12 @@ impl KittyRenderer {
             // they're focused — and the headroom-inclusive crop below can keep
             // TOP_HEADROOM rows above the head without ever clipping it.
             let body_pad = MOTION_PAD + HAT_H;
-            let image_id = match self.cache.get(&key) {
-                Some(&id) => id,
+            let image_id = match self.cache.get_mut(&key) {
+                Some(cached) => {
+                    // Touch it: an image placed this frame is not evictable.
+                    cached.last_used = self.frame;
+                    cached.id
+                }
                 None => {
                     let style = StateStyle {
                         dim: state.dim,
@@ -334,11 +459,16 @@ impl KittyRenderer {
                         let (head_row, head_col) = head_anchor(fr, animated.facing_left);
                         stamp_hat(&mut rgba, self.scale, body_pad, head_row, head_col);
                     }
-                    let id = self.next_id;
-                    self.next_id += 1;
+                    let id = self.image_ids.alloc();
                     self.out
                         .write_all(transmit_rgba(id, rgba.w, rgba.h, &rgba.px).as_bytes())?;
-                    self.cache.insert(key, id);
+                    self.cache.insert(
+                        key,
+                        Cached {
+                            id,
+                            last_used: self.frame,
+                        },
+                    );
                     id
                 }
             };
@@ -361,8 +491,7 @@ impl KittyRenderer {
             self.out
                 .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 
-            let pid = self.next_id;
-            self.next_id += 1;
+            let pid = self.placement_ids.alloc();
             // Pan the crop window by this state's motion offset (breathe/hop/
             // bounce/sway) — the same offset the half-block path bakes
             // straight into its pixel buffer — so the body (and its baked-in
@@ -402,8 +531,11 @@ impl KittyRenderer {
             match glyph.and_then(IconKind::from_glyph) {
                 Some(kind) => {
                     let icon_key = (kind, theme == Theme::Dark, state.overlay.color);
-                    let icon_image_id = match self.icon_cache.get(&icon_key) {
-                        Some(&id) => id,
+                    let icon_image_id = match self.icon_cache.get_mut(&icon_key) {
+                        Some(cached) => {
+                            cached.last_used = self.frame;
+                            cached.id
+                        }
                         None => {
                             let rgba = rasterize_icon(
                                 kind,
@@ -412,12 +544,17 @@ impl KittyRenderer {
                                 self.scale,
                                 ICON_PAD,
                             );
-                            let id = self.next_id;
-                            self.next_id += 1;
+                            let id = self.image_ids.alloc();
                             self.out.write_all(
                                 transmit_rgba(id, rgba.w, rgba.h, &rgba.px).as_bytes(),
                             )?;
-                            self.icon_cache.insert(icon_key, id);
+                            self.icon_cache.insert(
+                                icon_key,
+                                Cached {
+                                    id,
+                                    last_used: self.frame,
+                                },
+                            );
                             id
                         }
                     };
@@ -457,8 +594,7 @@ impl KittyRenderer {
                         (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
                     self.out
                         .write_all(format!("\x1b[{icon_row};{icon_col}H").as_bytes())?;
-                    let icon_pid = self.next_id;
-                    self.next_id += 1;
+                    let icon_pid = self.placement_ids.alloc();
                     self.out.write_all(
                         place_cropped(
                             icon_image_id,
@@ -520,6 +656,11 @@ impl KittyRenderer {
                 self.out.write_all(delete_placement(img, pid).as_bytes())?;
             }
         }
+
+        // Deleting the placements above only takes images off screen; their
+        // pixel data stays resident in the terminal until it is explicitly
+        // freed. Hand back what this pane has stopped drawing (issue #30).
+        self.evict_stale_images()?;
 
         Ok(())
     }
@@ -664,9 +805,11 @@ impl MemberRenderer for KittyRenderer {
         best
     }
 
-    /// Release all transmitted images and placements (clean exit).
+    /// Release the images and placements *this pane* transmitted (clean exit),
+    /// one `d=I` per owned id. A quitting pane must leave every other pane's
+    /// images alone (issue #28).
     fn teardown(&mut self) -> io::Result<()> {
-        self.out.write_all(delete_all().as_bytes())
+        self.free_all_images()
     }
 
     fn backend_name(&self) -> &'static str {
@@ -710,7 +853,20 @@ impl KittyRenderer {
     /// Test constructor: boxes a clone of `sink` as the write target so the
     /// caller's `sink` handle keeps observing everything written.
     pub fn for_test(sink: SharedSink, scale: usize) -> Self {
-        Self::new(scale, Box::new(sink))
+        Self::for_test_in_block(sink, scale, 0)
+    }
+
+    /// Test constructor for a specific id block — one renderer per block stands
+    /// in for one pane per process, which is the only way to observe the
+    /// cross-pane properties from a single test process.
+    pub fn for_test_in_block(sink: SharedSink, scale: usize, block: u32) -> Self {
+        Self::with_image_ids(scale, Box::new(sink), ImageIds::for_block(block))
+    }
+
+    /// The id block this renderer allocates from, so a test can assert that an
+    /// id it observed belongs to this pane and not the other one.
+    pub fn image_ids(&self) -> ImageIds {
+        self.image_ids
     }
 }
 
@@ -761,6 +917,49 @@ mod tests {
         assert!(second.contains("a=d"), "and deletes the previous placement");
     }
 
+    /// The image ids named by every kitty command in `out` whose control block
+    /// carries all of `fields` (e.g. `["a=d", "d=I"]` for a data-freeing
+    /// delete). Continuation chunks of a chunked transmit carry no `a=`/`i=`
+    /// and are skipped.
+    fn ids_where(out: &str, fields: &[&str]) -> Vec<u32> {
+        out.split("\x1b_G")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_once("\x1b\\").map(|(body, _)| body))
+            .map(|body| body.split_once(';').map_or(body, |(control, _)| control))
+            .filter(|control| {
+                fields
+                    .iter()
+                    .all(|f| control.split(',').any(|kv| kv == *f))
+            })
+            .filter_map(|control| {
+                control
+                    .split(',')
+                    .find_map(|kv| kv.strip_prefix("i="))
+                    .and_then(|v| v.parse().ok())
+            })
+            .collect()
+    }
+
+    fn transmitted_image_ids(out: &str) -> Vec<u32> {
+        ids_where(out, &["a=t"])
+    }
+
+    /// Ids whose *data* was freed (`d=I`), as opposed to placements taken off
+    /// screen (`d=i`).
+    fn freed_image_ids(out: &str) -> Vec<u32> {
+        ids_where(out, &["a=d", "d=I"])
+    }
+
+    fn placed_image_ids(out: &str) -> Vec<u32> {
+        ids_where(out, &["a=p"])
+    }
+
+    fn sorted(mut ids: Vec<u32>) -> Vec<u32> {
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     #[test]
     fn resize_purges_and_retransmits() {
         let sink = SharedSink::default();
@@ -768,26 +967,50 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
         let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
-        let _ = sink.take();
+        let transmitted = sorted(transmitted_image_ids(&sink.take()));
+        assert!(!transmitted.is_empty(), "the first frame transmits");
         // Same area: image stays cached, no re-transmit.
         let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
         assert!(
             !sink.take().contains("a=t"),
             "unchanged area reuses the cache"
         );
-        // Changed area (resize): purge everything and re-transmit fresh.
+        // Changed area (resize): purge everything and re-transmit fresh. The
+        // purge names this pane's own ids — `d=A` would take every other pane's
+        // images with it (issue #28).
         let _ = r.render_members(&herd, &species, Rect::new(0, 0, 120, 8), Theme::Dark, 0);
         let out = sink.take();
-        assert!(out.contains("a=d,d=A"), "resize deletes all prior images");
+        assert!(
+            !out.contains("d=A"),
+            "resize must never emit the terminal-global delete: {out:?}"
+        );
+        assert_eq!(
+            sorted(freed_image_ids(&out)),
+            transmitted,
+            "resize frees exactly the ids this pane had transmitted"
+        );
         assert!(out.contains("a=t"), "resize re-transmits the image");
     }
 
     #[test]
-    fn teardown_deletes_all_images() {
+    fn teardown_frees_this_panes_own_ids_and_never_the_whole_terminal() {
         let sink = SharedSink::default();
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        r.draw_to_sink(&one_idle_herd(), &species, Theme::Dark, 0); // member + Zz icon
+        let transmitted = sorted(transmitted_image_ids(&sink.take()));
+        assert_eq!(transmitted.len(), 2, "a member image and an icon image");
         r.teardown().unwrap();
-        assert_eq!(sink.take(), "\x1b_Ga=d,d=A\x1b\\");
+        let out = sink.take();
+        assert!(
+            !out.contains("d=A"),
+            "teardown must never emit the terminal-global delete: {out:?}"
+        );
+        assert_eq!(
+            sorted(freed_image_ids(&out)),
+            transmitted,
+            "teardown frees every image this pane transmitted, by id"
+        );
     }
 
     #[test]
@@ -1408,6 +1631,279 @@ mod tests {
         assert_eq!(
             pos0, pos1,
             "an anchored member's column must stay fixed regardless of elapsed time"
+        );
+    }
+
+    // ---- Cross-pane properties ----------------------------------------
+    //
+    // Every strip pane is its own process writing into ONE outer terminal, so
+    // ids, deletes and image memory are shared. A test that drives a single
+    // renderer cannot see any of that, so each test below drives TWO renderers
+    // against separate sinks — pane A and pane B — exactly as two panes would.
+
+    /// Two panes drawing the same herd, each with its own id block.
+    fn two_panes(scale: usize) -> (SharedSink, KittyRenderer, SharedSink, KittyRenderer) {
+        let sink_a = SharedSink::default();
+        let sink_b = SharedSink::default();
+        // Distinct blocks stand in for distinct processes; `for_process`
+        // derives the block from the pid, which is identical inside one test.
+        let a = KittyRenderer::for_test_in_block(sink_a.clone(), scale, 11);
+        let b = KittyRenderer::for_test_in_block(sink_b.clone(), scale, 12);
+        (sink_a, a, sink_b, b)
+    }
+
+    #[test]
+    fn two_panes_never_transmit_under_the_same_image_id() {
+        // The bug: `next_id` started at 1 in every process, so pane B's first
+        // transmit replaced the pixels behind pane A's `i=1` — A then placed
+        // its cached id and drew B's sprite (issue #29).
+        let (sink_a, mut a, sink_b, mut b) = two_panes(4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        // Idle draws a member image plus an icon image, so several ids each.
+        a.draw_to_sink(&one_idle_herd(), &species, Theme::Dark, 0);
+        b.draw_to_sink(&one_idle_herd(), &species, Theme::Dark, 0);
+        let ids_a = sorted(transmitted_image_ids(&sink_a.take()));
+        let ids_b = sorted(transmitted_image_ids(&sink_b.take()));
+        assert!(ids_a.len() >= 2 && ids_b.len() >= 2, "both panes transmitted");
+        for id in &ids_a {
+            assert!(
+                !ids_b.contains(id),
+                "id {id} was transmitted by both panes into the shared namespace"
+            );
+        }
+        // And each pane's ids come from its own block, so the disjointness
+        // holds for every id either pane will ever allocate — not just these.
+        assert!(ids_a.iter().all(|&id| a.image_ids().contains(id)));
+        assert!(ids_b.iter().all(|&id| b.image_ids().contains(id)));
+        assert!(ids_a.iter().all(|&id| !b.image_ids().contains(id)));
+    }
+
+    #[test]
+    fn a_pane_tearing_down_leaves_the_other_panes_cached_images_intact() {
+        // The bug: teardown emitted `d=A`, which is terminal-global — it freed
+        // pane B's images while B's cache still mapped to those dead ids, so B
+        // went permanently blank, placing gone ids forever (issue #28).
+        let (sink_a, mut a, sink_b, mut b) = two_panes(4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_idle_herd();
+        a.draw_to_sink(&herd, &species, Theme::Dark, 0);
+        b.draw_to_sink(&herd, &species, Theme::Dark, 0);
+        let _ = sink_a.take();
+        let ids_b = sorted(transmitted_image_ids(&sink_b.take()));
+
+        a.teardown().unwrap();
+        let out_a = sink_a.take();
+        assert!(
+            !out_a.contains("d=A"),
+            "a quitting pane must not free the whole terminal: {out_a:?}"
+        );
+        for id in freed_image_ids(&out_a) {
+            assert!(
+                !ids_b.contains(&id),
+                "pane A freed id {id}, which belongs to pane B"
+            );
+            assert!(a.image_ids().contains(id), "A freed an id outside its block");
+        }
+
+        // B's cached ids are still live in the terminal, so its next frame is a
+        // pure re-place: no re-transmit needed, and the ids it places are the
+        // same ones it transmitted before A quit.
+        b.draw_to_sink(&herd, &species, Theme::Dark, 0);
+        let out_b = sink_b.take();
+        assert!(
+            !out_b.contains("a=t"),
+            "pane B's cache must survive pane A's teardown"
+        );
+        for id in placed_image_ids(&out_b) {
+            assert!(
+                ids_b.contains(&id),
+                "pane B placed id {id}, which it never transmitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resize_in_one_pane_frees_only_that_panes_images() {
+        // Same shape as teardown, but the far more common trigger: any window
+        // resize purged the whole terminal, blanking every other pane.
+        let (sink_a, mut a, sink_b, mut b) = two_panes(4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_idle_herd();
+        let _ = a.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let _ = b.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let _ = sink_a.take();
+        let ids_b = sorted(transmitted_image_ids(&sink_b.take()));
+
+        let _ = a.render_members(&herd, &species, Rect::new(0, 0, 120, 8), Theme::Dark, 0);
+        let out_a = sink_a.take();
+        assert!(!out_a.contains("d=A"), "resize is not terminal-global");
+        for id in freed_image_ids(&out_a) {
+            assert!(
+                !ids_b.contains(&id),
+                "pane A's resize freed pane B's image {id}"
+            );
+        }
+
+        let _ = b.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let out_b = sink_b.take();
+        assert!(
+            !out_b.contains("a=t"),
+            "pane B must not have to re-transmit because pane A resized"
+        );
+        assert!(
+            !placed_image_ids(&out_b).is_empty(),
+            "pane B keeps drawing from its own cache"
+        );
+    }
+
+    #[test]
+    fn no_command_in_a_panes_whole_lifecycle_is_terminal_global() {
+        // A blanket scan over transmit, re-place, status change, departure,
+        // resize and teardown: nothing may reach outside this pane's own ids.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test_in_block(sink.clone(), 4, 5);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let mut all = String::new();
+        for (herd, area, ms) in [
+            (one_idle_herd(), Rect::new(0, 0, 200, 10), 0u64),
+            (one_working_herd(), Rect::new(0, 0, 200, 10), 100),
+            (one_focused_idle_herd(), Rect::new(0, 0, 120, 8), 200),
+            (Herd::new(), Rect::new(0, 0, 120, 8), 300),
+        ] {
+            let _ = r.render_members(&herd, &species, area, Theme::Dark, ms);
+            all.push_str(&sink.take());
+        }
+        r.teardown().unwrap();
+        all.push_str(&sink.take());
+        assert!(
+            !all.contains("d=A") && !all.contains("d=a"),
+            "no delete may be terminal-global: {all:?}"
+        );
+        let ids = r.image_ids();
+        for id in transmitted_image_ids(&all)
+            .into_iter()
+            .chain(freed_image_ids(&all))
+            .chain(placed_image_ids(&all))
+        {
+            assert!(ids.contains(id), "id {id} is outside this pane's block");
+        }
+    }
+
+    #[test]
+    fn placements_do_not_consume_the_panes_image_ids() {
+        // Placement ids used to come off the same counter as image ids, so a
+        // pane burned ~one id per member per frame and would have run through
+        // any block it was given within minutes.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test_in_block(sink.clone(), 4, 6);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        for ms in (0..2000).step_by(50) {
+            let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
+        }
+        let transmitted = sorted(transmitted_image_ids(&sink.take()));
+        let base = r.image_ids().base();
+        assert!(
+            transmitted.iter().all(|&id| id < base + 8),
+            "40 frames must not walk the image-id space forward: {transmitted:?}"
+        );
+    }
+
+    // ---- Image-data lifetime (issue #30) --------------------------------
+
+    #[test]
+    fn an_image_that_stops_being_placed_is_freed_and_retransmitted_later() {
+        // `d=i` (delete_placement) only takes an image off screen; its pixels
+        // stayed resident in the terminal forever. Once a member is gone for
+        // the TTL its image data must actually be handed back.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let area = Rect::new(0, 0, 200, 10);
+        let _ = r.render_members(&one_working_herd(), &species, area, Theme::Dark, 0);
+        let transmitted = sorted(transmitted_image_ids(&sink.take()));
+
+        // The member departs; its image is now unplaced but still resident.
+        let empty = Herd::new();
+        let mut freed = Vec::new();
+        for _ in 0..=IMAGE_TTL_FRAMES {
+            let _ = r.render_members(&empty, &species, area, Theme::Dark, 0);
+            freed.extend(freed_image_ids(&sink.take()));
+        }
+        assert_eq!(
+            sorted(freed),
+            transmitted,
+            "an image unplaced for the TTL has its data freed by id"
+        );
+
+        // Freed means gone from the terminal: the cache must not keep claiming
+        // it, or the member would come back as a placement of a dead id.
+        let _ = r.render_members(&one_working_herd(), &species, area, Theme::Dark, 0);
+        assert!(
+            sink.take().contains("a=t"),
+            "the member re-transmits after its image was freed"
+        );
+    }
+
+    #[test]
+    fn an_image_still_on_screen_is_never_freed_however_long_it_is_drawn() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let area = Rect::new(0, 0, 200, 10);
+        let herd = one_working_herd();
+        let mut freed = Vec::new();
+        // Frozen `now_ms` (reduced motion) holds the member on one animation
+        // frame, so this is the same image every time — well past the TTL.
+        for _ in 0..IMAGE_TTL_FRAMES + 50 {
+            let _ = r.render_members(&herd, &species, area, Theme::Dark, 0);
+            freed.extend(freed_image_ids(&sink.take()));
+        }
+        assert!(
+            freed.is_empty(),
+            "a continuously drawn image must never be freed: {freed:?}"
+        );
+    }
+
+    #[test]
+    fn evict_from_frees_stale_entries_and_keeps_the_current_frames() {
+        let mut cache: HashMap<u8, Cached> = HashMap::new();
+        cache.insert(1, Cached { id: 10, last_used: 0 });
+        cache.insert(
+            2,
+            Cached {
+                id: 20,
+                last_used: IMAGE_TTL_FRAMES,
+            },
+        );
+        let freed = evict_from(&mut cache, IMAGE_TTL_FRAMES + 1);
+        assert_eq!(freed, vec![10], "only the entry past its TTL is freed");
+        assert!(cache.contains_key(&2), "the fresh entry stays cached");
+    }
+
+    #[test]
+    fn evict_from_caps_the_cache_without_touching_this_frames_images() {
+        let mut cache: HashMap<u32, Cached> = HashMap::new();
+        // One live entry on the current frame, plus a burst of older ones —
+        // all still inside the TTL, so only the cap can reclaim them.
+        for i in 0..(MAX_CACHED_IMAGES as u32 + 40) {
+            cache.insert(
+                i,
+                Cached {
+                    id: 1000 + i,
+                    last_used: 1 + u64::from(i),
+                },
+            );
+        }
+        let frame = MAX_CACHED_IMAGES as u64 + 40;
+        let live = *cache.get(&(MAX_CACHED_IMAGES as u32 + 39)).unwrap();
+        assert_eq!(live.last_used, frame, "that entry is this frame's");
+        let freed = evict_from(&mut cache, frame);
+        assert_eq!(cache.len(), MAX_CACHED_IMAGES, "the cache is capped");
+        assert_eq!(freed.len(), 40, "the oldest entries above the cap are freed");
+        assert!(
+            !freed.contains(&live.id),
+            "an image placed this frame is never evicted"
         );
     }
 }
