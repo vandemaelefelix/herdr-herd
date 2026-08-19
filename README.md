@@ -123,7 +123,7 @@ an opinionated default:
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm herd — no wandering or bounce. |
 | `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw the herd with. |
-| `member_scale` | int | `7` | Kitty-backend sprite scale (image px per sprite px); ignored by half-block. |
+| `member_scale` | int | `4` | Kitty-backend sprite scale (image px per sprite px); ignored by half-block. The default is roughly 1 transmitted pixel per screen pixel; raising it mostly costs transmission bandwidth and terminal memory. |
 | `sounds_enabled` | bool | `false` | Master switch for notification sounds. Off out of the box. |
 | `sound_<status>_enabled` | bool | `true` for `blocked`, else `false` | Per-status toggle. `<status>` is `idle`, `working`, `blocked`, or `done`. |
 | `sound_<status>_path` | string | unset | Sound file to play on that status's transition. No bundled sounds ship, so a status plays nothing until you point it at a file. |

@@ -1227,7 +1227,7 @@ mod tests {
         // `ICON_PAD` (instead of `ICON_PAD - ICON_MARGIN`) as the centering
         // reference, which put zero margin above/left of the bitmap at rest,
         // so the wave's rise cropped straight into the glyph's top row.
-        let scale = 7; // production default (`Config::default().member_scale`)
+        let scale = 4; // production default (`Config::default().member_scale`)
         for kind in [IconKind::Sleep, IconKind::Alert, IconKind::Question] {
             let (iw, ih) = icon_size(kind);
             let canvas_w = (iw + 2 * ICON_PAD) * scale;
@@ -1806,6 +1806,39 @@ mod tests {
         assert!(
             transmitted.iter().all(|&id| id < base + 8),
             "40 frames must not walk the image-id space forward: {transmitted:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_scale_is_not_oversampled_against_the_displayed_footprint() {
+        // Pins the ratio, not the constant: whatever `member_scale` defaults
+        // to, a member must not be transmitted at more than ~1.5x the pixels
+        // it is displayed at, since the terminal only nearest-neighbour
+        // upscales anyway and every extra pixel is transmission bandwidth and
+        // terminal-side memory (issue #46).
+        //
+        // The real cell size is unobtainable through herdr (see `caps`), so
+        // this assumes a generously large 10x22 px cell. A smaller cell means
+        // a smaller on-screen footprint, hence MORE oversampling, so this
+        // bound is the lenient one: passing it here does not prove 1:1 on any
+        // particular terminal, only that we are not 2x over on a roomy one.
+        const CELL_W: usize = 10;
+        const CELL_H: usize = 22;
+        let scale = crate::config::Config::default().member_scale;
+        let (frame_w, frame_h) = (16usize, 14usize); // sprites normalise to 16x14
+        let rows = member_rows(crate::config::Config::default().strip_rows);
+        let cols = member_cols(rows, frame_w, frame_h + TOP_HEADROOM);
+        // Transmitted: the crop window that is actually shown, not the padded
+        // canvas around it.
+        let (sent_w, sent_h) = (frame_w * scale, (frame_h + TOP_HEADROOM) * scale);
+        let (shown_w, shown_h) = (cols as usize * CELL_W, rows as usize * CELL_H);
+        assert!(
+            sent_w * 2 <= shown_w * 3,
+            "sending {sent_w}px wide for a {shown_w}px footprint is oversampled"
+        );
+        assert!(
+            sent_h * 2 <= shown_h * 3,
+            "sending {sent_h}px tall for a {shown_h}px footprint is oversampled"
         );
     }
 
