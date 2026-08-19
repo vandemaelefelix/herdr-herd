@@ -14,14 +14,14 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use ratatui::Frame;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb};
@@ -837,7 +837,20 @@ pub fn run(
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    // A FIXED viewport, not the default fullscreen one. `Terminal::draw`
+    // autoresizes a fullscreen viewport, and `crossterm::terminal::size` is a
+    // `File::open("/dev/tty")` + ioctl + close every time (~20 us in a real
+    // pty, and 15-35 ms via the `tput` fallback when /dev/tty can't be
+    // opened). A fixed viewport performs none of them: `run_loop` resizes it
+    // from the `Event::Resize` it already receives. This one call is the only
+    // size query left, at startup.
+    let (cols, rows) = size()?;
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(stdout),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+        },
+    )?;
     let result = run_loop(
         &mut terminal,
         rx,
@@ -893,6 +906,11 @@ where
     // The signature of the frame currently on screen. `None` until the first
     // draw, which is why the first frame is never skipped.
     let mut last_sig: Option<u64> = None;
+    // The geometry the strip is drawn at. Read once from the viewport here and
+    // then kept in step with `Event::Resize` below, rather than re-queried per
+    // frame: `terminal.size()` opens /dev/tty on every call, which cost more
+    // than rendering the sheep did.
+    let mut area = terminal.get_frame().area();
     loop {
         // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
@@ -912,8 +930,8 @@ where
             let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
             crate::sound::play_all(sound_player, &sounds);
         }
-        let size = terminal.size()?;
-        let area = Rect::new(0, 0, size.width, size.height);
+        // Mouse hit-testing has to agree with what is on screen, so the width
+        // it uses is the width the last frame actually drew at.
         let strip_w = area.width as usize;
         let caption = hovered.clone();
         // Skip the whole frame when nothing visible changed. Measured on an
@@ -962,6 +980,22 @@ where
                     }
                     _ => {}
                 },
+                // A fixed viewport is never autoresized, so this is what keeps
+                // the strip reflowing. `area` feeds the next frame signature,
+                // which is what forces the repaint (`terminal.resize` has
+                // already cleared the viewport and reset the back buffer, and
+                // the kitty backend purges and retransmits its images when it
+                // sees the new area).
+                Event::Resize(w, h) => {
+                    let resized = Rect::new(0, 0, w, h);
+                    // Terminals emit a resize for a geometry that did not
+                    // actually change; honouring it would clear the viewport
+                    // and leave the strip blank until something else moved.
+                    if resized != area {
+                        terminal.resize(resized)?;
+                        area = resized;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1423,7 +1457,7 @@ mod tests {
     }
 
     use crate::herdr::{CommandRunner, LiveHerdr};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::ffi::OsStr;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
@@ -1786,7 +1820,24 @@ mod tests {
     /// reach the caller with their kind intact; `TestBackend`'s own
     /// `Infallible` doesn't satisfy that, so the tests wrap it rather than
     /// loosening the production bound.
-    struct IoTestBackend(TestBackend);
+    struct IoTestBackend {
+        inner: TestBackend,
+        /// How many times the terminal asked the backend for its size. In
+        /// production every one of these is a `/dev/tty` open + ioctl + close,
+        /// so issue #44 is really the claim that this stays at zero per frame.
+        size_calls: Rc<Cell<usize>>,
+    }
+
+    impl IoTestBackend {
+        fn new(width: u16, height: u16) -> (Self, Rc<Cell<usize>>) {
+            let size_calls = Rc::new(Cell::new(0));
+            let backend = Self {
+                inner: TestBackend::new(width, height),
+                size_calls: Rc::clone(&size_calls),
+            };
+            (backend, size_calls)
+        }
+    }
 
     /// A `Result` that cannot be an error, retyped. `match e {}` is total
     /// because `Infallible` has no variants.
@@ -1804,37 +1855,38 @@ mod tests {
         where
             I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
         {
-            infallible(self.0.draw(content))
+            infallible(self.inner.draw(content))
         }
         fn hide_cursor(&mut self) -> io::Result<()> {
-            infallible(self.0.hide_cursor())
+            infallible(self.inner.hide_cursor())
         }
         fn show_cursor(&mut self) -> io::Result<()> {
-            infallible(self.0.show_cursor())
+            infallible(self.inner.show_cursor())
         }
         fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
-            infallible(self.0.get_cursor_position())
+            infallible(self.inner.get_cursor_position())
         }
         fn set_cursor_position<P: Into<ratatui::layout::Position>>(
             &mut self,
             position: P,
         ) -> io::Result<()> {
-            infallible(self.0.set_cursor_position(position))
+            infallible(self.inner.set_cursor_position(position))
         }
         fn clear(&mut self) -> io::Result<()> {
-            infallible(self.0.clear())
+            infallible(self.inner.clear())
         }
         fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
-            infallible(self.0.clear_region(clear_type))
+            infallible(self.inner.clear_region(clear_type))
         }
         fn size(&self) -> io::Result<ratatui::layout::Size> {
-            infallible(self.0.size())
+            self.size_calls.set(self.size_calls.get() + 1);
+            infallible(self.inner.size())
         }
         fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
-            infallible(self.0.window_size())
+            infallible(self.inner.window_size())
         }
         fn flush(&mut self) -> io::Result<()> {
-            infallible(self.0.flush())
+            infallible(self.inner.flush())
         }
     }
 
@@ -1925,6 +1977,8 @@ mod tests {
     /// as 1197 zero-change frames out of 1199.
     fn drive_run_loop(
         backend: IoTestBackend,
+        width: u16,
+        height: u16,
         states: &[AgentStatus],
         script: Vec<Option<Event>>,
     ) -> CountingRenderer {
@@ -1944,7 +1998,11 @@ mod tests {
                 args: Rc::new(RefCell::new(Vec::new())),
             },
         );
-        let mut terminal = Terminal::new(backend).unwrap();
+        // A fixed viewport, exactly as `run` builds it, so the loop under test
+        // is the one that ships (a fullscreen viewport would autoresize and
+        // hide the `Event::Resize` handling).
+        let viewport = Viewport::Fixed(Rect::new(0, 0, width, height));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
         let mut renderer = CountingRenderer::default();
         let mut events = ScriptedEvents::new(script);
         run_loop(
@@ -1968,8 +2026,11 @@ mod tests {
         use AgentStatus::*;
         // 40 idle ticks after the herd arrives. Only the first frame has
         // anything new to say; the other 40 must not reach the renderer at all.
+        let (backend, size_calls) = IoTestBackend::new(90, 11);
         let renderer = drive_run_loop(
-            IoTestBackend(TestBackend::new(90, 11)),
+            backend,
+            90,
+            11,
             &[Idle, Done, Working, Blocked],
             vec![None; 40],
         );
@@ -1977,6 +2038,52 @@ mod tests {
             renderer.draws, 1,
             "an unchanged strip must be painted once, not once per tick"
         );
+        // Issue #44: a fixed viewport never autoresizes, and the loop no longer
+        // asks for the size itself, so 41 ticks must cost zero `/dev/tty`
+        // opens.
+        assert_eq!(
+            size_calls.get(),
+            0,
+            "the render loop must not query the terminal size per frame"
+        );
+    }
+
+    #[test]
+    fn a_resize_repaints_even_though_the_herd_did_not_change() {
+        use AgentStatus::*;
+        // The regression that would otherwise ship silently: with an unchanged
+        // herd every frame after the first is skipped, so the resize event is
+        // the *only* thing that can force the strip to reflow.
+        let (backend, _) = IoTestBackend::new(90, 11);
+        let renderer = drive_run_loop(
+            backend,
+            90,
+            11,
+            &[Idle, Done],
+            vec![None, None, Some(Event::Resize(60, 11)), None, None],
+        );
+        assert_eq!(
+            renderer.areas,
+            vec![Rect::new(0, 0, 90, 11), Rect::new(0, 0, 60, 11)],
+            "the strip is painted once at the old size and again at the new one"
+        );
+    }
+
+    #[test]
+    fn a_resize_to_the_same_geometry_does_not_repaint() {
+        use AgentStatus::*;
+        // Terminals emit resize events for geometry that did not change.
+        // Acting on one would clear the viewport, and the frame that would
+        // have repainted it is the one the signature says to skip.
+        let (backend, _) = IoTestBackend::new(90, 11);
+        let renderer = drive_run_loop(
+            backend,
+            90,
+            11,
+            &[Idle, Done],
+            vec![None, Some(Event::Resize(90, 11)), None],
+        );
+        assert_eq!(renderer.draws, 1, "a no-op resize must stay a no-op");
     }
 
     #[test]
