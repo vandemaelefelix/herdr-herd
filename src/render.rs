@@ -195,6 +195,12 @@ pub(crate) fn stamp_hat(
     }
 }
 
+/// The two half-block glyphs the blit paints with, hoisted to `&'static str`
+/// so the hot loop below writes a borrowed symbol into the cell instead of
+/// allocating a `String` per painted cell (#43).
+const UPPER_HALF: &str = "▀";
+const LOWER_HALF: &str = "▄";
+
 /// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
 /// each cell packs two pixel rows into one terminal row via `▀` (fg = top
 /// pixel, bg = bottom pixel) or `▄` when only the bottom pixel is set.
@@ -215,11 +221,21 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
             }
             let (ch, style) = match (top, bot) {
                 (None, None) => continue,
-                (Some(t), Some(b)) => ('▀', Style::default().fg(to_color(t)).bg(to_color(b))),
-                (Some(t), None) => ('▀', Style::default().fg(to_color(t))),
-                (None, Some(b)) => ('▄', Style::default().fg(to_color(b))),
+                (Some(t), Some(b)) => {
+                    (UPPER_HALF, Style::default().fg(to_color(t)).bg(to_color(b)))
+                }
+                (Some(t), None) => (UPPER_HALF, Style::default().fg(to_color(t))),
+                (None, Some(b)) => (LOWER_HALF, Style::default().fg(to_color(b))),
             };
-            frame.buffer_mut().set_string(cx, cy, ch.to_string(), style);
+            // Write the cell directly instead of `set_string`, which allocates
+            // (`ch.to_string()`) and re-runs grapheme segmentation for a single
+            // known 1-column glyph. `set_symbol` + `set_style` is exactly what
+            // `set_string` does per grapheme, so the output is byte-identical
+            // — the existing snapshots must not move. `cell_mut` yields `None`
+            // outside the buffer, which the bounds check above already excludes.
+            if let Some(cell) = frame.buffer_mut().cell_mut((cx, cy)) {
+                cell.set_symbol(ch).set_style(style);
+            }
         }
     }
 }
@@ -833,6 +849,49 @@ mod tests {
             next_hover(None, &herd.members),
             None,
             "moving off all sheep must hide the name"
+        );
+    }
+
+    #[test]
+    fn draw_pixels_writes_the_half_block_symbol_and_style_into_each_cell() {
+        // The blit writes cells directly (`set_symbol` + `set_style`) rather
+        // than through `set_string`, which allocated a `String` per painted
+        // cell (#43). That is exactly what `set_string` does per grapheme, so
+        // the output must stay byte-identical — pinned here per cell, where the
+        // strip snapshots only cover it in aggregate.
+        use crate::anim::Rgb;
+        let mut buf = PixelBuf::new(4, 2);
+        buf.set(0, 0, Rgb(1, 2, 3)); // top pixel only
+        buf.set(1, 0, Rgb(1, 2, 3)); // top and bottom
+        buf.set(1, 1, Rgb(4, 5, 6));
+        buf.set(2, 1, Rgb(4, 5, 6)); // bottom pixel only
+        // column 3 stays fully transparent
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        terminal
+            .draw(|f| draw_pixels(f, Rect::new(0, 0, 4, 1), &buf))
+            .unwrap();
+        let rendered = terminal.backend().buffer().clone();
+        let cell = |x: u16| rendered.cell((x, 0)).expect("a cell inside the buffer");
+        assert_eq!(cell(0).symbol(), "▀");
+        assert_eq!(cell(0).fg, Color::Rgb(1, 2, 3));
+        assert_eq!(
+            cell(0).bg,
+            Color::Reset,
+            "no bottom pixel leaves the background untouched"
+        );
+        assert_eq!(cell(1).symbol(), "▀");
+        assert_eq!(cell(1).fg, Color::Rgb(1, 2, 3));
+        assert_eq!(
+            cell(1).bg,
+            Color::Rgb(4, 5, 6),
+            "the bottom pixel is the bg"
+        );
+        assert_eq!(cell(2).symbol(), "▄");
+        assert_eq!(cell(2).fg, Color::Rgb(4, 5, 6));
+        assert_eq!(
+            cell(3).symbol(),
+            " ",
+            "a fully transparent column is skipped, not painted"
         );
     }
 
