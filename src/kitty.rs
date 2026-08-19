@@ -66,7 +66,7 @@ pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16, z: i32) -> String {
 
 /// A source-image crop rectangle, in raster pixels (kitty's `x=`/`y=`/`w=`/`h=`
 /// placement keys): show only this `w`x`h` region starting at `(x, y)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Crop {
     pub x: u32,
     pub y: u32,
