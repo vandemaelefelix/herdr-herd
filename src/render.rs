@@ -7,12 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -647,7 +642,11 @@ pub fn run(
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
 ) -> io::Result<()> {
-    enable_raw_mode()?;
+    // Every terminal mutation below belongs to `guard`, so the `?`s here and a
+    // panic inside the loop both hand the terminal back (issue #35).
+    crate::term::install_panic_hook();
+    let mut guard = crate::term::TerminalGuard::new();
+    guard.enter_raw()?;
 
     // Probe for kitty support BEFORE entering the alternate screen and enabling
     // mouse capture: the query/DA round-trip then happens on the main screen
@@ -656,9 +655,8 @@ pub fn run(
     let mut caps = crate::caps::RealCaps::new();
     let mut renderer = select_renderer(renderer_kind, &mut caps, member_scale);
 
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    guard.enter_screen()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let result = run_loop(
         &mut terminal,
         rx,
@@ -672,14 +670,10 @@ pub fn run(
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    result
+    // The loop's own failure is the interesting one; a restore failure is only
+    // reported when the loop succeeded. Restoring used to `?` ahead of this and
+    // discard `result` entirely.
+    result.and(guard.restore())
 }
 
 /// The hover caption for the current cursor position: the hovered member's
