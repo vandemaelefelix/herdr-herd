@@ -926,11 +926,7 @@ mod tests {
             .skip(1)
             .filter_map(|chunk| chunk.split_once("\x1b\\").map(|(body, _)| body))
             .map(|body| body.split_once(';').map_or(body, |(control, _)| control))
-            .filter(|control| {
-                fields
-                    .iter()
-                    .all(|f| control.split(',').any(|kv| kv == *f))
-            })
+            .filter(|control| fields.iter().all(|f| control.split(',').any(|kv| kv == *f)))
             .filter_map(|control| {
                 control
                     .split(',')
@@ -1664,7 +1660,10 @@ mod tests {
         b.draw_to_sink(&one_idle_herd(), &species, Theme::Dark, 0);
         let ids_a = sorted(transmitted_image_ids(&sink_a.take()));
         let ids_b = sorted(transmitted_image_ids(&sink_b.take()));
-        assert!(ids_a.len() >= 2 && ids_b.len() >= 2, "both panes transmitted");
+        assert!(
+            ids_a.len() >= 2 && ids_b.len() >= 2,
+            "both panes transmitted"
+        );
         for id in &ids_a {
             assert!(
                 !ids_b.contains(id),
@@ -1702,7 +1701,10 @@ mod tests {
                 !ids_b.contains(&id),
                 "pane A freed id {id}, which belongs to pane B"
             );
-            assert!(a.image_ids().contains(id), "A freed an id outside its block");
+            assert!(
+                a.image_ids().contains(id),
+                "A freed an id outside its block"
+            );
         }
 
         // B's cached ids are still live in the terminal, so its next frame is a
@@ -1901,7 +1903,13 @@ mod tests {
     #[test]
     fn evict_from_frees_stale_entries_and_keeps_the_current_frames() {
         let mut cache: HashMap<u8, Cached> = HashMap::new();
-        cache.insert(1, Cached { id: 10, last_used: 0 });
+        cache.insert(
+            1,
+            Cached {
+                id: 10,
+                last_used: 0,
+            },
+        );
         cache.insert(
             2,
             Cached {
@@ -1933,7 +1941,11 @@ mod tests {
         assert_eq!(live.last_used, frame, "that entry is this frame's");
         let freed = evict_from(&mut cache, frame);
         assert_eq!(cache.len(), MAX_CACHED_IMAGES, "the cache is capped");
-        assert_eq!(freed.len(), 40, "the oldest entries above the cap are freed");
+        assert_eq!(
+            freed.len(),
+            40,
+            "the oldest entries above the cap are freed"
+        );
         assert!(
             !freed.contains(&live.id),
             "an image placed this frame is never evicted"
