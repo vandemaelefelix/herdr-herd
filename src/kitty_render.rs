@@ -646,8 +646,12 @@ impl MemberRenderer for KittyRenderer {
             let fr = &state.frames[animated.frame_index];
             // The image occupies `cols` cells from the member's x; the visible
             // sprite is the opaque span scaled into those cols, so hover
-            // matches the sheep, not its transparent padding.
-            let cols = member_cols(rows, fr.w, fr.h) as usize;
+            // matches the sheep, not its transparent padding. The window height
+            // MUST include TOP_HEADROOM, exactly as `render_members` sizes the
+            // placement it emits — `member_cols` is inversely proportional to
+            // it, so omitting it here made the hit box ~43% wider than the
+            // drawn sheep (#34).
+            let cols = member_cols(rows, fr.w, fr.h + TOP_HEADROOM) as usize;
             let (lo, hi) = opaque_col_span(fr, animated.facing_left).unwrap_or((0, fr.w));
             // Round each opaque edge to the nearest cell (rather than
             // floor-left/ceil-right) so the hit region hugs the visible sprite
@@ -970,14 +974,177 @@ mod tests {
         assert_eq!(opaque_col_span(fr, true), Some((1, 4)));
     }
 
+    /// A member body's on-screen footprint exactly as it was emitted: the
+    /// 1-based cursor column it was placed at, and the `c=` cell width of its
+    /// placement (`z=0` — an overlay icon places at `Z_ICON_BASE`+). Read out
+    /// of the real escapes rather than recomputed, so the hit-test assertions
+    /// below compare against what the terminal was actually told to draw. That
+    /// is the whole point: draw and hit-test each computed the footprint
+    /// themselves, with different arguments, and silently drifted (#34).
+    fn placed_footprint(out: &str) -> (i32, usize) {
+        let apc = out
+            .match_indices("\x1b_G")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                let end = out[i..].find("\x1b\\").map_or(out.len(), |e| i + e);
+                let chunk = &out[i..end];
+                chunk.contains("a=p") && chunk.contains(",z=0,")
+            })
+            .expect("the member body's own placement command (z=0)");
+        // The cursor move that positioned it is the last one written before it.
+        let before = &out[..apc];
+        let cup = before
+            .rfind("\x1b[")
+            .expect("a cursor move before the placement");
+        let cup_end = cup + before[cup..].find('H').expect("a terminated cursor move");
+        let col: i32 = before[cup..cup_end]
+            .rsplit(';')
+            .next()
+            .expect("row;col in the cursor move")
+            .parse()
+            .expect("a numeric cursor column");
+        let end = apc + out[apc..].find("\x1b\\").expect("APC terminator");
+        let cols: usize = out[apc..end]
+            .split(',')
+            .find_map(|kv| kv.strip_prefix("c="))
+            .expect("a c= cell-footprint field")
+            .parse()
+            .expect("a numeric c=");
+        (col, cols)
+    }
+
+    /// A fully opaque single-state species: every column of the frame carries
+    /// ink, so `opaque_col_span` trims nothing and the hit box must equal the
+    /// drawn cell footprint *exactly* — which is what lets the test below
+    /// compare it against the emitted `c=` with no slack.
+    const SOLID: &str = "\
+name = SolidBlock
+
+[idle]    frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[working] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[done]    frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[blocked] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[unknown] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+";
+
+    /// One `Done` member frozen at 40% of the walkable width: a static state
+    /// with a rest anchor pins its column deterministically, well clear of both
+    /// strip edges, so the cell just outside the footprint is testable.
+    fn one_anchored_solid_herd() -> Herd {
+        let mut h = Herd::new();
+        let mut member = Member::new("t1".into(), identity_for("t1", 1), AgentStatus::Done);
+        member.anchor = Some(crate::motion::Anchor {
+            frozen_x: 0.4,
+            settled_at_ms: 0,
+        });
+        h.members.push(member);
+        h
+    }
+
+    #[test]
+    fn hit_box_width_equals_the_emitted_cell_footprint() {
+        // Regression guard for #34: `draw` sized the footprint with the
+        // headroom-inclusive window (`fr.h + TOP_HEADROOM`) while
+        // `member_at_column` sized it without, so the hover/click box came out
+        // ~43% wider than the drawn sheep — empty strip popped up a name, and a
+        // click there focused that agent. `member_cols` is inversely
+        // proportional to frame height, so any future divergence in those
+        // arguments changes the width and this test fails.
+        let sink = SharedSink::default();
+        let species = vec![parse_species(SOLID).expect("the solid test species parses")];
+        let herd = one_anchored_solid_herd();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
+        let (col, cols) = placed_footprint(&sink.take());
+        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        // The placement's cursor column is 1-based; hit-test columns are 0-based.
+        let left = col - 1;
+        let right = left + cols as i32;
+        assert!(
+            left >= 1,
+            "fixture must be placed clear of the strip's left edge (col={col})"
+        );
+        assert_eq!(at(left - 1), None, "the cell just left of the sheep misses");
+        assert_eq!(at(left), Some(0), "the footprint's first cell hits");
+        assert_eq!(at(right - 1), Some(0), "the footprint's last cell hits");
+        assert_eq!(at(right), None, "the cell just right of the sheep misses");
+        // Stated as a width too, so a failure reads as the drift it is rather
+        // than as an off-by-one at one edge.
+        let hits = (0..200).filter(|&c| at(c) == Some(0)).count();
+        assert_eq!(
+            hits, cols,
+            "an opaque sheep's hit box must be exactly as wide as the emitted c={cols}"
+        );
+    }
+
     #[test]
     fn hit_test_uses_the_cell_footprint() {
+        let sink = SharedSink::default();
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let mut r = KittyRenderer::for_test(SharedSink::default(), 4);
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
-        let hit = (0..200u16).find_map(|c| r.member_at_column(&herd, &species, 200, c, 0));
-        assert_eq!(hit, Some(0), "some column under the member hits it");
+        let (col, cols) = placed_footprint(&sink.take());
+        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        let hits: Vec<i32> = (0..200).filter(|&c| at(c) == Some(0)).collect();
+        assert!(!hits.is_empty(), "some column under the member hits it");
+        let (left, right) = (hits[0], hits[hits.len() - 1] + 1);
+        assert_eq!(
+            hits,
+            (left..right).collect::<Vec<_>>(),
+            "the hit region is one contiguous run of columns"
+        );
+        // The exact `[left_cell, right_cell)` boundary, not merely "some column
+        // hits" — the weak assertion that let #34 survive.
+        assert!(
+            left >= 1,
+            "fixture must be placed clear of the strip's left edge (col={col})"
+        );
+        assert_eq!(
+            at(left - 1),
+            None,
+            "the cell just left of the hit box misses"
+        );
+        assert_eq!(at(left), Some(0), "the hit box's first cell hits");
+        assert_eq!(at(right - 1), Some(0), "the hit box's last cell hits");
+        assert_eq!(at(right), None, "the cell just right of the hit box misses");
+        // The blob's working frame has one fully transparent column, so the hit
+        // box is trimmed strictly *inside* the drawn footprint and can never
+        // reach beyond it.
+        let drawn = (col - 1)..(col - 1 + cols as i32);
+        assert!(
+            left >= drawn.start && right <= drawn.end,
+            "the hit box {left}..{right} must lie inside the drawn footprint {drawn:?}"
+        );
+        assert!(
+            right - left < cols as i32,
+            "the transparent column is trimmed off the hit box (width {} of c={cols})",
+            right - left
+        );
         assert_eq!(
             r.member_at_column(&herd, &species, 200, 200, 0),
             None,
