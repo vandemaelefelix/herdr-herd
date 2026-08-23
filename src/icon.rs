@@ -4,14 +4,11 @@
 //! half-block backend still draws the raw overlay glyph as a text `Span`.
 
 use crate::anim::{OverlayColor, Rgb};
+use crate::chrome;
 use crate::palette::Theme;
 use crate::raster::Rgba;
 
-/// The half-block renderer's accent badge color (`render.rs`'s
-/// `OverlayColor::Accent` mapping) — kept in sync so `done`'s badge reads the
-/// same warm, non-alarming tone on both backends, distinct from `blocked`'s
-/// red.
-const ACCENT: Rgb = Rgb(0xe6, 0xc8, 0x77);
+const ACCENT: Rgb = chrome::ACCENT;
 
 /// Which pixel-art icon a state's overlay glyph maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
