@@ -52,12 +52,14 @@ impl ImageIds {
     }
 
     /// The first id in this pane's block.
+    #[cfg(test)]
     pub fn base(&self) -> u32 {
         self.base
     }
 
     /// Whether `id` belongs to this pane — the property a cross-pane test
     /// asserts about every id a renderer transmits or deletes.
+    #[cfg(test)]
     pub fn contains(&self, id: u32) -> bool {
         id >= self.base && id - self.base < IDS_PER_PANE
     }

@@ -364,19 +364,20 @@ pub(crate) fn visible_members<'a>(
 /// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
 /// reduced motion) drives every member's position/pose via `motion::animate` — a
 /// pure function, so this is fully deterministic given the same inputs.
-/// Returns the buffer plus the visible set's z-order (draw order, lowest
-/// priority first) so the caller can reuse it for overlays without
-/// recomputing the visible/capacity selection.
-fn build_band(
-    herd: &Herd,
-    species: &[Species],
+/// Returns the buffer plus the resolved visible set in z-order (draw order,
+/// lowest priority first) and the hidden count, so the caller can reuse them
+/// for overlays and the `+N` counter without recomputing the visible/capacity
+/// selection or re-resolving each member's species/state/frame.
+fn build_band<'a>(
+    herd: &'a Herd,
+    species: &'a [Species],
     strip_w: usize,
     theme: Theme,
     now_ms: u64,
-) -> (PixelBuf, Vec<usize>) {
+) -> (PixelBuf, Vec<VisibleMember<'a>>, usize) {
     let mut buf = PixelBuf::new(strip_w, MEMBER_PX_H);
     let max_x = band_max_x(species, strip_w);
-    let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
+    let (visible, hidden) = visible_members(herd, species, strip_w, now_ms);
 
     for v in &visible {
         let member = v.member;
@@ -406,7 +407,7 @@ fn build_band(
             draw_hat(&mut buf, ox, oy, head_row, head_col);
         }
     }
-    (buf, visible.iter().map(|v| v.index).collect())
+    (buf, visible, hidden)
 }
 
 /// Draw the whole strip: visible members in priority z-order (blocked draws
@@ -427,12 +428,8 @@ pub fn draw_herd(
 ) {
     let area = frame.area();
     let strip_w = area.width as usize;
-    let (buf, order) = build_band(herd, species, strip_w, theme, now_ms);
-
-    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
-    let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
+    let max_x = band_max_x(species, strip_w);
+    let (buf, order, hidden) = build_band(herd, species, strip_w, theme, now_ms);
 
     // Bottom-align the whole strip so it reads as a slim status line whatever
     // the pane's height (herdr enforces a minimum pane height, so the pane can be
@@ -441,13 +438,13 @@ pub fn draw_herd(
     // top, blending with the pane above. The icon lane keeps overlays/`+N`/the
     // caption off the member.
     //
-    // `band_top` is derived from `overlay_lane_y` (rather than recomputing
+    // `band_top` is derived from `overlay_lane_row0` (rather than recomputing
     // `band_rows` here) so the lane and the band agree on where one ends and
     // the other begins: a pane shorter than `STRIP_ROWS` shrinks the band
     // instead of overlapping the lane (#37). `draw_pixels` crops a squeezed
     // band from the top (the sprite's headroom), so the feet stay visible at
     // the pane floor.
-    let lane_y = overlay_lane_y(area);
+    let lane_y = overlay_lane_row0(area);
     let band_top = lane_y.saturating_add(1);
     let member_area = Rect {
         x: area.x,
@@ -458,17 +455,8 @@ pub fn draw_herd(
     draw_pixels(frame, member_area, &buf);
 
     // Overlays (bubbles/badges) as text cells above each visible member.
-    for &i in &order {
-        let member = &herd.members[i];
-        let Some(sp) = species
-            .get(member.identity.species_index)
-            .or_else(|| species.first())
-        else {
-            continue;
-        };
-        let Some(state) = sp.states.get(&member.status) else {
-            continue;
-        };
+    for v in &order {
+        let state = v.state;
         let (glyph, _kind) = match &state.overlay.kind {
             Overlay::Bubble(g) => (g.clone(), 'b'),
             Overlay::Badge(g) => (g.clone(), 'a'),
@@ -479,15 +467,8 @@ pub fn draw_herd(
             OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
             OverlayColor::Default => Color::Gray,
         };
-        let animated = animate(
-            &member.terminal_id,
-            member.status,
-            state,
-            now_ms,
-            member.anchor,
-        );
         let cx = area.x
-            + ((animated.x_fraction * max_x).round() as u16)
+            + ((v.animated.x_fraction * max_x).round() as u16)
                 .saturating_add(3)
                 .min(area.width.saturating_sub(glyph.chars().count() as u16));
         frame.buffer_mut().set_span(
@@ -515,10 +496,13 @@ pub fn draw_herd(
 }
 
 /// The row of the overlay lane that holds `+N`, the caption, and the build
-/// marker: one row above the bottom-aligned member band. The band shrinks
-/// below [`BAND_ROWS`] whenever the pane is shorter than [`STRIP_ROWS`] (#37),
-/// so the lane always keeps its own row and can never collide with a member.
-pub fn overlay_lane_y(area: Rect) -> u16 {
+/// marker: one row above the bottom-aligned member band. 0-indexed, since it
+/// is a ratatui buffer row (contrast [`kitty_render::overlay_lane_row1`],
+/// which is 1-indexed for the terminal's cursor-positioning escapes). The
+/// band shrinks below [`BAND_ROWS`] whenever the pane is shorter than
+/// [`STRIP_ROWS`] (#37), so the lane always keeps its own row and can never
+/// collide with a member.
+pub fn overlay_lane_row0(area: Rect) -> u16 {
     let band_rows = BAND_ROWS.min(area.height.saturating_sub(1));
     area.bottom().saturating_sub(band_rows).saturating_sub(1)
 }
@@ -594,11 +578,11 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
 
 /// The index of the visible member drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
-/// Only members that are actually drawn (the visible set on overflow) are
-/// hit-testable; when members overlap, the topmost — highest `priority`, matching
-/// the draw z-order — wins. Returns `None` over a gap or out of range. `now_ms`
-/// must match whatever was passed to `draw_herd` this frame, so hit-testing
-/// agrees with what's actually on screen.
+/// Uses the same visible-set + z-order selection [`build_band`] draws with, so
+/// hit-testing can never disagree with what's on screen; when members
+/// overlap, the topmost (last in z-order) wins. Returns `None` over a gap or
+/// out of range. `now_ms` must match whatever was passed to `draw_herd` this
+/// frame, so hit-testing agrees with what's actually on screen.
 pub fn member_at_column(
     herd: &Herd,
     species: &[Species],
@@ -606,41 +590,18 @@ pub fn member_at_column(
     col: u16,
     now_ms: u64,
 ) -> Option<usize> {
-    let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - base_w as f32).max(0.0);
-    let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
-    let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
+    let max_x = band_max_x(species, strip_w);
+    let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
 
     let x = col as i32;
     let mut best: Option<usize> = None;
-    for &i in &visible {
-        let member = &herd.members[i];
-        let Some(sp) = species
-            .get(member.identity.species_index)
-            .or_else(|| species.first())
-        else {
-            continue;
-        };
-        let Some(state) = sp.states.get(&member.status) else {
-            continue;
-        };
-        let w = sp.size().0 as i32;
-        let animated = animate(
-            &member.terminal_id,
-            member.status,
-            state,
-            now_ms,
-            member.anchor,
-        );
-        let left = (animated.x_fraction * max_x).round() as i32;
+    for v in &visible {
+        let w = v.frame.w as i32;
+        let left = (v.animated.x_fraction * max_x).round() as i32;
         if x >= left && x < left + w {
-            let take = match best {
-                None => true,
-                Some(b) => priority(member.status) >= priority(herd.members[b].status),
-            };
-            if take {
-                best = Some(i);
-            }
+            // Later in z-order = drawn on top -> overwrite so the frontmost
+            // covering member wins.
+            best = Some(v.index);
         }
     }
     best
@@ -774,7 +735,7 @@ impl MemberRenderer for HalfBlockRenderer {
         // feature-independent: the layout snapshots keep asserting the shipped
         // strip whichever way the crate is built. Mirrors the kitty path, which
         // emits its marker from its own `MemberRenderer::draw`.
-        draw_build_marker(frame, frame.area(), overlay_lane_y(frame.area()));
+        draw_build_marker(frame, frame.area(), overlay_lane_row0(frame.area()));
     }
     fn frame_signature(
         &self,
@@ -1785,7 +1746,7 @@ mod tests {
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
 
-        let lane = overlay_lane_y(Rect::new(0, 0, 60, 11)) as usize;
+        let lane = overlay_lane_row0(Rect::new(0, 0, 60, 11)) as usize;
         let reserved = marker::reserved_cols() as usize;
         let trait_rows = rows_of(via_trait.backend());
         let fn_rows = rows_of(via_fn.backend());
@@ -1927,7 +1888,7 @@ mod tests {
             identity_for("unfocused", 1),
             AgentStatus::Idle,
         ));
-        let (buf, _order) = build_band(&herd, &species, 50, Theme::Dark, NOW_MS);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 50, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1948,7 +1909,7 @@ mod tests {
         let mut member = Member::new("f".into(), identity_for("f", 1), AgentStatus::Working);
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1978,7 +1939,7 @@ mod tests {
         );
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -2001,7 +1962,7 @@ mod tests {
         );
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,

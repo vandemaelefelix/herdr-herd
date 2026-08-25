@@ -123,9 +123,11 @@ pub fn working_position(
 }
 
 /// A wandering (`Working`) member's horizontal position/facing at `now_ms`,
-/// ignoring any resume ease — the plain, stateless cycle. Kept as a thin
-/// convenience over [`working_position`] for callers that only need the bare
-/// cycle position/facing.
+/// ignoring any resume ease — the plain, stateless cycle. Test-only: used to
+/// independently recompute the expected position in assertions elsewhere
+/// (e.g. `herd::tests`); production code always goes through
+/// [`working_position`] since a real member always has an anchor to consider.
+#[cfg(test)]
 pub fn wander_position(terminal_id: &str, now_ms: u64) -> (f32, bool) {
     let (x_fraction, facing_left, _moving) = working_position(terminal_id, now_ms, None);
     (x_fraction, facing_left)
