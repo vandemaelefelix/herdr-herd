@@ -10,7 +10,7 @@
 //! on every path (`?`, panic, early return), so the terminal is always handed
 //! back.
 
-use std::io::{self, Write};
+use std::io;
 use std::sync::Once;
 
 use crossterm::cursor::Show;
@@ -137,11 +137,16 @@ impl<C: TerminalControl> Drop for TerminalGuard<C> {
 /// state was never entered.
 pub fn restore_terminal_best_effort() {
     let _ = disable_raw_mode();
-    let mut out = io::stdout();
-    // `renderer.teardown()` is skipped on the panic path, so delete any
-    // transmitted kitty images here or they outlive the process on screen.
-    let _ = out.write_all(crate::kitty::delete_all().as_bytes());
-    let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show);
+    let out = io::stdout();
+    // Deliberately NO kitty image cleanup here. The only delete reachable
+    // without the renderer's state is the terminal-global `a=d,d=A`, and that
+    // is exactly issue #28: every strip pane forwards into one outer terminal,
+    // so a global delete issued by this pane blanks every *other* pane's sheep
+    // permanently. `KittyRenderer::teardown` frees this pane's own id block on
+    // the normal exit path; on the panic path the images are simply left, which
+    // is cosmetic and clears on the next redraw. Pane-scoped cleanup here would
+    // need the live id set reachable from the hook — tracked separately.
+    let _ = execute!(&out, LeaveAlternateScreen, DisableMouseCapture, Show);
 }
 
 /// Install a process-wide panic hook that hands the terminal back *before* the
