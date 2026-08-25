@@ -559,8 +559,11 @@ pub fn inject_strip(
     let strip_pane = parse_split_pane_id(&split_reply)?;
     // `exec` so the renderer *replaces* the pane's shell: when it exits the
     // pane exits with it, rather than lingering as a labelled corpse that every
-    // later sweep counts as a working strip.
-    let render_cmd = format!("exec '{self_exe}' render");
+    // later sweep counts as a working strip. `pane run` executes via a shell,
+    // so `self_exe` is single-quoted rather than pasted in raw: an unescaped
+    // `'` in the path (e.g. `/Users/o'brien/...`) would break the quoting and
+    // the renderer would silently never start.
+    let render_cmd = format!("exec {} render", shell_single_quote(self_exe));
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     // An unlabelled strip is invisible to every later sweep, which would then
     // inject a second one into the same tab. Rather than leave that orphan
@@ -571,6 +574,22 @@ pub fn inject_strip(
         return Err(e);
     }
     Ok(())
+}
+
+/// Wrap `s` in single quotes for a POSIX shell, escaping any embedded single
+/// quote as `'\''` (close the quote, an escaped literal quote, reopen it).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Extract `result.pane.pane_id` from a `herdr pane split` reply.
@@ -842,6 +861,25 @@ mod tests {
             vec!["pane", "run", "w1:pNEW", "exec '/abs/herdr-herd' render"]
         );
         assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
+    }
+
+    /// `pane run` executes via a shell. An unescaped `'` in `self_exe` (e.g.
+    /// a home directory like `/Users/o'brien`) would break the quoting and
+    /// the renderer would silently never start.
+    #[test]
+    fn inject_strip_escapes_a_single_quote_in_self_exe() {
+        let cli = FakeCli::new();
+        inject_strip(&cli, "w1:p1", 64, "/Users/o'brien/herdr-herd", 7).unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                r"exec '/Users/o'\''brien/herdr-herd' render"
+            ]
+        );
     }
 
     fn tab(id: &str, panes: u32) -> TabRef {
