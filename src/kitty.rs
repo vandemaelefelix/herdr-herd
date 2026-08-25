@@ -47,6 +47,9 @@ pub fn transmit_rgba(id: u32, w: usize, h: usize, rgba: &[u8]) -> String {
 }
 
 /// Place transmitted image `id` as placement `pid` at the current cursor.
+/// Test-only: production placement always goes through [`place_cropped`],
+/// which subsumes this; kept to exercise the bare, unsized escape sequence.
+#[cfg(test)]
 pub fn place(id: u32, pid: u32) -> String {
     apc(&format!("a=p,i={id},p={pid},q=2"), "")
 }
@@ -57,6 +60,10 @@ pub fn place(id: u32, pid: u32) -> String {
 /// querying the cell pixel size (which herdr does not report); the explicit `z`
 /// makes overlap stacking deterministic and match our draw z-order, so hover
 /// hit-testing agrees with what is visually in front.
+/// Test-only: production placement always goes through [`place_cropped`],
+/// which subsumes this; kept to exercise the sized-but-uncropped escape
+/// sequence.
+#[cfg(test)]
 pub fn place_sized(id: u32, pid: u32, cols: u16, rows: u16, z: i32) -> String {
     apc(
         &format!("a=p,i={id},p={pid},c={cols},r={rows},z={z},q=2"),
