@@ -106,7 +106,13 @@ pub fn classify_event(line: &str) -> EventClass {
 pub struct Timings {
     /// The safety net: refresh at least this often, whatever the socket is
     /// doing. Pure status transitions (`idle`↔`working`) have no global event,
-    /// so this is what carries them.
+    /// so this is not really a safety net for them, it is their transport, and
+    /// it bounds how stale a sheep's status can be.
+    ///
+    /// Kept at 2500 deliberately. #41 raised it to 5000 on the grounds that a
+    /// refresh was expensive, but a refresh over the socket costs 0.7 ms of CPU
+    /// against the old 25 ms, so the reason to poll slowly is gone while the
+    /// cost of polling slowly (a sheep up to `slow_ms` behind reality) is not.
     pub slow_ms: u64,
     /// How long a burst of structural events is coalesced for.
     pub debounce_ms: u64,
@@ -120,7 +126,7 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
-            slow_ms: 5_000,
+            slow_ms: 2_500,
             debounce_ms: 750,
             focus_ms: 100,
         }
@@ -435,7 +441,7 @@ mod tests {
     #[test]
     fn a_focus_event_refreshes_long_before_a_structural_one_would() {
         let t = Timings {
-            slow_ms: 5_000,
+            slow_ms: 2_500,
             debounce_ms: 750,
             focus_ms: 100,
         };
@@ -479,17 +485,18 @@ mod tests {
     /// The safety net carries the status transitions that have no global event.
     #[test]
     fn the_slow_poll_comes_due_with_no_events_at_all() {
-        let mut d = Debouncer::new(Timings::default());
+        let t = Timings::default();
+        let mut d = Debouncer::new(t);
         d.sent(0);
-        assert!(!d.due(4_999));
-        assert!(d.due(5_000));
+        assert!(!d.due(t.slow_ms - 1));
+        assert!(d.due(t.slow_ms));
     }
 
     #[test]
     fn the_defaults_keep_focus_far_faster_than_the_structural_window() {
         let t = Timings::default();
         assert_eq!(t.debounce_ms, 750);
-        assert_eq!(t.slow_ms, 5_000);
+        assert_eq!(t.slow_ms, 2_500);
         assert!(
             t.focus_ms < t.debounce_ms,
             "raising the debounce must not slow the hat"
