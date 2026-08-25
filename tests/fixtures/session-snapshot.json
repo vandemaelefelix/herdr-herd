@@ -1,0 +1,245 @@
+{
+  "id": "herd:snapshot",
+  "result": {
+    "type": "session_snapshot",
+    "snapshot": {
+      "protocol": 19,
+      "version": "0.8.0",
+      "focused_pane_id": "w1:p1",
+      "focused_tab_id": "w1:t1",
+      "focused_workspace_id": "w1",
+      "workspaces": [
+        {
+          "active_tab_id": "w1:t1",
+          "agent_status": "working",
+          "focused": true,
+          "label": "herdr-herd",
+          "number": 1,
+          "pane_count": 4,
+          "tab_count": 3,
+          "workspace_id": "w1",
+          "worktree": {
+            "checkout_path": "/Users/felix/projects/herdr-herd",
+            "is_linked_worktree": false,
+            "repo_key": "/Users/felix/projects/herdr-herd/.git",
+            "repo_name": "herdr-herd",
+            "repo_root": "/Users/felix/projects/herdr-herd"
+          }
+        },
+        {
+          "agent_status": "idle",
+          "focused": false,
+          "label": "   ",
+          "number": 2,
+          "pane_count": 1,
+          "tab_count": 1,
+          "workspace_id": "w2"
+        }
+      ],
+      "tabs": [
+        {
+          "agent_status": "working",
+          "focused": true,
+          "label": "renderer",
+          "number": 1,
+          "pane_count": 2,
+          "tab_id": "w1:t1",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "idle",
+          "focused": false,
+          "label": "Lazygit",
+          "number": 2,
+          "pane_count": 2,
+          "tab_id": "w1:t2",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "unknown",
+          "focused": false,
+          "number": 3,
+          "pane_count": 1,
+          "tab_id": "w1:tCOL",
+          "workspace_id": "w1"
+        }
+      ],
+      "agents": [
+        {
+          "agent": "claude",
+          "agent_status": "working",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": true,
+          "foreground_cwd": "/Users/felix/projects/herdr-herd",
+          "pane_id": "w1:p1",
+          "revision": 79,
+          "state_change_seq": 256,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_1",
+          "terminal_title": "✳ Wiring the watcher to the socket",
+          "terminal_title_stripped": "Wiring the watcher to the socket",
+          "workspace_id": "w1"
+        },
+        {
+          "agent": "claude",
+          "agent_status": "teleporting",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": false,
+          "foreground_cwd": "/Users/felix/projects/herdr-herd/docs",
+          "pane_id": "w1:p3",
+          "revision": 8,
+          "state_change_seq": 412,
+          "tab_id": "w1:t2",
+          "terminal_id": "term_3",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "idle",
+          "cwd": "/Users/felix/scratch",
+          "focused": false,
+          "foreground_cwd": "/Users/felix/scratch",
+          "pane_id": "w2:p9",
+          "revision": 0,
+          "tab_id": "w2:t9",
+          "terminal_id": "term_9",
+          "workspace_id": "w2"
+        },
+        {
+          "agent_status": "idle",
+          "cwd": null,
+          "focused": false,
+          "foreground_cwd": null,
+          "pane_id": "w1:pBAD",
+          "revision": 0,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_bad",
+          "workspace_id": "w1"
+        }
+      ],
+      "panes": [
+        {
+          "agent": "claude",
+          "agent_status": "working",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": true,
+          "foreground_cwd": "/Users/felix/projects/herdr-herd",
+          "pane_id": "w1:p1",
+          "revision": 79,
+          "scroll": {
+            "max_offset_from_bottom": 0,
+            "offset_from_bottom": 0,
+            "viewport_rows": 57
+          },
+          "tab_id": "w1:t1",
+          "terminal_id": "term_1",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": false,
+          "foreground_cwd": "/Users/felix/projects/herdr-herd",
+          "label": "herdr-herd",
+          "pane_id": "w1:pSTRIP",
+          "revision": 0,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_strip",
+          "workspace_id": "w1"
+        },
+        {
+          "agent": "claude",
+          "agent_status": "idle",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": false,
+          "foreground_cwd": "/Users/felix/projects/herdr-herd/docs",
+          "pane_id": "w1:p3",
+          "revision": 8,
+          "tab_id": "w1:t2",
+          "terminal_id": "term_3",
+          "workspace_id": "w1"
+        },
+        {
+          "agent_status": "unknown",
+          "cwd": "/Users/felix/projects/herdr-herd",
+          "focused": false,
+          "pane_id": "w1:pCOL",
+          "revision": 0,
+          "tab_id": "w1:tCOL",
+          "terminal_id": "term_col",
+          "workspace_id": "w1"
+        }
+      ],
+      "layouts": [
+        {
+          "area": { "height": 64, "width": 100, "x": 0, "y": 1 },
+          "focused_pane_id": "w1:p1",
+          "panes": [
+            {
+              "focused": true,
+              "pane_id": "w1:p1",
+              "rect": { "height": 57, "width": 100, "x": 0, "y": 1 }
+            },
+            {
+              "focused": false,
+              "pane_id": "w1:pSTRIP",
+              "rect": { "height": 7, "width": 100, "x": 0, "y": 58 }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "down",
+              "id": "split_0_root",
+              "ratio": 0.89,
+              "rect": { "height": 64, "width": 100, "x": 0, "y": 1 }
+            }
+          ],
+          "tab_id": "w1:t1",
+          "workspace_id": "w1",
+          "zoomed": false
+        },
+        {
+          "area": { "height": 64, "width": 100, "x": 0, "y": 1 },
+          "focused_pane_id": "w1:p3",
+          "panes": [
+            {
+              "focused": true,
+              "pane_id": "w1:p3",
+              "rect": { "height": 64, "width": 100, "x": 0, "y": 1 }
+            }
+          ],
+          "splits": [],
+          "tab_id": "w1:t2",
+          "workspace_id": "w1",
+          "zoomed": false
+        },
+        {
+          "area": { "height": 64, "width": 100, "x": 0, "y": 1 },
+          "focused_pane_id": "w1:pCOL",
+          "panes": [
+            {
+              "focused": true,
+              "pane_id": "w1:pCOL",
+              "rect": { "height": 64, "width": 50, "x": 0, "y": 1 }
+            },
+            {
+              "focused": false,
+              "pane_id": "w1:pCOL2",
+              "rect": { "height": 64, "width": 50, "x": 50, "y": 1 }
+            }
+          ],
+          "splits": [
+            {
+              "direction": "right",
+              "id": "split_0_root",
+              "ratio": 0.5,
+              "rect": { "height": 64, "width": 100, "x": 0, "y": 1 }
+            }
+          ],
+          "tab_id": "w1:tCOL",
+          "workspace_id": "w1",
+          "zoomed": false
+        }
+      ]
+    }
+  }
+}

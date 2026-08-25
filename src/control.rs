@@ -3,8 +3,8 @@
 //! processes — Phase 3 spike). Pure sweep logic here; the loop + I/O are thin
 //! shells over the `herdr` CLI seam. See the Phase 3 design spec.
 
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ use serde_json::Value;
 
 use crate::herdr::HerdrCli;
 use crate::place::slim_ratio;
+use crate::snapshot::parse_session_snapshot;
+use crate::socket::RpcClient;
 use crate::{lock, socket};
 
 /// The pane label the controller stamps on each strip so later sweeps (and a
@@ -66,7 +68,15 @@ pub struct StripTarget {
 /// Tolerant: malformed or absent geometry ⇒ `None` (the tab is skipped).
 pub fn find_bottom_strip_target(layout_json: &str) -> Option<StripTarget> {
     let v: Value = serde_json::from_str(layout_json).ok()?;
-    let layout = v.get("result")?.get("layout")?;
+    strip_target_from_layout(v.get("result")?.get("layout")?)
+}
+
+/// The same choice, made straight from a layout object.
+///
+/// This is the shape `session.snapshot` hands over in `layouts[]`, one entry per
+/// tab, so on the socket path the controller picks every tab's split target
+/// without a `pane layout` spawn per candidate.
+pub fn strip_target_from_layout(layout: &Value) -> Option<StripTarget> {
     let area = layout.get("area")?;
     let ax = area.get("x")?.as_i64()?;
     let ay = area.get("y")?.as_i64()?;
@@ -210,20 +220,233 @@ pub fn renderer_is_running(process_info_json: &str) -> bool {
 /// The process name a running strip renderer reports — this crate's own binary.
 const RENDERER_PROCESS_NAME: &str = "herdr-herd";
 
-/// The strip panes whose renderer is no longer running, so the sweep can close
-/// them and re-inject a live strip next time round.
-fn plan_dead_strips(cli: &dyn HerdrCli, panes: &[PaneRef]) -> Vec<String> {
-    controller_strips(panes)
-        .into_iter()
-        .filter(|id| {
-            // An unreadable reply counts as live, same as a malformed one:
-            // never reap on doubt.
-            match cli.run_json(&["pane", "process-info", "--pane", id]) {
-                Ok(reply) => !renderer_is_running(&reply),
-                Err(_) => false,
+/// How long the controller goes between liveness probes of the same strip.
+///
+/// Probing every strip every sweep is the cost issue #59 names: at ten tabs and
+/// the 3 s sweep floor that is ~3 process spawns a second, asking panes that
+/// answered a moment ago whether they are still there. A strip that has died
+/// stays dead, so a longer interval costs only latency before the replacement
+/// lands, and in the common case the pane exits with its renderer anyway
+/// (`inject_strip` `exec`s it), which the sweep sees for free in the pane list.
+pub const STRIP_PROBE_INTERVAL_MS: u64 = 30_000;
+
+/// How many sweeps of `interval` fit in [`STRIP_PROBE_INTERVAL_MS`]. At least
+/// one, so a sweep interval longer than the probe interval still probes every
+/// time round rather than dividing to zero.
+pub fn probe_every_sweeps(interval: Duration) -> u64 {
+    let ms = (interval.as_millis().max(1)) as u64;
+    (STRIP_PROBE_INTERVAL_MS / ms).max(1)
+}
+
+/// Which strips answered "the renderer is running" recently, so a sweep only
+/// pays for a `pane process-info` probe on the ones it has not checked lately.
+///
+/// Keyed by pane id and counted in sweeps rather than milliseconds: the
+/// controller's only clock is its own loop, and counting sweeps keeps the
+/// decision pure and testable.
+#[derive(Debug, Default)]
+pub struct StripHealth {
+    confirmed: HashMap<String, u64>,
+}
+
+impl StripHealth {
+    /// The strips to probe on sweep `sweep`: every one never probed (so a strip
+    /// inherited from a previous controller is checked the moment it is seen),
+    /// and every one last confirmed `probe_every` or more sweeps ago.
+    pub fn due(&self, strips: &[String], sweep: u64, probe_every: u64) -> Vec<String> {
+        strips
+            .iter()
+            .filter(|id| match self.confirmed.get(*id) {
+                Some(last) => sweep.saturating_sub(*last) >= probe_every,
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Record that `pane_id` answered "renderer running" on sweep `sweep`.
+    pub fn confirm(&mut self, pane_id: &str, sweep: u64) {
+        self.confirmed.insert(pane_id.to_string(), sweep);
+    }
+
+    /// Forget strips that are gone, so a controller that runs for days does not
+    /// keep an entry for every pane it has ever seen.
+    pub fn forget_missing(&mut self, strips: &[String]) {
+        let alive: HashSet<&str> = strips.iter().map(String::as_str).collect();
+        self.confirmed.retain(|id, _| alive.contains(id.as_str()));
+    }
+}
+
+/// One sweep's view of the session.
+#[derive(Debug, Default)]
+pub struct SessionView {
+    pub tabs: Vec<TabRef>,
+    pub panes: Vec<PaneRef>,
+    /// `tab_id → that tab's layout`. Filled on the socket path, where one
+    /// `session.snapshot` carries every tab's layout; empty on the CLI
+    /// fallback, where each candidate tab still costs its own `pane layout`.
+    pub layouts: HashMap<String, Value>,
+}
+
+/// The controller, sweeping.
+///
+/// Owns its two sources (the control socket first, the `herdr` CLI as the
+/// fallback) and the per-strip health memo, which only pays for itself if it
+/// survives between sweeps.
+pub struct Sweeper<'a> {
+    rpc: Option<&'a dyn RpcClient>,
+    cli: &'a dyn HerdrCli,
+    self_exe: &'a str,
+    target_rows: u16,
+    probe_every: u64,
+    sweep: u64,
+    health: StripHealth,
+}
+
+impl<'a> Sweeper<'a> {
+    /// Wire a sweeper to its sources. `rpc` is `None` outside a herdr session,
+    /// which puts every read back on the CLI.
+    pub fn new(
+        rpc: Option<&'a dyn RpcClient>,
+        cli: &'a dyn HerdrCli,
+        self_exe: &'a str,
+        target_rows: u16,
+        probe_every: u64,
+    ) -> Self {
+        Self {
+            rpc,
+            cli,
+            self_exe,
+            target_rows,
+            probe_every: probe_every.max(1),
+            sweep: 0,
+            health: StripHealth::default(),
+        }
+    }
+
+    /// One sweep: read the session, then inject a strip into every tab that has
+    /// a full-width bottom pane (single-pane tabs and top+bottom multi-pane
+    /// tabs). A tab with no full-width bottom pane (columned bottom) is skipped
+    /// and left to the on-demand `place`. A per-tab failure is logged and
+    /// skipped so one bad tab never aborts the sweep or the others.
+    pub fn sweep_once(&mut self) -> io::Result<()> {
+        self.sweep = self.sweep.saturating_add(1);
+        let view = self.read_session()?;
+        // Reap before injecting: collapsing a tab to one strip must not be
+        // undone by this same sweep deciding the tab still needs one.
+        for extra in plan_reap(&view.panes) {
+            if let Err(e) = self.cli.run_json(&["pane", "close", &extra]) {
+                eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
             }
+        }
+        // Close strips whose renderer has died. Left alone they keep their
+        // label forever, so the tab looks covered and never gets a working
+        // strip back. The next sweep injects the replacement: closing and
+        // re-injecting in one pass would race the layout this sweep already
+        // read.
+        for dead in self.plan_dead_strips(&view.panes) {
+            if let Err(e) = self.cli.run_json(&["pane", "close", &dead]) {
+                eprintln!("herdr-herd: could not close dead strip {dead}: {e}");
+            }
+        }
+        for (tab_id, probe_pane) in plan_injections(&view.tabs, &view.panes) {
+            let result = (|| -> io::Result<()> {
+                match self.strip_target(&view, &tab_id, &probe_pane)? {
+                    Some(target) => inject_strip(
+                        self.cli,
+                        &target.pane_id,
+                        target.pane_rows,
+                        self.self_exe,
+                        self.target_rows,
+                    ),
+                    None => Ok(()), // columned bottom: no full-width strip possible
+                }
+            })();
+            if let Err(e) = result {
+                eprintln!("herdr-herd: could not place strip in {tab_id}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The tabs, panes and (on the socket path) layouts this sweep works from.
+    ///
+    /// One `session.snapshot` replaces `tab list` + `pane list` + a `pane
+    /// layout` per candidate tab. Anything the socket cannot answer (no
+    /// socket, a failed call, a reply we cannot read) falls back to those CLI
+    /// spawns rather than skipping the sweep.
+    fn read_session(&self) -> io::Result<SessionView> {
+        if let Some(rpc) = self.rpc
+            && let Ok(reply) = rpc.call(&socket::snapshot_request())
+            && let Ok(snapshot) = parse_session_snapshot(&reply)
+        {
+            return Ok(SessionView {
+                tabs: snapshot.tabs,
+                panes: snapshot.panes,
+                layouts: snapshot.layouts,
+            });
+        }
+        Ok(SessionView {
+            tabs: parse_tabs(&self.cli.run_json(&["tab", "list"])?)?,
+            panes: parse_panes(&self.cli.run_json(&["pane", "list"])?)?,
+            layouts: HashMap::new(),
         })
-        .collect()
+    }
+
+    /// Where to split for `tab_id`'s strip: from the snapshot's own layout when
+    /// there is one, else from a `pane layout` spawn probing `probe_pane`.
+    fn strip_target(
+        &self,
+        view: &SessionView,
+        tab_id: &str,
+        probe_pane: &str,
+    ) -> io::Result<Option<StripTarget>> {
+        match view.layouts.get(tab_id) {
+            Some(layout) => Ok(strip_target_from_layout(layout)),
+            None => {
+                let json = self
+                    .cli
+                    .run_json(&["pane", "layout", "--pane", probe_pane])?;
+                Ok(find_bottom_strip_target(&json))
+            }
+        }
+    }
+
+    /// The strip panes whose renderer is no longer running, so the sweep can
+    /// close them and re-inject a live strip next time round.
+    ///
+    /// Only strips due a probe are asked; the rest are taken as live on the
+    /// strength of their last answer (see [`StripHealth`]).
+    fn plan_dead_strips(&mut self, panes: &[PaneRef]) -> Vec<String> {
+        let strips = controller_strips(panes);
+        self.health.forget_missing(&strips);
+        let sweep = self.sweep;
+        let due = self.health.due(&strips, sweep, self.probe_every);
+        let mut dead = Vec::new();
+        for id in due {
+            // An unreadable reply counts as live, same as a malformed one:
+            // never reap on doubt. It is not recorded as confirmed either, so
+            // the next sweep asks again instead of trusting a non-answer.
+            match self.process_info(&id) {
+                Ok(reply) if !renderer_is_running(&reply) => dead.push(id),
+                Ok(_) => self.health.confirm(&id, sweep),
+                Err(_) => {}
+            }
+        }
+        dead
+    }
+
+    /// One pane's foreground processes: over the control socket when it is up,
+    /// else a `herdr pane process-info` spawn.
+    fn process_info(&self, pane_id: &str) -> io::Result<String> {
+        if let Some(rpc) = self.rpc
+            && let Ok(reply) = rpc.call(&socket::process_info_request(pane_id))
+        {
+            return Ok(reply);
+        }
+        self.cli
+            .run_json(&["pane", "process-info", "--pane", pane_id])
+    }
 }
 
 /// The strips the *controller* injected — the subset a reload may restart.
@@ -333,58 +556,12 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("no result.pane.pane_id in pane split reply"))
 }
 
-/// One sweep: list tabs + panes, then inject a strip into every tab that has a
-/// full-width bottom pane (single-pane tabs and top+bottom multi-pane tabs).
-/// For each candidate the tab's layout is fetched and
-/// [`find_bottom_strip_target`] picks the split target; a tab with no full-width
-/// bottom pane (columned bottom) is skipped (left to on-demand `place`). A
-/// per-tab failure is logged and skipped so one bad tab never aborts the sweep
-/// or the others (unobtrusive).
-pub fn sweep_once(cli: &dyn HerdrCli, self_exe: &str, target_rows: u16) -> io::Result<()> {
-    let tabs = parse_tabs(&cli.run_json(&["tab", "list"])?)?;
-    let panes = parse_panes(&cli.run_json(&["pane", "list"])?)?;
-    // Reap before injecting: collapsing a tab to one strip must not be undone
-    // by this same sweep deciding the tab still needs one.
-    for extra in plan_reap(&panes) {
-        if let Err(e) = cli.run_json(&["pane", "close", &extra]) {
-            eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
-        }
-    }
-    // Close strips whose renderer has died. Left alone they keep their label
-    // forever, so the tab looks covered and never gets a working strip back.
-    // The next sweep injects the replacement — closing and re-injecting in one
-    // pass would race the layout this sweep already read.
-    for dead in plan_dead_strips(cli, &panes) {
-        if let Err(e) = cli.run_json(&["pane", "close", &dead]) {
-            eprintln!("herdr-herd: could not close dead strip {dead}: {e}");
-        }
-    }
-    for (tab_id, probe_pane) in plan_injections(&tabs, &panes) {
-        let result = (|| -> io::Result<()> {
-            let layout = cli.run_json(&["pane", "layout", "--pane", &probe_pane])?;
-            match find_bottom_strip_target(&layout) {
-                Some(target) => inject_strip(
-                    cli,
-                    &target.pane_id,
-                    target.pane_rows,
-                    self_exe,
-                    target_rows,
-                ),
-                None => Ok(()), // columned bottom — no full-width strip possible
-            }
-        })();
-        if let Err(e) = result {
-            eprintln!("herdr-herd: could not place strip in {tab_id}: {e}");
-        }
-    }
-    Ok(())
-}
-
 /// Run the watchdog: take the single-owner lock (exit cleanly if another
 /// controller holds it), then sweep every `interval` forever. The poll unifies
 /// startup, new-tab injection, and respawn/re-assert (a closed strip reappears
 /// next sweep). A failed whole sweep is logged and retried next interval.
 pub fn control(
+    rpc: Option<&dyn RpcClient>,
     cli: &dyn HerdrCli,
     self_exe: &str,
     lock_path: &Path,
@@ -398,6 +575,13 @@ pub fn control(
             return Ok(());
         }
     };
+    let mut sweeper = Sweeper::new(
+        rpc,
+        cli,
+        self_exe,
+        target_rows,
+        probe_every_sweeps(interval),
+    );
     let mut baseline = binary_stamp(self_exe);
     loop {
         if binary_changed(baseline, binary_stamp(self_exe)) {
@@ -410,7 +594,7 @@ pub fn control(
             eprintln!("herdr-herd: could not re-exec {self_exe}: {err}; staying on this build");
             baseline = binary_stamp(self_exe);
         }
-        if let Err(e) = sweep_once(cli, self_exe, target_rows) {
+        if let Err(e) = sweeper.sweep_once() {
             eprintln!("herdr-herd: sweep failed: {e}");
         }
         std::thread::sleep(interval);
@@ -466,6 +650,94 @@ pub fn controller_lock_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// A sweeper with no socket (so every read goes through the CLI double) and
+    /// `probe_every = 1`, i.e. probing every strip every sweep.
+    fn sweeper(cli: &dyn HerdrCli) -> Sweeper<'_> {
+        Sweeper::new(None, cli, "/abs/herdr-herd", 7, 1)
+    }
+
+    const SNAPSHOT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/session-snapshot.json"
+    ));
+
+    /// A control-socket double: answers `session.snapshot` from the fixture and
+    /// `pane.process_info` per pane, recording every method it was asked for.
+    struct FakeRpc {
+        calls: RefCell<Vec<String>>,
+        snapshot: String,
+        /// Panes whose renderer has exited, so the probe reports a shell.
+        dead: RefCell<HashSet<String>>,
+        /// Panes the socket cannot answer for at all.
+        unanswerable: HashSet<String>,
+    }
+    impl FakeRpc {
+        fn new(snapshot: &str) -> Self {
+            FakeRpc {
+                calls: RefCell::new(Vec::new()),
+                snapshot: snapshot.to_string(),
+                dead: RefCell::new(HashSet::new()),
+                unanswerable: HashSet::new(),
+            }
+        }
+        /// The renderer in `pane_id` has just exited.
+        fn kill(&self, pane_id: &str) {
+            self.dead.borrow_mut().insert(pane_id.to_string());
+        }
+        fn calls_of(&self, method: &str) -> usize {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with(method))
+                .count()
+        }
+    }
+    impl RpcClient for FakeRpc {
+        fn call(&self, payload: &str) -> io::Result<String> {
+            let v: Value = serde_json::from_str(payload).map_err(io::Error::other)?;
+            let method = v["method"].as_str().unwrap_or_default().to_string();
+            let pane = v["params"]["pane_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            self.calls.borrow_mut().push(format!("{method} {pane}"));
+            match method.as_str() {
+                "session.snapshot" => Ok(self.snapshot.clone()),
+                "pane.process_info" if self.unanswerable.contains(&pane) => {
+                    Err(io::Error::other("no answer"))
+                }
+                "pane.process_info" => Ok(process_info(if self.dead.borrow().contains(&pane) {
+                    "zsh"
+                } else {
+                    "herdr-herd"
+                })),
+                _ => Ok(r#"{"result":{}}"#.into()),
+            }
+        }
+    }
+
+    /// A CLI double for the socket-path tests: it answers the mutations
+    /// (`pane split`/`run`/`rename`/`close`) and records everything, so a test
+    /// can assert that no *read* ever reached it.
+    fn one_tab_cli() -> SweepFake {
+        SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":2}]}}"#.into(),
+            panes: r#"{"result":{"panes":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1"},
+                {"pane_id":"w1:pLIVE","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
+                .into(),
+        }
+    }
+
+    fn calls_matching(cli: &SweepFake, argv: &str) -> usize {
+        cli.calls
+            .borrow()
+            .iter()
+            .filter(|c| c.join(" ").starts_with(argv))
+            .count()
+    }
 
     /// A `pane layout` reply for a tab whose bottom edge is the full-width pane
     /// `id` (single-pane tab, or a top+bottom multi-pane tab). 64-row tab.
@@ -592,6 +864,218 @@ mod tests {
     }
 
     #[test]
+    fn probe_every_sweeps_scales_with_the_sweep_interval() {
+        // The 3 s default floor: one probe per strip per ten sweeps.
+        assert_eq!(probe_every_sweeps(Duration::from_millis(3_000)), 10);
+        assert_eq!(probe_every_sweeps(Duration::from_millis(250)), 120);
+        // A sweep slower than the probe interval still probes every sweep,
+        // rather than dividing to zero and probing on none of them.
+        assert_eq!(probe_every_sweeps(Duration::from_secs(60)), 1);
+    }
+
+    #[test]
+    fn a_strip_seen_for_the_first_time_is_probed_at_once() {
+        let health = StripHealth::default();
+        let strips = vec!["w1:pA".to_string()];
+        assert_eq!(health.due(&strips, 1, 10), strips, "never probed before");
+    }
+
+    #[test]
+    fn a_strip_confirmed_live_is_not_probed_again_until_the_interval_is_up() {
+        let mut health = StripHealth::default();
+        let strips = vec!["w1:pA".to_string()];
+        health.confirm("w1:pA", 1);
+        assert!(health.due(&strips, 10, 10).is_empty(), "9 sweeps on: quiet");
+        assert_eq!(health.due(&strips, 11, 10), strips, "10 sweeps on: due");
+    }
+
+    /// A controller can run for days; the memo must not grow an entry for every
+    /// pane that has ever held a strip.
+    #[test]
+    fn the_probe_memo_forgets_strips_that_are_gone() {
+        let mut health = StripHealth::default();
+        health.confirm("w1:pGONE", 1);
+        health.confirm("w1:pA", 1);
+        health.forget_missing(&["w1:pA".to_string()]);
+        assert!(
+            health.due(&["w1:pGONE".to_string()], 2, 10) == vec!["w1:pGONE".to_string()],
+            "a pane that comes back is probed as if new"
+        );
+        assert!(health.due(&["w1:pA".to_string()], 2, 10).is_empty());
+    }
+
+    /// Issue #59: the sweep used to ask every strip, every sweep, whether it was
+    /// still alive.
+    #[test]
+    fn a_live_strip_is_probed_once_per_interval_not_once_per_sweep() {
+        let cli = one_tab_cli();
+        let rpc = FakeRpc::new(SNAPSHOT);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        for _ in 0..5 {
+            sw.sweep_once().unwrap();
+        }
+        assert_eq!(
+            rpc.calls_of("pane.process_info"),
+            1,
+            "five sweeps, one probe"
+        );
+
+        let cli = one_tab_cli();
+        let rpc = FakeRpc::new(SNAPSHOT);
+        let mut every = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 1);
+        for _ in 0..5 {
+            every.sweep_once().unwrap();
+        }
+        assert_eq!(
+            rpc.calls_of("pane.process_info"),
+            5,
+            "the old behaviour, for comparison"
+        );
+    }
+
+    /// The bound on what the memo costs: a strip that dies between probes is
+    /// still reaped, just on its next probe rather than the next sweep.
+    #[test]
+    fn a_strip_that_dies_between_probes_is_caught_on_its_next_probe() {
+        let cli = one_tab_cli();
+        let rpc = FakeRpc::new(SNAPSHOT);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 3);
+        sw.sweep_once().unwrap(); // sweep 1: probed, alive, confirmed
+        rpc.kill("w1:pSTRIP"); // the renderer exits
+        sw.sweep_once().unwrap(); // sweep 2: not due
+        sw.sweep_once().unwrap(); // sweep 3: not due
+        assert_eq!(
+            calls_matching(&cli, "pane close"),
+            0,
+            "nothing is reaped on the strength of a stale answer"
+        );
+        sw.sweep_once().unwrap(); // sweep 4: due again
+        assert_eq!(
+            calls_matching(&cli, "pane close w1:pSTRIP"),
+            1,
+            "the dead strip is closed once its probe comes round"
+        );
+    }
+
+    /// The socket cannot answer, so the probe falls back to a spawn, and the
+    /// spawn's answer counts, so the strip is confirmed like any other.
+    #[test]
+    fn a_probe_the_socket_cannot_answer_falls_back_to_a_spawn() {
+        let cli = one_tab_cli();
+        let mut rpc = FakeRpc::new(SNAPSHOT);
+        rpc.unanswerable.insert("w1:pSTRIP".to_string());
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        sw.sweep_once().unwrap();
+        sw.sweep_once().unwrap();
+        assert_eq!(calls_matching(&cli, "pane close"), 0, "the strip is live");
+        assert_eq!(
+            calls_matching(&cli, "pane process-info"),
+            1,
+            "one spawn, then the memo carries it"
+        );
+    }
+
+    /// Never reap on doubt, and never let a non-answer count as an answer: a
+    /// probe nothing can answer leaves the strip alone and asks again.
+    #[test]
+    fn a_probe_nothing_can_answer_is_retried_rather_than_trusted() {
+        /// A CLI double that fails every `pane process-info` and otherwise
+        /// behaves like [`SweepFake`].
+        struct NoProcessInfo(SweepFake);
+        impl HerdrCli for NoProcessInfo {
+            fn run_json(&self, args: &[&str]) -> io::Result<String> {
+                match args {
+                    ["pane", "process-info", ..] => {
+                        self.0
+                            .calls
+                            .borrow_mut()
+                            .push(args.iter().map(|s| s.to_string()).collect());
+                        Err(io::Error::other("boom"))
+                    }
+                    _ => self.0.run_json(args),
+                }
+            }
+        }
+
+        let cli = NoProcessInfo(one_tab_cli());
+        let mut rpc = FakeRpc::new(SNAPSHOT);
+        rpc.unanswerable.insert("w1:pSTRIP".to_string());
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        sw.sweep_once().unwrap();
+        sw.sweep_once().unwrap();
+        assert_eq!(
+            calls_matching(&cli.0, "pane close"),
+            0,
+            "an unanswered probe must never close a healthy strip"
+        );
+        assert_eq!(
+            calls_matching(&cli.0, "pane process-info"),
+            2,
+            "a non-answer is not a confirmation, so the next sweep asks again"
+        );
+    }
+
+    /// One `session.snapshot` replaces `tab list` + `pane list` + a `pane
+    /// layout` per candidate tab.
+    #[test]
+    fn the_socket_path_reads_the_whole_session_without_a_single_spawn() {
+        let cli = one_tab_cli();
+        let rpc = FakeRpc::new(SNAPSHOT);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        sw.sweep_once().unwrap();
+
+        assert_eq!(rpc.calls_of("session.snapshot"), 1);
+        for read in ["tab list", "pane list", "pane layout"] {
+            assert_eq!(
+                calls_matching(&cli, read),
+                0,
+                "`{read}` must not be spawned when the socket answered"
+            );
+        }
+        // The fixture: t1 already has a strip, t2 has a full-width bottom pane,
+        // tCOL has a columned bottom. Only t2 gets one, and its split target
+        // came from the snapshot's own layout.
+        let splits: Vec<String> = cli
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c[..2] == ["pane", "split"])
+            .map(|c| c[2].clone())
+            .collect();
+        assert_eq!(splits, vec!["w1:p3".to_string()]);
+    }
+
+    #[test]
+    fn a_socket_that_cannot_answer_falls_back_to_the_cli_reads() {
+        struct DeadRpc;
+        impl RpcClient for DeadRpc {
+            fn call(&self, _payload: &str) -> io::Result<String> {
+                Err(io::Error::other("socket down"))
+            }
+        }
+        let cli = SweepFake {
+            calls: RefCell::new(Vec::new()),
+            tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":1}]}}"#.into(),
+            panes: r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}"#.into(),
+        };
+        Sweeper::new(Some(&DeadRpc), &cli, "/abs/herdr-herd", 7, 10)
+            .sweep_once()
+            .unwrap();
+        assert_eq!(calls_matching(&cli, "tab list"), 1);
+        assert_eq!(calls_matching(&cli, "pane list"), 1);
+        assert_eq!(
+            calls_matching(&cli, "pane layout"),
+            1,
+            "no snapshot layouts, so the candidate tab is probed the old way"
+        );
+        assert_eq!(
+            calls_matching(&cli, "pane split"),
+            1,
+            "the strip still lands"
+        );
+    }
+
+    #[test]
     fn sweep_closes_a_strip_whose_renderer_has_died() {
         let cli = SweepFake {
             calls: RefCell::new(Vec::new()),
@@ -601,7 +1085,7 @@ mod tests {
                 {"pane_id":"w1:pDEAD","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        sweeper(&cli).sweep_once().unwrap();
         let calls = cli.calls.borrow();
         let closes: Vec<&str> = calls
             .iter()
@@ -621,7 +1105,7 @@ mod tests {
                 {"pane_id":"w1:p2","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        sweeper(&cli).sweep_once().unwrap();
         let calls = cli.calls.borrow();
         assert!(
             !calls.iter().any(|c| c[..2] == ["pane", "close"]),
@@ -671,7 +1155,7 @@ mod tests {
                 {"pane_id":"w1:pC","tab_id":"w1:t1"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        sweeper(&cli).sweep_once().unwrap();
         let calls = cli.calls.borrow();
         let closes: Vec<&str> = calls
             .iter()
@@ -978,7 +1462,7 @@ mod tests {
                 {"pane_id":"w1:p2","tab_id":"w1:t2"}]}}"#,
             "w1:p1",
         );
-        let result = sweep_once(&cli, "/abs/herdr-herd", 7);
+        let result = sweeper(&cli).sweep_once();
         assert!(
             result.is_ok(),
             "one failing tab must not abort the whole sweep"
@@ -1021,7 +1505,7 @@ mod tests {
                 {"pane_id":"w1:pD","tab_id":"w1:t4"}]}}"#
                 .into(),
         };
-        sweep_once(&cli, "/abs/herdr-herd", 7).unwrap();
+        sweeper(&cli).sweep_once().unwrap();
         let calls = cli.calls.borrow();
         let split_targets: Vec<&str> = calls
             .iter()

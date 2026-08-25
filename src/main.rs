@@ -1,12 +1,12 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use herdr_herd::herdr::LiveHerdr;
+use herdr_herd::herdr::{HerdFeed, LiveHerdr};
 use herdr_herd::palette::Theme;
 use herdr_herd::render;
-use herdr_herd::socket::{RealSocket, SocketClient, socket_path};
+use herdr_herd::socket::{RealSocket, RpcClient, SocketClient, UnixRpcClient, socket_path};
 use herdr_herd::sprite::load_species;
-use herdr_herd::watcher::{RealClock, watch};
+use herdr_herd::watcher::{RealClock, Timings, watch};
 
 fn main() -> ExitCode {
     let arg = std::env::args().nth(1);
@@ -15,12 +15,22 @@ fn main() -> ExitCode {
             let cfg = herdr_herd::config::load();
             let species = load_species();
             let (tx, rx) = mpsc::channel();
-            let cli = Box::new(LiveHerdr::from_env());
             let focus = Box::new(LiveHerdr::from_env());
+            // The refresh goes over the control socket; the CLI stays wired in
+            // behind it so a socket failure degrades the herd instead of
+            // stopping it.
+            let rpc = UnixRpcClient::from_env().map(|c| Box::new(c) as Box<dyn RpcClient + Send>);
+            let feed = HerdFeed::new(rpc, Box::new(LiveHerdr::from_env()));
             let socket: Option<Box<dyn SocketClient + Send>> = socket_path()
                 .and_then(|p| RealSocket::connect(&p).ok())
                 .map(|s| Box::new(s) as Box<dyn SocketClient + Send>);
-            let _watcher = watch(cli, socket, Box::new(RealClock::new()), tx, 2500, 250);
+            let _watcher = watch(
+                feed,
+                socket,
+                Box::new(RealClock::new()),
+                tx,
+                Timings::default(),
+            );
             match render::run(
                 rx,
                 species,
@@ -64,12 +74,16 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             let cli = LiveHerdr::from_env();
+            // Reads go over the control socket when there is one; the CLI stays
+            // wired in behind it for the mutations and as the fallback.
+            let rpc = UnixRpcClient::from_env();
             let self_exe = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "herdr-herd".to_string());
             let lock_path = herdr_herd::control::controller_lock_path();
             match herdr_herd::control::control(
+                rpc.as_ref().map(|c| c as &dyn RpcClient),
                 &cli,
                 &self_exe,
                 &lock_path,
