@@ -29,6 +29,11 @@ pub struct Member {
     pub identity: Identity,
     pub status: AgentStatus,
     pub label: String,
+    /// The detected agent kind (`"claude"`, `"codex"`, ...), straight from
+    /// `Agent::agent` — `None` for an undetected pane. Carried onto the
+    /// member so the hover caption can show its icon without reaching back
+    /// into the last-seen `Agent` snapshot.
+    pub agent_kind: Option<String>,
     /// This member wears the focus hat: the session's global "you are here"
     /// marker. Resolved by `Herd::reconcile` for the herd as a whole, never
     /// copied verbatim from `Agent::focused`, so at most one member is ever
@@ -54,6 +59,7 @@ impl Member {
             identity,
             status,
             label: String::new(),
+            agent_kind: None,
             focused: false,
             anchor: None,
         }
