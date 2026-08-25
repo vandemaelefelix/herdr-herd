@@ -357,7 +357,11 @@ mod tests {
         let (mut feed, cli) =
             feed_with(Some(FakeRpc::answering(SNAPSHOT)), RecordingCli::default());
         let agents = feed.herd(0).expect("the socket answered");
-        assert_eq!(agents.len(), 3);
+        assert_eq!(
+            agents.len(),
+            3,
+            "the fourth agent is missing terminal_id and unreadable"
+        );
         assert_eq!(
             agents[0].display_label(),
             "herdr-herd › renderer",
