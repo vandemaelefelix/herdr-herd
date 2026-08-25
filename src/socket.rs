@@ -190,6 +190,17 @@ fn rpc_request(id: &str, method: &str, params: serde_json::Value) -> String {
 /// On connect herdr also replays current state, giving an immediate structural
 /// snapshot. (Stream event names use underscores, e.g. `pane_created`; the
 /// watcher ignores event contents and just refetches.)
+///
+/// The global focus subscriptions wake every render process on one pane
+/// switch (#73). Checked herdr 0.8.0's schema (`herdr api schema --json`) for
+/// a narrower alternative: `pane.focused`/`tab.focused`/`workspace.focused`
+/// take no target filter at all, only `pane.output_matched`/
+/// `pane.agent_status_changed`/`pane.scroll_changed` accept one `pane_id`.
+/// Since the herd strip renders the whole session, not just its own pane
+/// (#31), a per-pane subscription would mean one subscription per pane that
+/// exists, re-issued as panes come and go, not a straight swap for the global
+/// one. Narrowing this needs either a herdr API change or a decision on what
+/// a session-wide strip should actually watch, so it stays global here.
 pub fn subscribe_request() -> String {
     r#"{"id":"members","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.focused"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"},{"type":"tab.focused"},{"type":"workspace.focused"}]}}"#.to_string()
 }
