@@ -151,6 +151,16 @@ fn overlay_lane_row(pane_h: u16) -> u16 {
     member_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
 }
 
+/// How many members a `strip_w`-wide strip has room for; the rest overflow and
+/// are reported by the `+N` counter. Derived from the first species' frame
+/// width (all species share one size) and mirrors the half-block path's own
+/// capacity in `render::draw_herd`. Shared by drawing, hit-testing and the
+/// counter so all three agree on which members are on screen.
+fn member_capacity(strip_w: usize, species: &[Species]) -> usize {
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    (strip_w / (member_w * 3 / 4).max(1)).max(1)
+}
+
 /// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
 /// the sprite's aspect under an assumed ~1:2.1 cell width:height ratio. herdr
 /// hides the real cell size, so we approximate it; the worst case is a slight
@@ -388,7 +398,7 @@ impl KittyRenderer {
         let strip_w = area.width as usize;
         let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-        let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
+        let capacity = member_capacity(strip_w, species);
         let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
 
         let mut order = visible.clone();
@@ -665,13 +675,21 @@ impl KittyRenderer {
         Ok(())
     }
 
-    /// Draw the hover caption as direct terminal escapes on the dedicated name
-    /// row — bypassing ratatui, whose text the
-    /// per-frame kitty re-placement clobbers and then never redraws (see
-    /// [`KittyRenderer::draw`]). The row carries no member image, so it's cleared
-    /// and rewritten every frame with no stale trail. Row/column are 1-indexed
-    /// within this pane's own terminal.
-    fn draw_overlay_text(&mut self, area: Rect, hover_label: Option<&str>) -> io::Result<()> {
+    /// Draw the hover caption and the `+{hidden}` overflow counter as direct
+    /// terminal escapes on the dedicated name row — bypassing ratatui, whose
+    /// text the per-frame kitty re-placement clobbers and then never redraws
+    /// (see [`KittyRenderer::draw`]). The row carries no member image, so it's
+    /// cleared and rewritten every frame with no stale trail. Row/column are
+    /// 1-indexed within this pane's own terminal. The lane's layout mirrors the
+    /// half-block path's (`render::draw_herd` / `render::draw_caption`): marker
+    /// at the left, then the caption, then `+N` hard right — so the two
+    /// backends read the same way.
+    fn draw_overlay_text(
+        &mut self,
+        area: Rect,
+        hover_label: Option<&str>,
+        hidden: usize,
+    ) -> io::Result<()> {
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
@@ -685,12 +703,28 @@ impl KittyRenderer {
             let text: String = text.chars().take(width).collect();
             s.push_str(&format!("\x1b[38;2;107;122;107m{text}\x1b[0m"));
         }
+        // `+N` for the members the strip has no room for, dim gray (SGR 90 —
+        // ratatui's `Color::DarkGray` on the half-block side), rightmost in the
+        // lane with the same 1-column margin the caption keeps. Without it the
+        // default renderer silently under-reported the herd on overflow (#36).
+        let counter: Option<String> = (hidden > 0)
+            .then(|| format!("+{hidden}"))
+            .map(|l| l.chars().take(width).collect());
+        // Columns the counter (plus a separating gap) takes off the caption's
+        // right edge — 0 when nothing is hidden, so a non-overflowing strip
+        // lays out byte-identically to before.
+        let counter_w = counter.as_ref().map_or(0, |l| l.chars().count() + 1);
+        if let Some(label) = &counter {
+            let col = width.saturating_sub(label.chars().count()).max(1);
+            s.push_str(&format!("\x1b[{row};{col}H\x1b[90m{label}\x1b[0m"));
+        }
         if let Some(label) = hover_label {
-            let max = width.saturating_sub(1 + crate::marker::reserved_cols() as usize);
+            let max = width.saturating_sub(1 + counter_w + crate::marker::reserved_cols() as usize);
             let text: String = label.chars().take(max).collect();
             let tw = text.chars().count();
-            // Right-aligned, ochre, with a 1-column margin from the edge.
-            let col = width.saturating_sub(tw).max(1);
+            // Right-aligned, ochre, with a 1-column margin from the edge — and
+            // clear of `+N` by a further column when the strip is overflowing.
+            let col = width.saturating_sub(tw + counter_w).max(1);
             s.push_str(&format!(
                 "\x1b[{row};{col}H\x1b[38;2;217;164;65m{text}\x1b[0m"
             ));
@@ -724,6 +758,10 @@ impl MemberRenderer for KittyRenderer {
     ) {
         let area = frame.area();
         let _ = self.render_members(herd, species, area, theme, now_ms);
+        // The same visible-set split `render_members` made, so the counter
+        // reports exactly the members it decided not to draw.
+        let capacity = member_capacity(area.width as usize, species);
+        let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
         // Draw the name (and the temp build marker) as DIRECT terminal escapes,
         // in the same layer as the members — NOT ratatui text via `frame`. The
         // per-frame kitty image re-placement clobbers ratatui's text cells, and
@@ -731,7 +769,7 @@ impl MemberRenderer for KittyRenderer {
         // drawn through the frame flashed on for one frame and then vanished
         // (the long-standing name-disappears bug). Writing straight to the sink
         // every frame keeps it stable, on its own dedicated top row.
-        let _ = self.draw_overlay_text(area, hover_label);
+        let _ = self.draw_overlay_text(area, hover_label, hidden);
     }
 
     /// Hit-test using the same visible set as `render_members`. A member's hit range
@@ -753,7 +791,7 @@ impl MemberRenderer for KittyRenderer {
     ) -> Option<usize> {
         let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let max_x = (strip_w as f32 - base_w as f32).max(0.0);
-        let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
+        let capacity = member_capacity(strip_w, species);
         let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
         // Match render_members' z-order exactly: lowest priority first, so the
         // topmost (on-top) member is the LAST one covering the column.
@@ -787,8 +825,12 @@ impl MemberRenderer for KittyRenderer {
             let fr = &state.frames[animated.frame_index];
             // The image occupies `cols` cells from the member's x; the visible
             // sprite is the opaque span scaled into those cols, so hover
-            // matches the sheep, not its transparent padding.
-            let cols = member_cols(rows, fr.w, fr.h) as usize;
+            // matches the sheep, not its transparent padding. The window height
+            // MUST include TOP_HEADROOM, exactly as `render_members` sizes the
+            // placement it emits — `member_cols` is inversely proportional to
+            // it, so omitting it here made the hit box ~43% wider than the
+            // drawn sheep (#34).
+            let cols = member_cols(rows, fr.w, fr.h + TOP_HEADROOM) as usize;
             let (lo, hi) = opaque_col_span(fr, animated.facing_left).unwrap_or((0, fr.w));
             // Round each opaque edge to the nearest cell (rather than
             // floor-left/ceil-right) so the hit region hugs the visible sprite
@@ -1158,6 +1200,119 @@ mod tests {
         );
     }
 
+    /// The 1-based column and text of the lane run styled with `sgr` (the
+    /// counter's dim gray or the caption's ochre). The kitty lane's layout only
+    /// exists in the emitted escapes — there is no ratatui buffer to snapshot —
+    /// so parsing them back is how it gets asserted.
+    fn lane_run(out: &str, sgr: &str) -> (usize, String) {
+        let at = out.find(sgr).expect("the styled run is emitted");
+        let cup = out[..at]
+            .rfind("\x1b[")
+            .expect("a cursor move positions the run");
+        let cup_end = cup + out[cup..].find('H').expect("a terminated cursor move");
+        let col: usize = out[cup..cup_end]
+            .rsplit(';')
+            .next()
+            .expect("row;col in the cursor move")
+            .parse()
+            .expect("a numeric column");
+        let rest = &out[at + sgr.len()..];
+        let end = rest.find("\x1b[0m").expect("the run resets its style");
+        (col, rest[..end].to_string())
+    }
+
+    /// `n` working members. Capacity comes from the strip width, so a narrow
+    /// terminal plus several members is what forces the overflow the `+N`
+    /// counter reports.
+    fn herd_of(n: usize) -> Herd {
+        let mut h = Herd::new();
+        for i in 0..n {
+            let tid = format!("t{i}");
+            h.members.push(Member::new(
+                tid.clone(),
+                identity_for(&tid, 1),
+                AgentStatus::Working,
+            ));
+        }
+        h
+    }
+
+    #[test]
+    fn an_overflowing_strip_draws_the_plus_n_counter_right_aligned_in_the_lane() {
+        // #36: the kitty lane drew only the marker and the caption, so the
+        // DEFAULT renderer silently under-reported the herd whenever more
+        // agents existed than fit. Mirrors the half-block path's `+N`.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        // capacity = width / (member_w * 3 / 4) = 12 / 3 = 4, so 6 members
+        // leave 2 hidden.
+        let (w, pane_h) = (12u16, 10u16);
+        let herd = herd_of(6);
+        let mut terminal = Terminal::new(TestBackend::new(w, pane_h)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        let out = sink.take();
+        let (col, text) = lane_run(&out, "\x1b[90m");
+        assert_eq!(text, "+2", "two of the six members did not fit");
+        assert_eq!(
+            col,
+            (w - 2) as usize,
+            "right-aligned with the same 1-column margin the caption keeps"
+        );
+        let row = overlay_lane_row(pane_h);
+        assert!(
+            out.contains(&format!("\x1b[{row};{col}H\x1b[90m")),
+            "the counter sits on the name row {row}: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_strip_that_fits_every_member_draws_no_counter() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .unwrap();
+        assert!(
+            !sink.take().contains("\x1b[90m"),
+            "no overflow means no counter, and no reserved room for one"
+        );
+    }
+
+    #[test]
+    fn the_caption_stops_short_of_the_plus_n_counter() {
+        // The half-block caption already reserves horizontal room for `+N`
+        // (`render::draw_caption`); the kitty caption did not, so the two lanes
+        // laid out differently. They must not collide here either.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        // capacity = 60 / 3 = 20, so 23 members leave 3 hidden.
+        let (w, pane_h) = (60u16, 10u16);
+        let herd = herd_of(23);
+        let mut terminal = Terminal::new(TestBackend::new(w, pane_h)).unwrap();
+        terminal
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
+            })
+            .unwrap();
+        let out = sink.take();
+        let (counter_col, counter) = lane_run(&out, "\x1b[90m");
+        let (caption_col, caption) = lane_run(&out, "\x1b[38;2;217;164;65m");
+        assert_eq!(counter, "+3");
+        assert_eq!(caption, "agent-x", "this width has room for the whole name");
+        let caption_end = caption_col + caption.chars().count();
+        assert!(
+            caption_end < counter_col,
+            "the caption ({caption_col}..{caption_end}) must stop clear of `+3` at {counter_col}"
+        );
+    }
+
     #[test]
     fn draw_emits_no_caption_escape_when_nothing_is_hovered() {
         // With no hover label the name row still gets cleared + the marker, but
@@ -1189,14 +1344,177 @@ mod tests {
         assert_eq!(opaque_col_span(fr, true), Some((1, 4)));
     }
 
+    /// A member body's on-screen footprint exactly as it was emitted: the
+    /// 1-based cursor column it was placed at, and the `c=` cell width of its
+    /// placement (`z=0` — an overlay icon places at `Z_ICON_BASE`+). Read out
+    /// of the real escapes rather than recomputed, so the hit-test assertions
+    /// below compare against what the terminal was actually told to draw. That
+    /// is the whole point: draw and hit-test each computed the footprint
+    /// themselves, with different arguments, and silently drifted (#34).
+    fn placed_footprint(out: &str) -> (i32, usize) {
+        let apc = out
+            .match_indices("\x1b_G")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                let end = out[i..].find("\x1b\\").map_or(out.len(), |e| i + e);
+                let chunk = &out[i..end];
+                chunk.contains("a=p") && chunk.contains(",z=0,")
+            })
+            .expect("the member body's own placement command (z=0)");
+        // The cursor move that positioned it is the last one written before it.
+        let before = &out[..apc];
+        let cup = before
+            .rfind("\x1b[")
+            .expect("a cursor move before the placement");
+        let cup_end = cup + before[cup..].find('H').expect("a terminated cursor move");
+        let col: i32 = before[cup..cup_end]
+            .rsplit(';')
+            .next()
+            .expect("row;col in the cursor move")
+            .parse()
+            .expect("a numeric cursor column");
+        let end = apc + out[apc..].find("\x1b\\").expect("APC terminator");
+        let cols: usize = out[apc..end]
+            .split(',')
+            .find_map(|kv| kv.strip_prefix("c="))
+            .expect("a c= cell-footprint field")
+            .parse()
+            .expect("a numeric c=");
+        (col, cols)
+    }
+
+    /// A fully opaque single-state species: every column of the frame carries
+    /// ink, so `opaque_col_span` trims nothing and the hit box must equal the
+    /// drawn cell footprint *exactly* — which is what lets the test below
+    /// compare it against the emitted `c=` with no slack.
+    const SOLID: &str = "\
+name = SolidBlock
+
+[idle]    frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[working] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[done]    frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[blocked] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+
+[unknown] frame_ms=0 motion=none overlay=none
+MMMM
+MMMM
+MMMM
+MMMM
+";
+
+    /// One `Done` member frozen at 40% of the walkable width: a static state
+    /// with a rest anchor pins its column deterministically, well clear of both
+    /// strip edges, so the cell just outside the footprint is testable.
+    fn one_anchored_solid_herd() -> Herd {
+        let mut h = Herd::new();
+        let mut member = Member::new("t1".into(), identity_for("t1", 1), AgentStatus::Done);
+        member.anchor = Some(crate::motion::Anchor {
+            frozen_x: 0.4,
+            settled_at_ms: 0,
+        });
+        h.members.push(member);
+        h
+    }
+
+    #[test]
+    fn hit_box_width_equals_the_emitted_cell_footprint() {
+        // Regression guard for #34: `draw` sized the footprint with the
+        // headroom-inclusive window (`fr.h + TOP_HEADROOM`) while
+        // `member_at_column` sized it without, so the hover/click box came out
+        // ~43% wider than the drawn sheep — empty strip popped up a name, and a
+        // click there focused that agent. `member_cols` is inversely
+        // proportional to frame height, so any future divergence in those
+        // arguments changes the width and this test fails.
+        let sink = SharedSink::default();
+        let species = vec![parse_species(SOLID).expect("the solid test species parses")];
+        let herd = one_anchored_solid_herd();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
+        let (col, cols) = placed_footprint(&sink.take());
+        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        // The placement's cursor column is 1-based; hit-test columns are 0-based.
+        let left = col - 1;
+        let right = left + cols as i32;
+        assert!(
+            left >= 1,
+            "fixture must be placed clear of the strip's left edge (col={col})"
+        );
+        assert_eq!(at(left - 1), None, "the cell just left of the sheep misses");
+        assert_eq!(at(left), Some(0), "the footprint's first cell hits");
+        assert_eq!(at(right - 1), Some(0), "the footprint's last cell hits");
+        assert_eq!(at(right), None, "the cell just right of the sheep misses");
+        // Stated as a width too, so a failure reads as the drift it is rather
+        // than as an off-by-one at one edge.
+        let hits = (0..200).filter(|&c| at(c) == Some(0)).count();
+        assert_eq!(
+            hits, cols,
+            "an opaque sheep's hit box must be exactly as wide as the emitted c={cols}"
+        );
+    }
+
     #[test]
     fn hit_test_uses_the_cell_footprint() {
+        let sink = SharedSink::default();
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_working_herd();
-        let mut r = KittyRenderer::for_test(SharedSink::default(), 4);
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
         r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
-        let hit = (0..200u16).find_map(|c| r.member_at_column(&herd, &species, 200, c, 0));
-        assert_eq!(hit, Some(0), "some column under the member hits it");
+        let (col, cols) = placed_footprint(&sink.take());
+        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        let hits: Vec<i32> = (0..200).filter(|&c| at(c) == Some(0)).collect();
+        assert!(!hits.is_empty(), "some column under the member hits it");
+        let (left, right) = (hits[0], hits[hits.len() - 1] + 1);
+        assert_eq!(
+            hits,
+            (left..right).collect::<Vec<_>>(),
+            "the hit region is one contiguous run of columns"
+        );
+        // The exact `[left_cell, right_cell)` boundary, not merely "some column
+        // hits" — the weak assertion that let #34 survive.
+        assert!(
+            left >= 1,
+            "fixture must be placed clear of the strip's left edge (col={col})"
+        );
+        assert_eq!(
+            at(left - 1),
+            None,
+            "the cell just left of the hit box misses"
+        );
+        assert_eq!(at(left), Some(0), "the hit box's first cell hits");
+        assert_eq!(at(right - 1), Some(0), "the hit box's last cell hits");
+        assert_eq!(at(right), None, "the cell just right of the hit box misses");
+        // The blob's working frame has one fully transparent column, so the hit
+        // box is trimmed strictly *inside* the drawn footprint and can never
+        // reach beyond it.
+        let drawn = (col - 1)..(col - 1 + cols as i32);
+        assert!(
+            left >= drawn.start && right <= drawn.end,
+            "the hit box {left}..{right} must lie inside the drawn footprint {drawn:?}"
+        );
+        assert!(
+            right - left < cols as i32,
+            "the transparent column is trimmed off the hit box (width {} of c={cols})",
+            right - left
+        );
         assert_eq!(
             r.member_at_column(&herd, &species, 200, 200, 0),
             None,
