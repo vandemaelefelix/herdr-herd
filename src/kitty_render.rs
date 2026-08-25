@@ -125,7 +125,7 @@ fn member_crop(
 
 /// Rows a member image occupies, derived from the pane height and capped small
 /// so the members always read as a slim strip, even in a tall pane. Reserves 1
-/// row off the top for the shared overlay lane (see [`overlay_lane_row`]) —
+/// row off the top for the shared overlay lane (see [`overlay_lane_row1`]) —
 /// the caption and every member's icon/hat all live there, column-separated,
 /// exactly like the half-block renderer's single `lane_y` row, rather than
 /// each claiming a row of its own.
@@ -148,7 +148,7 @@ fn member_row(pane_h: i32, rows: u16) -> i32 {
 /// dedicated, image-free row is what stops a member's icon or hopping head from
 /// painting over the name (which made it flicker on then vanish) and
 /// guarantees it can never overlap a sheep.
-fn overlay_lane_row(pane_h: u16) -> u16 {
+fn overlay_lane_row1(pane_h: u16) -> u16 {
     let rows = member_rows(pane_h);
     member_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
 }
@@ -695,7 +695,7 @@ impl KittyRenderer {
         if area.width == 0 || area.height == 0 {
             return Ok(());
         }
-        let row = overlay_lane_row(area.height);
+        let row = overlay_lane_row1(area.height);
         let width = area.width as usize;
         let mut s = String::new();
         s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
@@ -1217,11 +1217,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_lane_row_is_always_above_the_member_body_never_inside_it() {
+    fn overlay_lane_row1_is_always_above_the_member_body_never_inside_it() {
         for pane_h in 3..40u16 {
             let rows = member_rows(pane_h);
             let row = member_row(pane_h as i32, rows);
-            let lane = overlay_lane_row(pane_h);
+            let lane = overlay_lane_row1(pane_h);
             assert!(
                 (lane as i32) < row,
                 "pane_h={pane_h}: overlay lane {lane} must sit above the member's own top row {row}"
@@ -1251,7 +1251,7 @@ mod tests {
             out.contains("agent-x"),
             "the caption is emitted as a direct escape: {out:?}"
         );
-        let row = overlay_lane_row(pane_h);
+        let row = overlay_lane_row1(pane_h);
         assert!(
             out.contains(&format!("\x1b[{row};")),
             "the caption is positioned on the 1-indexed name row {row}"
@@ -1275,7 +1275,7 @@ mod tests {
         let out = sink.take();
         let marker = crate::marker::build_marker().unwrap();
         assert!(out.contains(marker), "the marker is emitted: {out:?}");
-        let row = overlay_lane_row(pane_h);
+        let row = overlay_lane_row1(pane_h);
         assert!(
             out.contains(&format!("\x1b[{row};1H")),
             "the marker sits at column 1 of the name row {row}"
@@ -1363,7 +1363,7 @@ mod tests {
             (w - 2) as usize,
             "right-aligned with the same 1-column margin the caption keeps"
         );
-        let row = overlay_lane_row(pane_h);
+        let row = overlay_lane_row1(pane_h);
         assert!(
             out.contains(&format!("\x1b[{row};{col}H\x1b[90m")),
             "the counter sits on the name row {row}: {out:?}"

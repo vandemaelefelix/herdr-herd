@@ -1,6 +1,13 @@
 //! herdr-herd — a herd of pixel-art sheep for your herdr agents, one per agent.
 //!
 //! Phase 0: foundations. Modules are added task-by-task.
+//!
+//! Vocabulary used throughout this crate: a **member** is one agent's animal;
+//! **species** is which animal it is; the **strip** is the pane it lives in;
+//! the **herd** is the whole set of members. "Sheep", "pet" and "agent" show
+//! up in user-facing text (README, GOAL.md) and in herdr's own vocabulary
+//! (an agent is herdr's pane-level concept), but the code consistently says
+//! "member" for the crate's own concept of one animal.
 
 // `marker` is imported by the integration tests (`tests/cli.rs`); the rest of
 // this list is `pub` only where `main.rs` needs it directly, since the binary

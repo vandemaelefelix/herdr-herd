@@ -418,7 +418,7 @@ pub fn draw_herd(
     // caption off the member.
     let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
     let band_top = area.bottom().saturating_sub(band_rows);
-    let lane_y = overlay_lane_y(area);
+    let lane_y = overlay_lane_row0(area);
     let member_area = Rect {
         x: area.x,
         y: band_top,
@@ -488,8 +488,10 @@ pub fn draw_herd(
 }
 
 /// The row of the overlay lane that holds `+N`, the caption, and the build
-/// marker: one row above the bottom-aligned member band.
-pub fn overlay_lane_y(area: Rect) -> u16 {
+/// marker: one row above the bottom-aligned member band. 0-indexed, since
+/// it is a ratatui buffer row (contrast [`kitty_render::overlay_lane_row1`],
+/// which is 1-indexed for the terminal's cursor-positioning escapes).
+pub fn overlay_lane_row0(area: Rect) -> u16 {
     let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
     area.bottom().saturating_sub(band_rows).saturating_sub(1)
 }
@@ -742,7 +744,7 @@ impl MemberRenderer for HalfBlockRenderer {
         // feature-independent: the layout snapshots keep asserting the shipped
         // strip whichever way the crate is built. Mirrors the kitty path, which
         // emits its marker from its own `MemberRenderer::draw`.
-        draw_build_marker(frame, frame.area(), overlay_lane_y(frame.area()));
+        draw_build_marker(frame, frame.area(), overlay_lane_row0(frame.area()));
     }
     fn frame_signature(
         &self,
@@ -1614,7 +1616,7 @@ mod tests {
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
 
-        let lane = overlay_lane_y(Rect::new(0, 0, 60, 11)) as usize;
+        let lane = overlay_lane_row0(Rect::new(0, 0, 60, 11)) as usize;
         let reserved = marker::reserved_cols() as usize;
         let trait_rows = rows_of(via_trait.backend());
         let fn_rows = rows_of(via_fn.backend());
