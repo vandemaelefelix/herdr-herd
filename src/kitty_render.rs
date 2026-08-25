@@ -23,12 +23,10 @@ use ratatui::layout::Rect;
 
 use crate::agent::AgentStatus;
 use crate::anim::{Overlay, OverlayColor};
-use crate::herd::{Herd, visible_and_hidden};
+use crate::herd::Herd;
 use crate::icon::{IconKind, icon_size, rasterize_icon};
 use crate::kitty::{Crop, delete_image, delete_placement, place_cropped, transmit_rgba};
 use crate::kitty_ids::{ImageIds, PlacementIds};
-use crate::member::priority;
-use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::raster::{pad_frame, rasterize};
 use crate::render::{HAT_H, MemberRenderer, band_max_x, head_anchor, stamp_hat, visible_members};
@@ -151,16 +149,6 @@ fn member_row(pane_h: i32, rows: u16) -> i32 {
 fn overlay_lane_row1(pane_h: u16) -> u16 {
     let rows = member_rows(pane_h);
     member_row(pane_h as i32, rows).saturating_sub(1).max(1) as u16
-}
-
-/// How many members a `strip_w`-wide strip has room for; the rest overflow and
-/// are reported by the `+N` counter. Derived from the first species' frame
-/// width (all species share one size) and mirrors the half-block path's own
-/// capacity in `render::draw_herd`. Shared by drawing, hit-testing and the
-/// counter so all three agree on which members are on screen.
-fn member_capacity(strip_w: usize, species: &[Species]) -> usize {
-    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    (strip_w / (member_w * 3 / 4).max(1)).max(1)
 }
 
 /// Columns for a `frame_w` x `frame_h` sprite shown at `rows` rows, preserving
@@ -374,8 +362,9 @@ impl KittyRenderer {
     }
 
     /// Write all escapes for the current frame's visible members to `self.out`,
-    /// replicating `render::draw_herd`'s visible-set + z-order selection
-    /// exactly so the kitty and half-block backends agree on what's shown.
+    /// using [`visible_members`] for the visible-set + z-order selection, so
+    /// the kitty and half-block backends can never disagree about what's
+    /// shown.
     fn render_members(
         &mut self,
         herd: &Herd,
@@ -398,33 +387,15 @@ impl KittyRenderer {
         }
 
         let strip_w = area.width as usize;
-        let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
-        let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-        let capacity = member_capacity(strip_w, species);
-        let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
+        let max_x = band_max_x(species, strip_w);
+        let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
 
-        let mut order = visible.clone();
-        order.sort_by_key(|&i| priority(herd.members[i].status));
-
-        for (zi, &i) in order.iter().enumerate() {
-            let member = &herd.members[i];
-            let Some(sp) = species
-                .get(member.identity.species_index)
-                .or_else(|| species.first())
-            else {
-                continue;
-            };
-            let Some(state) = sp.states.get(&member.status) else {
-                continue;
-            };
-            let animated = animate(
-                &member.terminal_id,
-                member.status,
-                state,
-                now_ms,
-                member.anchor,
-            );
-            let fr = &state.frames[animated.frame_index];
+        for v in &visible {
+            let zi = v.z;
+            let member = v.member;
+            let state = v.state;
+            let animated = v.animated;
+            let fr = v.frame;
             let key: ImgKey = (
                 member.identity.species_index,
                 member.status,
@@ -644,7 +615,7 @@ impl KittyRenderer {
         // it doesn't linger as a ghost image.
         let visible_ids: std::collections::HashSet<&str> = visible
             .iter()
-            .map(|&i| herd.members[i].terminal_id.as_str())
+            .map(|v| v.member.terminal_id.as_str())
             .collect();
         let departed: Vec<String> = self
             .placements
@@ -762,8 +733,7 @@ impl MemberRenderer for KittyRenderer {
         let _ = self.render_members(herd, species, area, theme, now_ms);
         // The same visible-set split `render_members` made, so the counter
         // reports exactly the members it decided not to draw.
-        let capacity = member_capacity(area.width as usize, species);
-        let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
+        let (_visible, hidden) = visible_members(herd, species, area.width as usize, now_ms);
         // Draw the name (and the temp build marker) as DIRECT terminal escapes,
         // in the same layer as the members — NOT ratatui text via `frame`. The
         // per-frame kitty image re-placement clobbers ratatui's text cells, and
@@ -891,14 +861,11 @@ impl MemberRenderer for KittyRenderer {
         col: u16,
         now_ms: u64,
     ) -> Option<usize> {
-        let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
-        let max_x = (strip_w as f32 - base_w as f32).max(0.0);
-        let capacity = member_capacity(strip_w, species);
-        let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
-        // Match render_members' z-order exactly: lowest priority first, so the
-        // topmost (on-top) member is the LAST one covering the column.
-        let mut order = visible;
-        order.sort_by_key(|&i| priority(herd.members[i].status));
+        let max_x = band_max_x(species, strip_w);
+        // The same visible-set + z-order selection `render_members` draws
+        // with, so the topmost (on-top) member is the LAST one covering the
+        // column.
+        let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
 
         let x = col as i32;
         // The member footprint depends on the pane height (rows -> cols); use the
@@ -906,25 +873,8 @@ impl MemberRenderer for KittyRenderer {
         let pane_h = self.last_area.map(|a| a.height).unwrap_or(8);
         let rows = member_rows(pane_h);
         let mut best: Option<usize> = None;
-        for &i in &order {
-            let member = &herd.members[i];
-            let Some(sp) = species
-                .get(member.identity.species_index)
-                .or_else(|| species.first())
-            else {
-                continue;
-            };
-            let Some(state) = sp.states.get(&member.status) else {
-                continue;
-            };
-            let animated = animate(
-                &member.terminal_id,
-                member.status,
-                state,
-                now_ms,
-                member.anchor,
-            );
-            let fr = &state.frames[animated.frame_index];
+        for v in &visible {
+            let fr = v.frame;
             // The image occupies `cols` cells from the member's x; the visible
             // sprite is the opaque span scaled into those cols, so hover
             // matches the sheep, not its transparent padding. The window height
@@ -933,17 +883,17 @@ impl MemberRenderer for KittyRenderer {
             // it, so omitting it here made the hit box ~43% wider than the
             // drawn sheep (#34).
             let cols = member_cols(rows, fr.w, fr.h + TOP_HEADROOM) as usize;
-            let (lo, hi) = opaque_col_span(fr, animated.facing_left).unwrap_or((0, fr.w));
+            let (lo, hi) = opaque_col_span(fr, v.animated.facing_left).unwrap_or((0, fr.w));
             // Round each opaque edge to the nearest cell (rather than
             // floor-left/ceil-right) so the hit region hugs the visible sprite
             // instead of over-reaching into a barely-touched edge cell.
             let left_cell = (lo * cols + fr.w / 2) / fr.w;
             let right_cell = ((hi * cols + fr.w / 2) / fr.w).max(left_cell + 1);
-            let left = (animated.x_fraction * max_x).round() as i32;
+            let left = (v.animated.x_fraction * max_x).round() as i32;
             if x >= left + left_cell as i32 && x < left + right_cell as i32 {
                 // Later in draw order = drawn on top → overwrite so the
                 // frontmost covering member wins.
-                best = Some(i);
+                best = Some(v.index);
             }
         }
         best
@@ -1021,6 +971,7 @@ mod tests {
     use crate::herd::Herd;
     use crate::identity::identity_for;
     use crate::member::Member;
+    use crate::motion::animate;
     use crate::palette::Theme;
     use crate::sprite::parse_species;
     use ratatui::Terminal;

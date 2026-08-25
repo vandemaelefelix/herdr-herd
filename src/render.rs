@@ -340,19 +340,20 @@ pub(crate) fn visible_members<'a>(
 /// `now_ms` (milliseconds since the Unix epoch, or a frozen value under
 /// reduced motion) drives every member's position/pose via `motion::animate` — a
 /// pure function, so this is fully deterministic given the same inputs.
-/// Returns the buffer plus the visible set's z-order (draw order, lowest
-/// priority first) so the caller can reuse it for overlays without
-/// recomputing the visible/capacity selection.
-fn build_band(
-    herd: &Herd,
-    species: &[Species],
+/// Returns the buffer plus the resolved visible set in z-order (draw order,
+/// lowest priority first) and the hidden count, so the caller can reuse them
+/// for overlays and the `+N` counter without recomputing the visible/capacity
+/// selection or re-resolving each member's species/state/frame.
+fn build_band<'a>(
+    herd: &'a Herd,
+    species: &'a [Species],
     strip_w: usize,
     theme: Theme,
     now_ms: u64,
-) -> (PixelBuf, Vec<usize>) {
+) -> (PixelBuf, Vec<VisibleMember<'a>>, usize) {
     let mut buf = PixelBuf::new(strip_w, MEMBER_PX_H);
     let max_x = band_max_x(species, strip_w);
-    let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
+    let (visible, hidden) = visible_members(herd, species, strip_w, now_ms);
 
     for v in &visible {
         let member = v.member;
@@ -382,7 +383,7 @@ fn build_band(
             draw_hat(&mut buf, ox, oy, head_row, head_col);
         }
     }
-    (buf, visible.iter().map(|v| v.index).collect())
+    (buf, visible, hidden)
 }
 
 /// Draw the whole strip: visible members in priority z-order (blocked draws
@@ -403,12 +404,8 @@ pub fn draw_herd(
 ) {
     let area = frame.area();
     let strip_w = area.width as usize;
-    let (buf, order) = build_band(herd, species, strip_w, theme, now_ms);
-
-    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
-    let (_visible, hidden) = visible_and_hidden(&herd.members, capacity);
+    let max_x = band_max_x(species, strip_w);
+    let (buf, order, hidden) = build_band(herd, species, strip_w, theme, now_ms);
 
     // Bottom-align the whole strip so it reads as a slim status line whatever
     // the pane's height (herdr enforces a minimum pane height, so the pane can be
@@ -431,17 +428,8 @@ pub fn draw_herd(
     draw_pixels(frame, member_area, &buf);
 
     // Overlays (bubbles/badges) as text cells above each visible member.
-    for &i in &order {
-        let member = &herd.members[i];
-        let Some(sp) = species
-            .get(member.identity.species_index)
-            .or_else(|| species.first())
-        else {
-            continue;
-        };
-        let Some(state) = sp.states.get(&member.status) else {
-            continue;
-        };
+    for v in &order {
+        let state = v.state;
         let (glyph, _kind) = match &state.overlay.kind {
             Overlay::Bubble(g) => (g.clone(), 'b'),
             Overlay::Badge(g) => (g.clone(), 'a'),
@@ -452,15 +440,8 @@ pub fn draw_herd(
             OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
             OverlayColor::Default => Color::Gray,
         };
-        let animated = animate(
-            &member.terminal_id,
-            member.status,
-            state,
-            now_ms,
-            member.anchor,
-        );
         let cx = area.x
-            + ((animated.x_fraction * max_x).round() as u16)
+            + ((v.animated.x_fraction * max_x).round() as u16)
                 .saturating_add(3)
                 .min(area.width.saturating_sub(glyph.chars().count() as u16));
         frame.buffer_mut().set_span(
@@ -564,11 +545,11 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
 
 /// The index of the visible member drawn under terminal column `col`, if any.
 /// A mouse column maps 1:1 to a pixel x (half-block cells are one pixel wide).
-/// Only members that are actually drawn (the visible set on overflow) are
-/// hit-testable; when members overlap, the topmost — highest `priority`, matching
-/// the draw z-order — wins. Returns `None` over a gap or out of range. `now_ms`
-/// must match whatever was passed to `draw_herd` this frame, so hit-testing
-/// agrees with what's actually on screen.
+/// Uses the same visible-set + z-order selection [`build_band`] draws with, so
+/// hit-testing can never disagree with what's on screen; when members
+/// overlap, the topmost (last in z-order) wins. Returns `None` over a gap or
+/// out of range. `now_ms` must match whatever was passed to `draw_herd` this
+/// frame, so hit-testing agrees with what's actually on screen.
 pub fn member_at_column(
     herd: &Herd,
     species: &[Species],
@@ -576,41 +557,18 @@ pub fn member_at_column(
     col: u16,
     now_ms: u64,
 ) -> Option<usize> {
-    let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - base_w as f32).max(0.0);
-    let capacity = (strip_w / (base_w * 3 / 4).max(1)).max(1);
-    let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
+    let max_x = band_max_x(species, strip_w);
+    let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
 
     let x = col as i32;
     let mut best: Option<usize> = None;
-    for &i in &visible {
-        let member = &herd.members[i];
-        let Some(sp) = species
-            .get(member.identity.species_index)
-            .or_else(|| species.first())
-        else {
-            continue;
-        };
-        let Some(state) = sp.states.get(&member.status) else {
-            continue;
-        };
-        let w = sp.size().0 as i32;
-        let animated = animate(
-            &member.terminal_id,
-            member.status,
-            state,
-            now_ms,
-            member.anchor,
-        );
-        let left = (animated.x_fraction * max_x).round() as i32;
+    for v in &visible {
+        let w = v.frame.w as i32;
+        let left = (v.animated.x_fraction * max_x).round() as i32;
         if x >= left && x < left + w {
-            let take = match best {
-                None => true,
-                Some(b) => priority(member.status) >= priority(herd.members[b].status),
-            };
-            if take {
-                best = Some(i);
-            }
+            // Later in z-order = drawn on top -> overwrite so the frontmost
+            // covering member wins.
+            best = Some(v.index);
         }
     }
     best
@@ -1697,7 +1655,7 @@ mod tests {
             identity_for("unfocused", 1),
             AgentStatus::Idle,
         ));
-        let (buf, _order) = build_band(&herd, &species, 50, Theme::Dark, NOW_MS);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 50, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1718,7 +1676,7 @@ mod tests {
         let mut member = Member::new("f".into(), identity_for("f", 1), AgentStatus::Working);
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1748,7 +1706,7 @@ mod tests {
         );
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, peak_ms);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
@@ -1771,7 +1729,7 @@ mod tests {
         );
         member.focused = true;
         herd.members.push(member);
-        let (buf, _order) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
+        let (buf, _order, _hidden) = build_band(&herd, &species, 40, Theme::Dark, NOW_MS);
         assert_eq!(
             count_hat_pixels(&buf),
             HAT_PIXEL_COUNT,
