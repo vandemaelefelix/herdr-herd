@@ -1,12 +1,18 @@
 //! The herdr control socket client.
 //!
-//! This is the persistent, line-delimited JSON-RPC client
-//! (`SocketClient`/`RealSocket`) used to subscribe to socket events and
-//! receive framed lines, one per newline-delimited JSON-RPC message. It also
-//! retains the one-shot `request` helper (from Phase 0 Spike A) for simple
-//! request/reply calls such as `layout.export` / `layout.apply` against
-//! `$HERDR_SOCKET_PATH`. (Spike A verified the wire uses newline-delimited
-//! JSON-RPC with dotted method names — see the design doc §5.)
+//! Two shapes of client live here, because herdr's control socket has two:
+//!
+//! - a **persistent** subscription (`SocketClient`/`RealSocket`), which sends
+//!   one `events.subscribe` and then reads framed event lines forever; and
+//! - a **one-shot** request (`RpcClient`/`UnixRpcClient`, over `request_line`),
+//!   which asks herdr a question and reads the single reply line. herdr closes
+//!   the connection after answering, so each question gets its own.
+//!
+//! Asking over the socket is how the plugin avoids fork/exec'ing the `herdr`
+//! CLI: see `RpcClient`. The older read-to-EOF `request` helper (from Phase 0
+//! Spike A) is retained for simple calls such as `layout.export` /
+//! `layout.apply`. (Spike A verified the wire uses newline-delimited JSON-RPC
+//! with dotted method names — see the design doc §5.)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -104,6 +110,71 @@ impl SocketClient for RealSocket {
     }
 }
 
+/// A one-shot JSON-RPC call against the herdr control socket, behind a trait so
+/// tests never touch a real socket.
+///
+/// This is the cheap way to ask herdr a question. Shelling out to the `herdr`
+/// CLI forks and execs an 18 MB binary for every question (~68 ms wall, ~7.6 ms
+/// of CPU before it has even parsed its arguments); a call here is a connect and
+/// a round trip on a unix socket.
+pub trait RpcClient {
+    /// Send `payload` as one request line and return the single reply line.
+    fn call(&self, payload: &str) -> std::io::Result<String>;
+}
+
+/// An [`RpcClient`] over the herdr control socket, opening a short-lived
+/// connection per call.
+///
+/// Per call, not once: herdr closes a control connection as soon as it has
+/// answered a plain request (verified live against 0.8.0 — a second request on
+/// the same stream gets `EPIPE`). Only an `events.subscribe` connection stays
+/// open, and that one cannot be reused for requests either, because its replies
+/// would interleave with the event stream the watcher is reading.
+pub struct UnixRpcClient {
+    path: PathBuf,
+}
+
+impl UnixRpcClient {
+    /// Point a client at an explicit socket path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// From `$HERDR_SOCKET_PATH`; `None` outside a herdr session, which is the
+    /// caller's signal to stay on the CLI path.
+    pub fn from_env() -> Option<Self> {
+        socket_path().map(Self::new)
+    }
+}
+
+impl RpcClient for UnixRpcClient {
+    fn call(&self, payload: &str) -> std::io::Result<String> {
+        request_line(&self.path, payload)
+    }
+}
+
+/// The `session.snapshot` request line: agents, workspace/tab labels, panes and
+/// every tab's layout, in one reply (see [`crate::snapshot`]).
+pub fn snapshot_request() -> String {
+    rpc_request("herd:snapshot", "session.snapshot", serde_json::json!({}))
+}
+
+/// The `pane.process_info` request line for one pane — what the controller uses
+/// to tell a live strip from a labelled corpse.
+pub fn process_info_request(pane_id: &str) -> String {
+    rpc_request(
+        "herd:process-info",
+        "pane.process_info",
+        serde_json::json!({ "pane_id": pane_id }),
+    )
+}
+
+/// Build one newline-free JSON-RPC request line. `params` is always sent, even
+/// when empty: herdr's request schema requires the key.
+fn rpc_request(id: &str, method: &str, params: serde_json::Value) -> String {
+    serde_json::json!({ "id": id, "method": method, "params": params }).to_string()
+}
+
 /// The `events.subscribe` request line (verified live — Spike 1, herdr 0.7.0).
 ///
 /// `params.subscriptions` is required and each entry is an internally-tagged
@@ -166,6 +237,66 @@ mod tests {
         assert!(
             s.contains(r#"{"type":"pane.focused"}"#),
             "must subscribe to pane.focused so the active hat updates promptly"
+        );
+    }
+
+    #[test]
+    fn snapshot_request_is_one_json_line_asking_for_the_session_snapshot() {
+        let s = snapshot_request();
+        assert!(!s.contains('\n'), "the wire is newline-framed");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON-RPC");
+        assert_eq!(v["method"], "session.snapshot");
+        assert!(
+            v.get("params").is_some(),
+            "herdr's request schema requires params, even empty"
+        );
+    }
+
+    #[test]
+    fn process_info_request_names_the_pane_and_escapes_it() {
+        let v: serde_json::Value =
+            serde_json::from_str(&process_info_request("w1:p1")).expect("valid JSON-RPC");
+        assert_eq!(v["method"], "pane.process_info");
+        assert_eq!(v["params"]["pane_id"], "w1:p1");
+
+        // A pane id is herdr's to shape, so it is escaped rather than pasted in.
+        let odd = process_info_request(r#"we"ird"#);
+        let v: serde_json::Value = serde_json::from_str(&odd).expect("still valid JSON");
+        assert_eq!(v["params"]["pane_id"], r#"we"ird"#);
+    }
+
+    #[test]
+    fn unix_rpc_client_sends_one_request_and_returns_one_reply_line() {
+        let path = std::env::temp_dir().join(format!("herdr-herd-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let (conn, _) = listener.accept().unwrap();
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut w = conn;
+                let mut got = String::new();
+                r.read_line(&mut got).unwrap();
+                w.write_all(b"{\"result\":{\"snapshot\":{}}}\n").unwrap();
+                let _ = std::fs::remove_file(&path);
+                got
+            }
+        });
+
+        let client = UnixRpcClient::new(&path);
+        let reply = client.call(&snapshot_request()).unwrap();
+        assert_eq!(reply, r#"{"result":{"snapshot":{}}}"#);
+        let got = server.join().unwrap();
+        assert!(got.contains("session.snapshot"));
+    }
+
+    #[test]
+    fn unix_rpc_client_errors_when_there_is_no_socket_to_talk_to() {
+        let client = UnixRpcClient::new("/nonexistent/herdr-herd-no-such.sock");
+        assert!(
+            client.call(&snapshot_request()).is_err(),
+            "a dead socket must surface as an error so the caller can fall back"
         );
     }
 
