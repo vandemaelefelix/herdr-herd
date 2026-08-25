@@ -67,11 +67,18 @@ pub const MEMBER_PX_H: usize = 15 + HAT_H;
 /// two per cell.
 const BAND_ROWS: u16 = MEMBER_PX_H.div_ceil(2) as u16;
 
-/// Terminal rows the half-block strip needs end to end: the band
-/// ([`BAND_ROWS`]) plus one overlay lane row for badges/`+N`/the caption/the
-/// build marker. `config::Config::strip_rows` and `place::TARGET_ROWS` are
-/// derived from this constant so they cannot drift from the geometry that
-/// actually gets drawn (#37).
+/// Terminal rows the half-block strip needs end to end to show the whole
+/// member with no cropping: the band ([`BAND_ROWS`]) plus one overlay lane
+/// row for badges/`+N`/the caption/the build marker (#37).
+///
+/// This is **not** the shipped default: the kitty backend derives its own
+/// band height from whatever pane it is given (`kitty_render::member_rows`),
+/// so it needs no extra room, and `Auto` picks kitty wherever the terminal
+/// supports it. Raising the shipped default would double the strip's
+/// vertical footprint for every kitty user for no benefit to them. A user who
+/// is on half-block (no kitty support, or `renderer = "half-block"`) and
+/// wants the full band, uncropped, should set `strip_rows` to this value
+/// explicitly.
 pub const STRIP_ROWS: u16 = BAND_ROWS + 1;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
@@ -1666,11 +1673,14 @@ mod tests {
 
     #[test]
     fn draw_herd_shows_feet_at_the_floor_of_the_shipped_five_row_strip() {
-        // The shipped strip (config.rs's old `strip_rows: 5`, place.rs's old
+        // The shipped strip (config.rs's `strip_rows: 5`, place.rs's
         // `TARGET_ROWS: 5`) is shorter than the band the half-block renderer
-        // needs (#37). A pane this short must still show the member's feet at
-        // the pane floor, and the overlay lane (row 0) must never collide
-        // with the band below it.
+        // needs (#37): the sheep loses its headroom, cropped to fit, but a
+        // pane this short must still show the member's feet at the pane
+        // floor, and the overlay lane (row 0) must never collide with the
+        // band below it. (Kitty users don't pay this cost: `member_rows`
+        // derives its band from the pane it's given, so `Auto` picking kitty
+        // is unaffected either way.)
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[AgentStatus::Working]);
         let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
@@ -1689,6 +1699,37 @@ mod tests {
             rows[0]
         );
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn draw_herd_shows_the_whole_band_uncropped_at_strip_rows() {
+        // A half-block user who sets `strip_rows = render::STRIP_ROWS` (the
+        // documented tradeoff for the full band) gets the entire member drawn
+        // with no cropping at all: every half-block row of the band, plus its
+        // own untouched overlay lane row above it.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(60, STRIP_ROWS)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        assert_eq!(rows.len(), STRIP_ROWS as usize);
+        let bottom = rows.last().expect("at least one row");
+        assert!(
+            bottom.contains('▀') || bottom.contains('▄'),
+            "the bottom row must show the member's feet: {bottom:?}"
+        );
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the overlay lane (row 0) must hold no member pixels: {:?}",
+            rows[0]
+        );
+        let band_rows = &rows[1..];
+        assert!(
+            band_rows.iter().any(|r| r.contains('▀') || r.contains('▄')),
+            "the band (every row below the lane) must actually be used"
+        );
     }
 
     /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should

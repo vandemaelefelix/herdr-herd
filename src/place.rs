@@ -12,12 +12,14 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: [`crate::render::STRIP_ROWS`], the half-block
-/// band plus its one overlay lane row. Derived rather than a separate literal
-/// so this can't drift from the geometry `render::draw_herd` actually needs
-/// (#37) — a smaller strip crops the members and can collide the lane
-/// (badges/`+N`/the caption) with the band.
-pub const TARGET_ROWS: u16 = crate::render::STRIP_ROWS;
+/// Rows the strip should occupy: a slim status strip, deliberately shorter
+/// than [`crate::render::STRIP_ROWS`] (the half-block band's full height,
+/// #37). Kitty adapts its own band to whatever pane it's given, so it pays
+/// nothing for this; a half-block user sees the band cropped down to fit,
+/// losing headroom, not feet (`render::draw_pixels`, `render::overlay_lane_y`).
+/// A half-block user who wants the whole member, uncropped, should set
+/// `strip_rows = render::STRIP_ROWS` in their `config.toml`.
+pub const TARGET_ROWS: u16 = 5;
 
 /// The split ratio that leaves the bottom `target_rows` for the strip on a tab
 /// `tab_rows` tall: `1 - target/tab`. Clamped to `[0.3, 0.95]` so a tiny tab
@@ -132,10 +134,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_rows_fits_the_half_block_band_plus_its_overlay_lane() {
-        // MEMBER_PX_H pixel rows packed two-per-cell, plus one overlay lane
-        // row for badges/`+N`/the caption, so the two can never collide (#37).
-        assert_eq!(TARGET_ROWS, crate::render::STRIP_ROWS);
+    fn target_rows_is_a_slim_status_strip() {
+        // Deliberately shorter than render::STRIP_ROWS, the half-block band's
+        // full height (#37): slim on purpose, and kitty (Auto's pick wherever
+        // supported) adapts its own band to whatever pane it's given, so it
+        // pays nothing for staying slim.
+        assert_eq!(TARGET_ROWS, 5);
     }
 
     #[test]

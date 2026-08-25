@@ -82,10 +82,13 @@ impl SoundConfig {
 pub struct Config {
     /// Whether the `control` watchdog runs at all.
     pub enabled: bool,
-    /// Strip height in rows. Defaults to [`crate::render::STRIP_ROWS`], the
-    /// half-block renderer's actual minimum (kitty adapts to whatever it's
-    /// given, so the half-block band sets the floor); a smaller override
-    /// crops the members and can collide the overlay lane with the band (#37).
+    /// Strip height in rows. Defaults to a slim 5, deliberately shorter than
+    /// [`crate::render::STRIP_ROWS`] (the half-block band's full height): the
+    /// kitty backend adapts its own band to whatever pane it's given, so a
+    /// kitty user pays nothing for the slim default, while a half-block user
+    /// sees the member cropped down to fit, losing headroom rather than feet
+    /// (#37). A half-block user who wants the full band, uncropped, should
+    /// set this to `render::STRIP_ROWS` explicitly.
     pub strip_rows: u16,
     /// Controller poll cadence in milliseconds.
     pub sweep_interval_ms: u64,
@@ -104,7 +107,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             enabled: true,
-            strip_rows: crate::render::STRIP_ROWS,
+            strip_rows: 5,
             sweep_interval_ms: 3000,
             reduced_motion: false,
             renderer: RendererKind::Auto,
@@ -291,7 +294,7 @@ mod tests {
             Config::default(),
             Config {
                 enabled: true,
-                strip_rows: crate::render::STRIP_ROWS,
+                strip_rows: 5,
                 sweep_interval_ms: 3000,
                 reduced_motion: false,
                 renderer: RendererKind::Auto,
@@ -325,7 +328,7 @@ mod tests {
         let c = Config::from_toml_str("# a comment\nreduced_motion = true  # calm\n");
         assert!(c.reduced_motion);
         assert!(c.enabled, "an unspecified key keeps its default");
-        assert_eq!(c.strip_rows, crate::render::STRIP_ROWS);
+        assert_eq!(c.strip_rows, 5);
     }
 
     #[test]
