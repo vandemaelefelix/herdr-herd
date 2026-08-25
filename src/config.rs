@@ -82,7 +82,13 @@ impl SoundConfig {
 pub struct Config {
     /// Whether the `control` watchdog runs at all.
     pub enabled: bool,
-    /// Strip height in rows.
+    /// Strip height in rows. Defaults to a slim 5, deliberately shorter than
+    /// [`crate::render::STRIP_ROWS`] (the half-block band's full height): the
+    /// kitty backend adapts its own band to whatever pane it's given, so a
+    /// kitty user pays nothing for the slim default, while a half-block user
+    /// sees the member cropped down to fit, losing headroom rather than feet
+    /// (#37). A half-block user who wants the full band, uncropped, should
+    /// set this to `render::STRIP_ROWS` explicitly.
     pub strip_rows: u16,
     /// Controller poll cadence in milliseconds.
     pub sweep_interval_ms: u64,

@@ -63,6 +63,24 @@ fn wall_clock_now_ms() -> u64 {
 /// (standing) pose without clipping.
 pub const MEMBER_PX_H: usize = 15 + HAT_H;
 
+/// Terminal rows the half-block band needs: [`MEMBER_PX_H`] pixel rows packed
+/// two per cell.
+const BAND_ROWS: u16 = MEMBER_PX_H.div_ceil(2) as u16;
+
+/// Terminal rows the half-block strip needs end to end to show the whole
+/// member with no cropping: the band ([`BAND_ROWS`]) plus one overlay lane
+/// row for badges/`+N`/the caption/the build marker (#37).
+///
+/// This is **not** the shipped default: the kitty backend derives its own
+/// band height from whatever pane it is given (`kitty_render::member_rows`),
+/// so it needs no extra room, and `Auto` picks kitty wherever the terminal
+/// supports it. Raising the shipped default would double the strip's
+/// vertical footprint for every kitty user for no benefit to them. A user who
+/// is on half-block (no kitty support, or `renderer = "half-block"`) and
+/// wants the full band, uncropped, should set `strip_rows` to this value
+/// explicitly.
+pub const STRIP_ROWS: u16 = BAND_ROWS + 1;
+
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
     pub w: usize,
@@ -199,12 +217,18 @@ pub(crate) fn stamp_hat(
 const UPPER_HALF: &str = "▀";
 const LOWER_HALF: &str = "▄";
 
-/// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
-/// each cell packs two pixel rows into one terminal row via `▀` (fg = top
-/// pixel, bg = bottom pixel) or `▄` when only the bottom pixel is set.
+/// Emit the pixel buffer as half-block cells into `area`, left-aligned: each
+/// cell packs two pixel rows into one terminal row via `▀` (fg = top pixel,
+/// bg = bottom pixel) or `▄` when only the bottom pixel is set. Bottom-aligned
+/// vertically: when `area` has fewer rows than the buffer needs, rows are
+/// dropped off the *top* (the sprite's headroom) rather than the bottom, so a
+/// squeezed pane still shows the feet at the floor instead of cropping them
+/// off (#37).
 pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     let rows = buf.h.div_ceil(2);
-    for ry in 0..rows {
+    let skip = rows.saturating_sub(area.height as usize);
+    for ry in skip..rows {
+        let out_y = ry - skip;
         for x in 0..buf.w {
             let top = buf.px[(ry * 2) * buf.w + x];
             let bot = if ry * 2 + 1 < buf.h {
@@ -213,7 +237,7 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
                 None
             };
             let cx = area.x + x as u16;
-            let cy = area.y + ry as u16;
+            let cy = area.y + out_y as u16;
             if cx >= area.right() || cy >= area.bottom() {
                 continue;
             }
@@ -416,17 +440,20 @@ pub fn draw_herd(
     // floor, and the icon lane sits just above it. Any extra rows fall at the
     // top, blending with the pane above. The icon lane keeps overlays/`+N`/the
     // caption off the member.
-    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
-    let band_top = area.bottom().saturating_sub(band_rows);
+    //
+    // `band_top` is derived from `overlay_lane_y` (rather than recomputing
+    // `band_rows` here) so the lane and the band agree on where one ends and
+    // the other begins: a pane shorter than `STRIP_ROWS` shrinks the band
+    // instead of overlapping the lane (#37). `draw_pixels` crops a squeezed
+    // band from the top (the sprite's headroom), so the feet stay visible at
+    // the pane floor.
     let lane_y = overlay_lane_y(area);
+    let band_top = lane_y.saturating_add(1);
     let member_area = Rect {
         x: area.x,
         y: band_top,
         width: area.width,
-        // Clamped so a pane shorter than the band (below herdr's enforced
-        // minimum) crops the top of the members instead of handing
-        // `draw_pixels` a Rect that overruns the real frame buffer.
-        height: band_rows.min(area.height.saturating_sub(band_top)),
+        height: area.bottom().saturating_sub(band_top),
     };
     draw_pixels(frame, member_area, &buf);
 
@@ -488,9 +515,11 @@ pub fn draw_herd(
 }
 
 /// The row of the overlay lane that holds `+N`, the caption, and the build
-/// marker: one row above the bottom-aligned member band.
+/// marker: one row above the bottom-aligned member band. The band shrinks
+/// below [`BAND_ROWS`] whenever the pane is shorter than [`STRIP_ROWS`] (#37),
+/// so the lane always keeps its own row and can never collide with a member.
 pub fn overlay_lane_y(area: Rect) -> u16 {
-    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
+    let band_rows = BAND_ROWS.min(area.height.saturating_sub(1));
     area.bottom().saturating_sub(band_rows).saturating_sub(1)
 }
 
@@ -1700,6 +1729,67 @@ mod tests {
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
+    }
+
+    #[test]
+    fn draw_herd_shows_feet_at_the_floor_of_the_shipped_five_row_strip() {
+        // The shipped strip (config.rs's `strip_rows: 5`, place.rs's
+        // `TARGET_ROWS: 5`) is shorter than the band the half-block renderer
+        // needs (#37): the sheep loses its headroom, cropped to fit, but a
+        // pane this short must still show the member's feet at the pane
+        // floor, and the overlay lane (row 0) must never collide with the
+        // band below it. (Kitty users don't pay this cost: `member_rows`
+        // derives its band from the pane it's given, so `Auto` picking kitty
+        // is unaffected either way.)
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        let bottom = rows.last().expect("at least one row");
+        assert!(
+            bottom.contains('▀') || bottom.contains('▄'),
+            "the bottom row must show the member's feet, not cropped-off blank space: {bottom:?}"
+        );
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the overlay lane (row 0) must hold no member pixels, even when the pane is short: {:?}",
+            rows[0]
+        );
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn draw_herd_shows_the_whole_band_uncropped_at_strip_rows() {
+        // A half-block user who sets `strip_rows = render::STRIP_ROWS` (the
+        // documented tradeoff for the full band) gets the entire member drawn
+        // with no cropping at all: every half-block row of the band, plus its
+        // own untouched overlay lane row above it.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(60, STRIP_ROWS)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        assert_eq!(rows.len(), STRIP_ROWS as usize);
+        let bottom = rows.last().expect("at least one row");
+        assert!(
+            bottom.contains('▀') || bottom.contains('▄'),
+            "the bottom row must show the member's feet: {bottom:?}"
+        );
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the overlay lane (row 0) must hold no member pixels: {:?}",
+            rows[0]
+        );
+        let band_rows = &rows[1..];
+        assert!(
+            band_rows.iter().any(|r| r.contains('▀') || r.contains('▄')),
+            "the band (every row below the lane) must actually be used"
+        );
     }
 
     /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should
