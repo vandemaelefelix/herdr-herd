@@ -719,6 +719,9 @@ where
     let species_count = species.len().max(1);
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
+    // One claim store for the whole session: every pane sees every transition,
+    // so the sound is claimed once per transition, not once per pane.
+    let sound_claim = crate::sound::session_claim();
     loop {
         // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
@@ -735,8 +738,7 @@ where
             transitions.extend(herd.reconcile(&agents, species_count, now_ms));
         }
         if !transitions.is_empty() {
-            let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
-            crate::sound::play_all(sound_player, &sounds);
+            crate::sound::play_claimed(sound_player, sound_claim.as_ref(), &transitions, sound_cfg);
         }
         let strip_w = terminal.size()?.width as usize;
         let caption = hovered.clone();
