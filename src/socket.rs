@@ -199,14 +199,66 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    /// A unique-per-test socket path, removed on drop even if the test panics
+    /// before reaching its own cleanup line. `std::process::id()` alone is not
+    /// enough: every test in this file runs as a thread in the same process,
+    /// so `tag` is what actually keeps them from colliding (see issue #53).
+    struct TempSocketPath(std::path::PathBuf);
+
+    impl TempSocketPath {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("herdr-herd-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TempSocketPath {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Wait up to `timeout` for `handle` to finish and return its result. A
+    /// bare `.join()` blocks forever if the thread is wedged (e.g. stuck in
+    /// `accept()` with no client ever connecting), which wedges the whole
+    /// suite with no diagnostic (issue #53). This fails loudly instead.
+    fn join_with_timeout<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => std::panic::resume_unwind(e),
+            Err(_) => panic!(
+                "server thread did not finish within {timeout:?}; \
+                 likely stuck in accept() or a blocking read"
+            ),
+        }
+    }
+
+    const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn real_socket_sends_and_receives_framed_lines() {
-        let path = std::env::temp_dir().join(format!("herdr-herd-rt-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+        let path = TempSocketPath::new("rt");
+        let listener = UnixListener::bind(&*path).unwrap();
         let server = std::thread::spawn({
-            let path = path.clone();
+            let path = path.0.clone();
             move || {
                 let (conn, _) = listener.accept().unwrap();
                 let mut r = BufReader::new(conn.try_clone().unwrap());
@@ -223,7 +275,7 @@ mod tests {
             .unwrap();
         let reply = c.recv_line().unwrap();
         assert_eq!(reply, "{\"event\":\"ok\"}");
-        let got = server.join().unwrap();
+        let got = join_with_timeout(server, JOIN_TIMEOUT);
         assert!(got.contains("events.subscribe"));
     }
 
@@ -267,11 +319,10 @@ mod tests {
 
     #[test]
     fn unix_rpc_client_sends_one_request_and_returns_one_reply_line() {
-        let path = std::env::temp_dir().join(format!("herdr-herd-rpc-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+        let path = TempSocketPath::new("rpc");
+        let listener = UnixListener::bind(&*path).unwrap();
         let server = std::thread::spawn({
-            let path = path.clone();
+            let path = path.0.clone();
             move || {
                 let (conn, _) = listener.accept().unwrap();
                 let mut r = BufReader::new(conn.try_clone().unwrap());
@@ -284,10 +335,10 @@ mod tests {
             }
         });
 
-        let client = UnixRpcClient::new(&path);
+        let client = UnixRpcClient::new(&*path);
         let reply = client.call(&snapshot_request()).unwrap();
         assert_eq!(reply, r#"{"result":{"snapshot":{}}}"#);
-        let got = server.join().unwrap();
+        let got = join_with_timeout(server, JOIN_TIMEOUT);
         assert!(got.contains("session.snapshot"));
     }
 
@@ -302,12 +353,11 @@ mod tests {
 
     #[test]
     fn request_writes_payload_and_reads_reply() {
-        let dir = std::env::temp_dir().join(format!("herdr-herd-sock-{}", std::process::id()));
-        let _ = std::fs::remove_file(&dir);
-        let listener = UnixListener::bind(&dir).unwrap();
+        let dir = TempSocketPath::new("sock");
+        let listener = UnixListener::bind(&*dir).unwrap();
 
         let server = std::thread::spawn({
-            let dir = dir.clone();
+            let dir = dir.0.clone();
             move || {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut got = String::new();
@@ -329,17 +379,16 @@ mod tests {
 
         let reply = request(&dir, "PING").unwrap();
         assert_eq!(reply, "PONG");
-        let got = server.join().unwrap();
+        let got = join_with_timeout(server, JOIN_TIMEOUT);
         assert_eq!(got, "PING\n");
     }
 
     #[test]
     fn request_line_reads_one_reply_line_without_needing_eof() {
-        let path = std::env::temp_dir().join(format!("herdr-herd-rl-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+        let path = TempSocketPath::new("rl");
+        let listener = UnixListener::bind(&*path).unwrap();
         let server = std::thread::spawn({
-            let path = path.clone();
+            let path = path.0.clone();
             move || {
                 let (conn, _) = listener.accept().unwrap();
                 let mut r = BufReader::new(conn.try_clone().unwrap());
@@ -364,7 +413,7 @@ mod tests {
         // with recv_timeout instead.
         let (tx, rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn({
-            let path = path.clone();
+            let path = path.0.clone();
             move || {
                 let result = request_line(&path, "{\"ping\":1}");
                 let _ = tx.send(result);
@@ -376,18 +425,17 @@ mod tests {
             .expect("request_line did not return promptly after one reply line");
         assert_eq!(result.unwrap(), "{\"reply\":1}");
 
-        client.join().unwrap();
-        let got = server.join().unwrap();
+        join_with_timeout(client, JOIN_TIMEOUT);
+        let got = join_with_timeout(server, JOIN_TIMEOUT);
         assert_eq!(got, "{\"ping\":1}\n");
     }
 
     #[test]
     fn request_line_errors_when_the_socket_closes_before_a_reply() {
-        let path = std::env::temp_dir().join(format!("herdr-herd-rl-close-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).unwrap();
+        let path = TempSocketPath::new("rl-close");
+        let listener = UnixListener::bind(&*path).unwrap();
         let server = std::thread::spawn({
-            let path = path.clone();
+            let path = path.0.clone();
             move || {
                 let (conn, _) = listener.accept().unwrap();
                 // Accept, then close without replying.
@@ -399,6 +447,6 @@ mod tests {
         let result = request_line(&path, "{\"ping\":1}");
         assert!(result.is_err());
 
-        server.join().unwrap();
+        join_with_timeout(server, JOIN_TIMEOUT);
     }
 }

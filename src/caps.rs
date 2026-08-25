@@ -315,12 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn fake_reports_configured_support() {
-        assert!(FakeCaps { supported: true }.supports_kitty_graphics());
-        assert!(!FakeCaps { supported: false }.supports_kitty_graphics());
-    }
-
-    #[test]
     fn reply_matcher_accepts_only_matching_image_id() {
         // Pure parser used by RealCaps, unit-tested without a terminal.
         assert!(reply_confirms(b"\x1b_Gi=31,OK\x1b\\", 31));

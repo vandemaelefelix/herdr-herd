@@ -135,9 +135,9 @@ impl Default for Timings {
 
 /// The refresh schedule: when the next refresh is due, given what has arrived.
 ///
-/// Split out from the loop so both the real watcher and [`drain_events`] make
-/// the same decisions, and so the decisions can be tested without a thread, a
-/// socket or a clock.
+/// Split out from the loop so the debounce/coalesce decisions can be tested
+/// directly — without a thread, a socket or a clock — independently of
+/// [`watch`], which drives the same schedule against the real socket/clock.
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     timings: Timings,
@@ -189,41 +189,6 @@ impl Debouncer {
         self.last_send = Some(now_ms);
         self.due_at = None;
     }
-}
-
-/// Test seam: consume every line a socket yields, applying the same schedule
-/// the real loop applies, and return the snapshots that would be pushed.
-/// `event_time(i)` supplies the clock reading (ms) for the i-th event so tests
-/// can place events in and out of the debounce windows.
-///
-/// Only the event-driven decisions: nothing here waits for a window to close on
-/// its own, because the socket runs dry rather than idling.
-pub fn drain_events(
-    feed: &mut HerdFeed,
-    socket: &mut dyn SocketClient,
-    timings: Timings,
-    mut event_time: impl FnMut(usize) -> u64,
-) -> Vec<Vec<Agent>> {
-    let _ = socket.send_line(&subscribe_request());
-    let mut snaps = Vec::new();
-    let mut schedule = Debouncer::new(timings);
-    let mut i = 0;
-    while let Ok(line) = socket.recv_line() {
-        let t = event_time(i);
-        i += 1;
-        let class = classify_event(&line);
-        if class == EventClass::Labels {
-            feed.invalidate_labels();
-        }
-        schedule.on_event(class, t);
-        if schedule.due(t) {
-            if let Some(s) = feed.herd(t) {
-                snaps.push(s);
-            }
-            schedule.sent(t);
-        }
-    }
-    snaps
 }
 
 /// Spawn the real watcher thread. Pushes an initial snapshot, then subscribes
@@ -302,7 +267,6 @@ pub fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentStatus;
     use crate::herdr::{CommandRunner, LiveHerdr};
     use std::ffi::OsStr;
     use std::os::unix::process::ExitStatusExt;
@@ -324,70 +288,6 @@ mod tests {
     /// A feed with no socket, so it answers from the canned CLI double.
     fn cli_feed() -> HerdFeed {
         HerdFeed::new(None, Box::new(LiveHerdr::with_runner("herdr", FakeRunner)))
-    }
-
-    // A fake socket that emits N event lines then blocks forever (returns Err).
-    struct FakeSocket {
-        remaining: usize,
-        line: String,
-    }
-    impl FakeSocket {
-        fn emitting(n: usize) -> Self {
-            Self {
-                remaining: n,
-                line: r#"{"event":"pane_agent_status_changed"}"#.into(),
-            }
-        }
-    }
-    impl crate::socket::SocketClient for FakeSocket {
-        fn send_line(&mut self, _l: &str) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn recv_line(&mut self) -> std::io::Result<String> {
-            if self.remaining == 0 {
-                return Err(std::io::Error::other("done"));
-            }
-            self.remaining -= 1;
-            Ok(self.line.clone())
-        }
-    }
-
-    fn timings(debounce_ms: u64) -> Timings {
-        Timings {
-            debounce_ms,
-            ..Timings::default()
-        }
-    }
-
-    #[test]
-    fn debounce_coalesces_a_burst_into_one_refetch() {
-        let mut feed = cli_feed();
-        // 5 events arriving within the debounce window => 1 snapshot.
-        let snaps = drain_events(
-            &mut feed,
-            &mut FakeSocket::emitting(5),
-            timings(250),
-            |_| 0, /* all same tick */
-        );
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].len(), 1);
-        assert_eq!(snaps[0][0].agent_status, AgentStatus::Idle);
-    }
-
-    #[test]
-    fn separated_events_produce_separate_refetches() {
-        let mut feed = cli_feed();
-        let mut tick = 0u64;
-        let snaps = drain_events(
-            &mut feed,
-            &mut FakeSocket::emitting(3),
-            timings(250),
-            move |_| {
-                tick += 1000;
-                tick
-            },
-        );
-        assert_eq!(snaps.len(), 3);
     }
 
     #[test]
@@ -501,5 +401,203 @@ mod tests {
             t.focus_ms < t.debounce_ms,
             "raising the debounce must not slow the hat"
         );
+    }
+
+    // ---- issue #49: drive `watch` itself, not a test-only shadow ---------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A deterministic, `Send` clock for driving `watch` on its own spawned
+    /// thread: every call advances by a fixed `step`, so a test can reason
+    /// about exactly which `now_ms` reading backs each loop decision without
+    /// touching the real clock.
+    struct StepClock {
+        ms: AtomicU64,
+        step: u64,
+    }
+
+    impl StepClock {
+        fn new(step: u64) -> Self {
+            Self {
+                ms: AtomicU64::new(0),
+                step,
+            }
+        }
+    }
+
+    impl Clock for StepClock {
+        fn now_ms(&self) -> u64 {
+            self.ms.fetch_add(self.step, Ordering::SeqCst)
+        }
+    }
+
+    /// One scripted `recv_line` outcome for [`ScriptedSocket`].
+    #[derive(Clone)]
+    enum SocketOutcome {
+        /// A framed event line arrives.
+        Line(&'static str),
+        /// `WouldBlock`: the real idle tick within the read timeout, not a
+        /// dead connection (see [`SocketClient::recv_line`]).
+        Idle,
+        /// A real close: the production loop must degrade to poll-only.
+        Closed,
+    }
+
+    /// A `SocketClient` double that drives `watch` directly, per issue #49,
+    /// replacing `drain_events`, a test-only reimplementation of the debounce
+    /// rule that could drift from the real loop. Yields each scripted outcome
+    /// in order; once exhausted, settles into permanent idle ticks, which is
+    /// always safe (never a hang risk) unlike defaulting to a close, which
+    /// would route every exhausted script into the real `thread::sleep`
+    /// degrade path.
+    struct ScriptedSocket {
+        script: std::collections::VecDeque<SocketOutcome>,
+    }
+
+    impl ScriptedSocket {
+        fn new(script: Vec<SocketOutcome>) -> Self {
+            Self {
+                script: script.into(),
+            }
+        }
+    }
+
+    impl crate::socket::SocketClient for ScriptedSocket {
+        fn send_line(&mut self, _line: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn recv_line(&mut self) -> std::io::Result<String> {
+            match self.script.pop_front() {
+                Some(SocketOutcome::Line(l)) => Ok(l.to_string()),
+                Some(SocketOutcome::Closed) => Err(std::io::Error::other("closed")),
+                Some(SocketOutcome::Idle) | None => {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for `handle` to finish. A bare `.join()` on a
+    /// wedged watcher thread would hang the whole suite with no diagnostic
+    /// (the same failure mode issue #53 names for socket tests); this fails
+    /// loudly instead.
+    fn join_with_timeout<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => std::panic::resume_unwind(e),
+            Err(_) => panic!("watcher thread did not finish within {timeout:?}"),
+        }
+    }
+
+    const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+    const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn watch_pushes_an_initial_snapshot_then_a_debounced_refresh_for_a_burst_of_events() {
+        // A near-infinite slow poll isolates this test to the debounce path
+        // (own `last_send` bookkeeping) rather than the safety net.
+        let timings = Timings {
+            slow_ms: 1_000_000,
+            debounce_ms: 50,
+            focus_ms: 50,
+        };
+        let socket = ScriptedSocket::new(vec![
+            SocketOutcome::Line(r#"{"event":"pane_created"}"#),
+            SocketOutcome::Line(r#"{"event":"pane_created"}"#),
+        ]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(20)),
+            tx,
+            timings,
+        );
+
+        let initial = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("the initial snapshot is pushed before any socket event");
+        assert_eq!(initial.len(), 1);
+
+        let refreshed = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("a debounced refresh follows the burst of structural events");
+        assert_eq!(refreshed.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    #[test]
+    fn watch_treats_idle_ticks_as_a_normal_wait_and_the_slow_poll_net_still_fires() {
+        // The debounce window is effectively infinite, so with zero events at
+        // all the only thing that can produce a second snapshot is the
+        // slow-poll safety net — proving idle ticks (`WouldBlock`) are neither
+        // mistaken for a close nor themselves trigger a refresh.
+        let timings = Timings {
+            slow_ms: 40,
+            debounce_ms: 1_000_000,
+            focus_ms: 1_000_000,
+        };
+        let socket = ScriptedSocket::new(vec![SocketOutcome::Idle; 50]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(10)),
+            tx,
+            timings,
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        let polled = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("the slow-poll net still refreshes with no socket events at all");
+        assert_eq!(polled.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    #[test]
+    fn watch_degrades_to_poll_only_when_the_socket_closes_for_real() {
+        let timings = Timings {
+            slow_ms: 5,
+            debounce_ms: 1_000_000,
+            focus_ms: 1_000_000,
+        };
+        let socket = ScriptedSocket::new(vec![SocketOutcome::Closed]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(10)),
+            tx,
+            timings,
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        // The socket closes on the very first read; production must degrade
+        // to poll-only rather than treat that as fatal, so a refresh must
+        // still arrive off the slow-poll safety net alone.
+        let polled = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("a poll-only refresh still arrives after the socket closes");
+        assert_eq!(polled.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
     }
 }
