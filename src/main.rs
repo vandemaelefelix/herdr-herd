@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
+use herdr_herd::diag::Diagnostic;
 use herdr_herd::herdr::{HerdFeed, LiveHerdr};
 use herdr_herd::palette::Theme;
 use herdr_herd::render;
@@ -24,12 +25,14 @@ fn main() -> ExitCode {
             let socket: Option<Box<dyn SocketClient + Send>> = socket_path()
                 .and_then(|p| RealSocket::connect(&p).ok())
                 .map(|s| Box::new(s) as Box<dyn SocketClient + Send>);
+            let diag = Diagnostic::new();
             let _watcher = watch(
                 feed,
                 socket,
                 Box::new(RealClock::new()),
                 tx,
                 Timings::default(),
+                diag.clone(),
             );
             match render::run(
                 rx,
@@ -42,6 +45,7 @@ fn main() -> ExitCode {
                 cfg.sounds,
                 Box::new(herdr_herd::sound::SystemSoundPlayer),
                 cfg.agent_icon,
+                diag,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
