@@ -333,9 +333,16 @@ mod tests {
     }
     impl FakeSocket {
         fn emitting(n: usize) -> Self {
+            Self::emitting_line(n, r#"{"event":"pane_agent_status_changed"}"#)
+        }
+
+        /// Emit `n` copies of a caller-chosen wire line, verbatim. Lets a
+        /// test push a real herdr event line (e.g. `pane_focused`) through
+        /// `drain_events` instead of a hand-built `EventClass`.
+        fn emitting_line(n: usize, line: &str) -> Self {
             Self {
                 remaining: n,
-                line: r#"{"event":"pane_agent_status_changed"}"#.into(),
+                line: line.to_string(),
             }
         }
     }
@@ -421,6 +428,39 @@ mod tests {
             },
         );
         assert_eq!(snaps.len(), 3);
+    }
+
+    /// #75: the fast focus window only protects the hat if a real wire line
+    /// actually reaches it. Every other test of the fast path builds
+    /// `EventClass::Focus` by hand, so it would stay green even if
+    /// `classify_event` mapped `pane_focused` to the wrong class entirely
+    /// (herdr's wire names are underscored; `subscribe_request`'s
+    /// subscription types are dotted, and it is easy to get that backwards).
+    /// This one starts from the literal line herdr emits and goes through
+    /// `drain_events` end to end, so it fails if that mapping breaks.
+    #[test]
+    fn a_real_pane_focused_wire_line_takes_the_fast_focus_window() {
+        let mut feed = cli_feed();
+        let mut socket = FakeSocket::emitting_line(2, r#"{"event":"pane_focused"}"#);
+        // First line primes the schedule (nothing sent yet, fires at once);
+        // the second lands 150ms later. That is well inside the 100ms focus
+        // window closing, but nowhere near the 750ms structural one, so it
+        // can only be due here if classify_event routed it to Focus.
+        let times = [0u64, 150];
+        let mut i = 0;
+        let snaps = drain_events(&mut feed, &mut socket, Timings::default(), move |_| {
+            let t = times[i];
+            i += 1;
+            t
+        });
+        assert_eq!(
+            snaps.len(),
+            2,
+            "a real pane_focused line must be due within the 100ms focus \
+             window; if it fell back to the 750ms structural one this second \
+             line would not be due yet and only the priming refetch would \
+             have happened"
+        );
     }
 
     #[test]
