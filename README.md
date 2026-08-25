@@ -127,7 +127,7 @@ an opinionated default:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether the `control` watchdog runs. |
-| `strip_rows` | int | `5` | Strip height, in rows (1 icon lane + 3 pixel rows + 1 caption). |
+| `strip_rows` | int | `10` | Strip height, in rows (1 overlay lane + the half-block band's 9 pixel rows). |
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm herd — no wandering or bounce. |
 | `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw the herd with. |
