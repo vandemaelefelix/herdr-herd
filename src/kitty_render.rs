@@ -2303,7 +2303,7 @@ MMMM
         height: 10,
     };
 
-    fn herd_of(states: &[AgentStatus]) -> Herd {
+    fn herd_of_states(states: &[AgentStatus]) -> Herd {
         let mut h = Herd::new();
         for (i, &s) in states.iter().enumerate() {
             let tid = format!("t{i}");
@@ -2353,7 +2353,7 @@ MMMM
         // and overlay-bearing members all get their turn.
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
-        let herd = herd_of(&[Working, Idle, Done, Blocked, Unknown]);
+        let herd = herd_of_states(&[Working, Idle, Done, Blocked, Unknown]);
         let (frames, seen) = kitty_sweep(&herd, &species, (0..30_000).step_by(83));
         assert!(
             seen.len() < frames,
@@ -2495,7 +2495,7 @@ MMMM
         // its old placements and never purge/retransmit (see `render_members`).
         use AgentStatus::*;
         let species = vec![parse_species(BLOB).unwrap()];
-        let herd = herd_of(&[Working, Idle]);
+        let herd = herd_of_states(&[Working, Idle]);
         let r = KittyRenderer::for_test(SharedSink::default(), 2);
         let sig = |w: u16, h: u16| {
             r.frame_signature(&herd, &species, Theme::Dark, Rect::new(0, 0, w, h), 0, None)
@@ -2512,7 +2512,7 @@ MMMM
         // a different area) must therefore never match the signature of one
         // that has, or the strip would go permanently blank after a resize.
         let species = vec![parse_species(BLOB).unwrap()];
-        let herd = herd_of(&[AgentStatus::Idle]);
+        let herd = herd_of_states(&[AgentStatus::Idle]);
         let mut r = KittyRenderer::for_test(SharedSink::default(), 2);
         let before = r.frame_signature(&herd, &species, Theme::Dark, SINK_AREA, 0, None);
         r.draw_to_sink(&herd, &species, Theme::Dark, 0);
