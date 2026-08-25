@@ -1879,6 +1879,248 @@ MMMM
         );
     }
 
+    /// Two `Working` members frozen at opposite ends of the strip, with `focused`
+    /// on `focused_tid`. Anchored so each one's placement column is exact and
+    /// time-independent (`animate` pins an anchored member's `x_fraction` to
+    /// `frozen_x` at the anchor instant), which is what lets a placement be
+    /// attributed to a member by its column alone. `Working` also carries no
+    /// overlay icon, so every transmit in the frame is a member's own image.
+    fn two_anchored_members(focused_tid: &str) -> Herd {
+        let mut h = Herd::new();
+        for (tid, frozen_x) in [("t1", 0.0), ("t2", 1.0)] {
+            let mut m = Member::new(tid.into(), identity_for(tid, 1), AgentStatus::Working);
+            m.anchor = Some(crate::motion::Anchor {
+                frozen_x,
+                settled_at_ms: 0,
+            });
+            m.focused = tid == focused_tid;
+            h.members.push(m);
+        }
+        h
+    }
+
+    /// One control-block field, parsed as a `u32` (`i=`, `p=`, `s=`, ...).
+    fn control_field(control: &str, key: &str) -> u32 {
+        control
+            .split(',')
+            .find_map(|kv| kv.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} field in {control:?}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Every image transmitted in `out`, as `(image_id, carries hat pixels)`.
+    /// Continuation chunks (`m=1`) are folded back into the image they belong
+    /// to, so this reads correctly at any scale.
+    ///
+    /// This is what the focus-hat tests need and `a=t` counting cannot give:
+    /// which *specific* image the hat was baked into, so a hat stamped on the
+    /// wrong member is a failure rather than just another hat-bearing transmit.
+    fn transmitted_images(out: &str) -> Vec<(u32, bool)> {
+        let mut images: Vec<(u32, String)> = Vec::new();
+        for chunk in out.split("\x1b_G").skip(1) {
+            let Some(end) = chunk.find("\x1b\\") else {
+                continue;
+            };
+            let Some((control, payload)) = chunk[..end].split_once(';') else {
+                continue; // payload-less command (a=p / a=d)
+            };
+            if control.starts_with("a=t") {
+                images.push((control_field(control, "i="), payload.to_string()));
+            } else if control.starts_with("m=") {
+                // A continuation of the transmit above it.
+                if let Some(last) = images.last_mut() {
+                    last.1.push_str(payload);
+                }
+            }
+        }
+        images
+            .into_iter()
+            .map(|(id, b64)| {
+                let px = crate::base64::decode(&b64);
+                let hat = contains_rgb(&px, HAT_FILL_RGB) && contains_rgb(&px, HAT_OUTLINE_RGB);
+                (id, hat)
+            })
+            .collect()
+    }
+
+    /// Every member-body placement in `out`, as `(cursor column, image_id)` in
+    /// emission order. Each member's placement is preceded by its own
+    /// cursor-move escape, so the running cursor column identifies which member
+    /// the placement is for; overlay icons place at `z >= Z_ICON_BASE` and are
+    /// excluded.
+    fn member_placements(out: &str) -> Vec<(i32, u32)> {
+        let mut column = 0i32;
+        let mut placements = Vec::new();
+        for piece in out.split('\x1b') {
+            if let Some(rest) = piece.strip_prefix('[') {
+                // CUP: `[{row};{col}H`
+                if let Some(h) = rest.find('H')
+                    && let Some((_row, col)) = rest[..h].split_once(';')
+                    && let Ok(col) = col.parse()
+                {
+                    column = col;
+                }
+            } else if let Some(rest) = piece.strip_prefix("_G") {
+                let control = rest.split(';').next().unwrap_or("");
+                if control.starts_with("a=p") && control_field(control, "z=") < Z_ICON_BASE as u32 {
+                    placements.push((column, control_field(control, "i=")));
+                }
+            }
+        }
+        placements
+    }
+
+    /// The cursor column each member's own placement is emitted at, keyed by
+    /// `terminal_id`: the same `animate` position `render_members` scales into
+    /// the strip. Exact (not approximate) for the anchored members above.
+    fn placement_columns(
+        herd: &Herd,
+        species: &[Species],
+        strip_w: u16,
+        now_ms: u64,
+    ) -> HashMap<String, i32> {
+        let member_w = species[0].size().0;
+        let max_x = (strip_w as f32 - member_w as f32).max(0.0);
+        let columns: HashMap<String, i32> = herd
+            .members
+            .iter()
+            .map(|m| {
+                let state = &species[m.identity.species_index].states[&m.status];
+                let a = animate(&m.terminal_id, m.status, state, now_ms, m.anchor);
+                let col =
+                    ((a.x_fraction * max_x).round() as i32 + 1).clamp(1, strip_w.max(1) as i32);
+                (m.terminal_id.clone(), col)
+            })
+            .collect();
+        let distinct: std::collections::HashSet<&i32> = columns.values().collect();
+        assert_eq!(
+            distinct.len(),
+            columns.len(),
+            "the fixture must keep the members in distinct columns, else a \
+             placement cannot be attributed to one of them: {columns:?}"
+        );
+        columns
+    }
+
+    #[test]
+    fn a_focus_handoff_transmits_one_hatted_image_and_places_it_on_the_new_holder() {
+        // The handoff frame transmits TWO fresh images (the old holder without
+        // its hat, the new holder with one), so "some transmit has hat pixels"
+        // would still pass with the hat stamped on the wrong sheep. The
+        // properties that actually pin it: exactly one transmitted image carries
+        // hat pixels, and that image is the one placed at the newly focused
+        // member's column.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 1);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let area = Rect::new(0, 0, 200, 10);
+
+        let _ = r.render_members(&two_anchored_members("t1"), &species, area, Theme::Dark, 0);
+        let _ = sink.take();
+
+        let herd = two_anchored_members("t2");
+        let _ = r.render_members(&herd, &species, area, Theme::Dark, 0);
+        let out = sink.take();
+
+        let images = transmitted_images(&out);
+        assert_eq!(images.len(), 2, "the handoff re-transmits both members");
+        let hatted: Vec<u32> = images
+            .iter()
+            .filter(|&&(_, hat)| hat)
+            .map(|&(id, _)| id)
+            .collect();
+        assert_eq!(
+            hatted.len(),
+            1,
+            "exactly one transmitted image may carry hat pixels, got {hatted:?}"
+        );
+
+        let columns = placement_columns(&herd, &species, area.width, 0);
+        let placements = member_placements(&out);
+        assert_eq!(
+            placements.len(),
+            2,
+            "both members are placed: {placements:?}"
+        );
+        let hat_columns: Vec<i32> = placements
+            .iter()
+            .filter(|&&(_, id)| id == hatted[0])
+            .map(|&(col, _)| col)
+            .collect();
+        assert_eq!(
+            hat_columns,
+            vec![columns["t2"]],
+            "the hatted image must be placed at the newly focused member's \
+             column, not the previous holder's ({columns:?})"
+        );
+    }
+
+    #[test]
+    fn a_steady_frame_places_the_hatted_image_only_on_the_focused_member() {
+        // By the third frame the cache holds a hatted AND an unhatted image for
+        // BOTH members, and a steady frame transmits nothing, so counting
+        // `a=t` proves only that the cache works, and says nothing about hats.
+        // What pins the property is which cached image each placement points at:
+        // exactly one placement may reference a hat-bearing image, and it must
+        // be the focused member's. Re-placing the ex-holder's cached hatted
+        // image (two hats on screen) fails here and cannot fail a transmit
+        // count.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 1);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let area = Rect::new(0, 0, 200, 10);
+        let mut hat_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        let mut frame = |r: &mut KittyRenderer, herd: &Herd| -> String {
+            let _ = r.render_members(herd, &species, area, Theme::Dark, 0);
+            let out = sink.take();
+            hat_ids.extend(
+                transmitted_images(&out)
+                    .into_iter()
+                    .filter(|&(_, hat)| hat)
+                    .map(|(id, _)| id),
+            );
+            out
+        };
+
+        frame(&mut r, &two_anchored_members("t1")); // t1 hatted
+        let herd = two_anchored_members("t2");
+        frame(&mut r, &herd); // handoff: t2 hatted, t1 unhatted
+        let steady = frame(&mut r, &herd); // steady: everything cached
+
+        assert!(
+            !steady.contains("a=t"),
+            "a steady frame transmits nothing, which is exactly why a transmit \
+             count cannot pin the hat: {steady:?}"
+        );
+        assert_eq!(
+            hat_ids.len(),
+            2,
+            "both members must have a hatted image sitting in the cache, so \
+             re-placing the wrong one is possible and therefore detectable"
+        );
+
+        let columns = placement_columns(&herd, &species, area.width, 0);
+        let placements = member_placements(&steady);
+        assert_eq!(
+            placements.len(),
+            2,
+            "both members are re-placed every frame: {placements:?}"
+        );
+        let hat_columns: Vec<i32> = placements
+            .iter()
+            .filter(|&&(_, id)| hat_ids.contains(&id))
+            .map(|&(col, _)| col)
+            .collect();
+        assert_eq!(
+            hat_columns,
+            vec![columns["t2"]],
+            "exactly one placement may reference a hat-bearing image, at the \
+             focused member's column ({columns:?})"
+        );
+    }
+
     #[test]
     fn departed_members_placement_is_deleted() {
         let sink = SharedSink::default();

@@ -35,6 +35,14 @@ stuck? is anyone finished? is everyone busy? is it quiet?
 - **Useful, not just cute.** No name labels cluttering the strip — instead,
   **hover** a sheep to see its agent's name, and **click** it to jump straight
   to that agent's pane.
+- **One hatted sheep: "you are here."** The agent in the focused pane wears a
+  small red hat. herdr reports one focused pane per session and the strip is
+  session-wide, so exactly one sheep is hatted at a time, in every tab, even
+  when that agent lives in another workspace. Focusing something that is not an
+  agent pane (the strip itself, a shell, an editor) leaves the hat on the agent
+  you were last in, rather than dropping it from every sheep. See
+  [GOAL.md](GOAL.md#the-focus-hat-one-global-you-are-here-marker) for the full
+  semantics.
 - **Universal rendering.** Sprites are drawn with half-block characters and
   24-bit color, so it looks pixel-art in every terminal, with no dependencies.
 
