@@ -30,8 +30,8 @@ use std::io;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
-use std::sync::{Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::SoundConfig;
@@ -161,24 +161,21 @@ fn armed_path(cfg: &SoundConfig, status: crate::agent::AgentStatus) -> Option<&P
 /// or an unavailable player must never crash or block rendering. This is the
 /// unconditional primitive; app code goes through [`play_claimed`] so N panes
 /// watching one transition do not each play it.
+///
+/// This deliberately never reports a failure anywhere, not even to stderr.
+/// `run_loop` calls this from inside the strip's alternate screen with raw
+/// mode on (see `render::run`): a bare `eprintln!` there paints straight
+/// over the sheep at whatever the cursor happens to be, `\n` stair-steps
+/// across the pane without a carriage return, and with #62's adaptive tick
+/// an idle pane may not redraw for hundreds of ms, so the corruption would
+/// sit on screen rather than being wiped by the next frame. The strip *is*
+/// the UI here; there is no spare channel to print to. A real user-visible
+/// warning belongs in the strip itself (tracked separately, alongside
+/// #55/#60's renderer-liveness reporting), not bolted onto this cleanup.
 pub fn play_all(player: &dyn SoundPlayer, paths: &[PathBuf]) {
     for p in paths {
-        if let Err(e) = player.play(p) {
-            warn_once(&e);
-        }
+        let _ = player.play(p);
     }
-}
-
-/// Tell the user, once per process, that a sound failed to play. Playback
-/// stays best-effort either way (see the module doc), but silence with no
-/// explanation (#74) is a worse default than one stderr line the first time
-/// it happens: enough to point at a missing player without spamming a pane
-/// that keeps failing the same way.
-fn warn_once(err: &io::Error) {
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        eprintln!("herdr-herd: sound playback failed and will stay silent for this pane: {err}");
-    });
 }
 
 /// Play the sounds for `transitions` that this process claims, ignoring the
@@ -607,6 +604,42 @@ mod tests {
         let paths = vec![PathBuf::from("/a.wav"), PathBuf::from("/b.wav")];
         play_all(&fake, &paths); // must not panic
         assert_eq!(fake.calls.borrow().len(), 2, "both paths were attempted");
+    }
+
+    #[test]
+    fn this_module_never_writes_to_stdout_or_stderr() {
+        // Pins the fix for a real corruption bug: this module runs from
+        // inside `run_loop`, which is only ever entered after the strip has
+        // taken the alternate screen and raw mode (see `render::run`). A
+        // bare `println!`/`eprintln!` there paints over the sheep at
+        // whatever the cursor happens to be, and with #62's adaptive tick an
+        // idle pane may not redraw for a while, so the corruption would sit
+        // on screen instead of being wiped by the next frame. `play_all`'s
+        // doc comment explains why this module has no spare channel to print
+        // a warning to; this test makes sure nobody quietly adds one back.
+        // Built from parts rather than spelled out directly, so this list
+        // itself does not trip the scan below.
+        let bang = "!";
+        let banned = [
+            format!("println{bang}"),
+            format!("eprintln{bang}"),
+            format!("print{bang}("),
+            format!("eprint{bang}("),
+            format!("dbg{bang}("),
+        ];
+        let source = include_str!("sound.rs");
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // doc/line comments may mention these macros in prose
+            }
+            for needle in &banned {
+                assert!(
+                    !line.contains(needle.as_str()),
+                    "found `{needle}` outside a comment, in: {line:?}"
+                );
+            }
+        }
     }
 
     /// A clock the test drives by hand. Shared (via `Rc`) between claimants so
