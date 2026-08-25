@@ -41,6 +41,7 @@ fn main() -> ExitCode {
                 cfg.member_scale,
                 cfg.sounds,
                 Box::new(herdr_herd::sound::SystemSoundPlayer),
+                cfg.agent_icon,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

@@ -30,3 +30,4 @@ pub mod sound;
 pub mod sprite;
 pub mod term;
 pub mod watcher;
+pub mod width;

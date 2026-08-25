@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::agent::AgentStatus;
+use crate::agent::{AgentIconStyle, AgentStatus};
 
 /// Which rendering backend to use. `Auto` probes for kitty support and falls
 /// back to half-blocks.
@@ -95,6 +95,9 @@ pub struct Config {
     pub member_scale: usize,
     /// Notification-sound settings.
     pub sounds: SoundConfig,
+    /// How to render the detected agent kind in the hover caption. No `Auto`:
+    /// emoji rendering can't be reliably probed, so this is a plain choice.
+    pub agent_icon: AgentIconStyle,
 }
 
 impl Default for Config {
@@ -113,6 +116,10 @@ impl Default for Config {
             // for it in transmission bursts on every cold frame and resize.
             member_scale: 4,
             sounds: SoundConfig::default(),
+            // Felix's own call (#15): emoji, distinct at a glance, with the
+            // ASCII tag table kept as an explicit opt-out for a terminal or
+            // config that doesn't want wide multi-cell glyphs.
+            agent_icon: AgentIconStyle::Emoji,
         }
     }
 }
@@ -160,6 +167,13 @@ impl Config {
                         "kitty" => RendererKind::Kitty,
                         "half-block" | "half_block" | "halfblock" => RendererKind::HalfBlock,
                         _ => RendererKind::Auto, // "auto" or anything unrecognized
+                    };
+                }
+                "agent_icon" => {
+                    cfg.agent_icon = match val {
+                        "ascii" => AgentIconStyle::Ascii,
+                        "off" | "none" => AgentIconStyle::Off,
+                        _ => AgentIconStyle::Emoji, // "emoji" or anything unrecognized
                     };
                 }
                 "member_scale" => {
@@ -294,6 +308,7 @@ mod tests {
                 renderer: RendererKind::Auto,
                 member_scale: 4,
                 sounds: SoundConfig::default(),
+                agent_icon: AgentIconStyle::Emoji,
             }
         );
     }
@@ -313,6 +328,7 @@ mod tests {
                 renderer: RendererKind::Auto,
                 member_scale: 4,
                 sounds: SoundConfig::default(),
+                agent_icon: AgentIconStyle::Emoji,
             }
         );
     }
@@ -372,6 +388,29 @@ mod tests {
     fn unknown_renderer_value_falls_back_to_auto() {
         let c = Config::from_toml_str("renderer = hologram\n");
         assert_eq!(c.renderer, RendererKind::Auto);
+    }
+
+    #[test]
+    fn agent_icon_defaults_to_emoji() {
+        assert_eq!(Config::default().agent_icon, AgentIconStyle::Emoji);
+    }
+
+    #[test]
+    fn parses_agent_icon_ascii_and_off() {
+        assert_eq!(
+            Config::from_toml_str("agent_icon = ascii\n").agent_icon,
+            AgentIconStyle::Ascii
+        );
+        assert_eq!(
+            Config::from_toml_str("agent_icon = off\n").agent_icon,
+            AgentIconStyle::Off
+        );
+    }
+
+    #[test]
+    fn unknown_agent_icon_value_falls_back_to_emoji() {
+        let c = Config::from_toml_str("agent_icon = hologram\n");
+        assert_eq!(c.agent_icon, AgentIconStyle::Emoji);
     }
 
     #[test]

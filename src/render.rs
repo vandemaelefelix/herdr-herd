@@ -19,7 +19,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentIconStyle};
 use crate::anim::{Overlay, OverlayColor, Rgb};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
@@ -527,7 +527,10 @@ const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
 /// right-aligned and ochre, or nothing when `label` is `None`. When `hidden`
 /// members overflow (the `+N` marker also lives in this lane, further right) the
 /// caption stops one column short of it; either way it's truncated so it
-/// never overruns the strip width.
+/// never overruns the strip width. Measured in terminal cells, not chars —
+/// the label may carry a wide agent-kind icon (see `src/width.rs`), and a
+/// char-count budget would let a wide glyph overrun by a cell or get sliced
+/// in half.
 pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, hidden: usize) {
     let Some(label) = label else { return };
     if area.height == 0 || area.width == 0 {
@@ -545,12 +548,12 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
     // starts after it. `reserved_cols` is 0 in a shipped build, leaving the
     // shipped layout unchanged.
     let left = area.x.saturating_add(marker::reserved_cols());
-    let max_chars = right.saturating_sub(left) as usize;
-    if max_chars == 0 {
+    let max_cols = right.saturating_sub(left) as usize;
+    if max_cols == 0 {
         return;
     }
-    let text: String = label.chars().take(max_chars).collect();
-    let w = text.chars().count() as u16;
+    let text = crate::width::truncate_to_width(label, max_cols);
+    let w = crate::width::display_width(&text) as u16;
     let x = right.saturating_sub(w);
     frame.buffer_mut().set_span(
         x,
@@ -837,6 +840,7 @@ pub fn run(
     member_scale: usize,
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
+    agent_icon: AgentIconStyle,
 ) -> io::Result<()> {
     // Every terminal mutation below belongs to `guard`, so the `?`s here and a
     // panic inside the loop both hand the terminal back (issue #35).
@@ -877,6 +881,7 @@ pub fn run(
         &sound_cfg,
         sound_player.as_ref(),
         &mut CrosstermEvents,
+        agent_icon,
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
@@ -887,11 +892,26 @@ pub fn run(
 }
 
 /// The hover caption for the current cursor position: the hovered member's
-/// label when the cursor is over one (`hit`), or `None` over empty strip.
+/// label when the cursor is over one (`hit`), or `None` over empty strip,
+/// prefixed with its agent-kind icon (`agent::kind_icon`) when one applies.
 /// Clearing on empty is deliberate — the name vanishes when you're not on a
-/// sheep, rather than sticking at the last one shown.
-fn next_hover(hit: Option<usize>, members: &[Member]) -> Option<String> {
-    hit.map(|i| members[i].label.clone())
+/// sheep, rather than sticking at the last one shown. Baked in here, once,
+/// rather than in either renderer: both `draw_caption` and the kitty
+/// backend's caption path already draw an opaque label string through the
+/// same lane, so this is the one place the icon needs to be added for both
+/// to show it.
+fn next_hover(
+    hit: Option<usize>,
+    members: &[Member],
+    agent_icon: AgentIconStyle,
+) -> Option<String> {
+    hit.map(|i| {
+        let m = &members[i];
+        match crate::agent::kind_icon(m.agent_kind.as_deref(), agent_icon) {
+            Some(icon) => format!("{icon} {}", m.label),
+            None => m.label.clone(),
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -906,6 +926,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     sound_cfg: &crate::config::SoundConfig,
     sound_player: &dyn crate::sound::SoundPlayer,
     events: &mut dyn EventSource,
+    agent_icon: AgentIconStyle,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -980,7 +1001,7 @@ where
                         // caption disappears when you're not on a sheep.
                         let hit =
                             renderer.member_at_column(&herd, species, strip_w, column, now_ms);
-                        hovered = next_hover(hit, &herd.members);
+                        hovered = next_hover(hit, &herd.members, agent_icon);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
@@ -1067,17 +1088,39 @@ mod tests {
     #[test]
     fn hover_caption_follows_the_cursor_and_clears_over_empty_strip() {
         let herd = fixed_herd(&[AgentStatus::Idle, AgentStatus::Working]);
-        // Over a member: its label is shown.
+        // Over a member: its label is shown. This fixture's agents have no
+        // detected kind, so there is no icon to prepend.
         assert_eq!(
-            next_hover(Some(1), &herd.members),
+            next_hover(Some(1), &herd.members, AgentIconStyle::Emoji),
             Some(herd.members[1].label.clone())
         );
         // Over empty strip: the caption clears. Regression guard — a "sticky"
         // hover that kept the last name here is the bug this restores.
         assert_eq!(
-            next_hover(None, &herd.members),
+            next_hover(None, &herd.members, AgentIconStyle::Emoji),
             None,
             "moving off all sheep must hide the name"
+        );
+    }
+
+    #[test]
+    fn next_hover_prepends_the_agent_kind_icon_when_one_is_known() {
+        let mut h = Herd::new();
+        let mut a = agent("t0", AgentStatus::Idle);
+        a.agent = Some("claude".into());
+        h.reconcile(&[a], 1, NOW_MS);
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Emoji),
+            Some(format!("🤖 {}", h.members[0].label))
+        );
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Ascii),
+            Some(format!("Cl {}", h.members[0].label))
+        );
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Off),
+            Some(h.members[0].label.clone()),
+            "Off shows the bare label even for a known kind"
         );
     }
 
@@ -1389,6 +1432,45 @@ mod tests {
             "caption stays left of the +N marker with a gap: {row0:?}"
         );
         assert!(row0.chars().count() <= 24, "never overruns the strip width");
+    }
+
+    /// Pins the caption's *cell* width, not its char count, against a wide
+    /// (2-cell) agent-kind icon at the strip edge — regression guard against
+    /// #15's original bug class: a char-count budget lets a wide glyph either
+    /// overrun the strip or get sliced in half mid-glyph. `unicode-width`
+    /// agrees with ratatui's own internal measurement (both resolve the same
+    /// pinned crate version — see `src/width.rs`), so this also pins that a
+    /// future glyph swap can't silently break truncation.
+    #[test]
+    fn caption_with_a_wide_icon_truncates_on_a_whole_cell_boundary() {
+        let label = "🤖 claude"; // icon (2 cells) + space (1) + name (6) = 9
+        // `draw_caption`'s own budget is `width - 1 (margin) - reserved_cols`;
+        // building `width` from `max_cols` this way keeps the pinned
+        // boundaries below exact whether or not the `dev-marker` feature
+        // (which makes `reserved_cols` nonzero) is enabled.
+        let reserved = marker::reserved_cols();
+        let draw_at = |max_cols: u16| -> String {
+            let width = max_cols + 1 + reserved;
+            let area = Rect::new(0, 0, width, 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| draw_caption(f, area, 0, Some(label), 0))
+                .unwrap();
+            let (row, _) = row_text_and_fg(terminal.backend().buffer(), 0);
+            row.trim().to_string()
+        };
+        // Room for the whole caption (9 cells of content).
+        // The wide icon's own second cell reads back as a space (ratatui
+        // resets it — see `Buffer::set_stringn`), so the reconstructed
+        // per-cell string carries two spaces here though only one is a real
+        // char in the source label.
+        assert_eq!(draw_at(9), "🤖  claude");
+        // Exactly room for the icon's 2 cells and nothing else: the space and
+        // name are dropped whole, not the icon sliced down to 1 cell.
+        assert_eq!(draw_at(2), "🤖", "only the icon fits; the name drops whole");
+        // One cell too narrow even for the icon: draw nothing rather than a
+        // corrupted half-glyph.
+        assert_eq!(draw_at(1), "", "too narrow for the icon: nothing is drawn");
     }
 
     /// A dev build has to answer "which build is in this pane?" at a glance,
@@ -2072,6 +2154,7 @@ mod tests {
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
             &mut events,
+            AgentIconStyle::Emoji,
         )
         .expect("the scripted loop quits cleanly");
         renderer
