@@ -42,3 +42,4 @@ pub mod sound;
 pub mod sprite;
 pub(crate) mod term;
 pub mod watcher;
+pub(crate) mod width;

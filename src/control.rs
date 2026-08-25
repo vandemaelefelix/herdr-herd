@@ -303,6 +303,7 @@ pub struct Sweeper<'a> {
     rpc: Option<&'a dyn RpcClient>,
     cli: &'a dyn HerdrCli,
     self_exe: &'a str,
+    config_dir_override: Option<&'a str>,
     target_rows: u16,
     probe_every: u64,
     sweep: u64,
@@ -311,11 +312,15 @@ pub struct Sweeper<'a> {
 
 impl<'a> Sweeper<'a> {
     /// Wire a sweeper to its sources. `rpc` is `None` outside a herdr session,
-    /// which puts every read back on the CLI.
+    /// which puts every read back on the CLI. `config_dir_override` is the
+    /// controller's own `HERDR_HERD_CONFIG_DIR`, resolved once by the caller
+    /// and forwarded to every strip this sweeper injects, so a test session
+    /// stays isolated end to end rather than only at the controller.
     pub fn new(
         rpc: Option<&'a dyn RpcClient>,
         cli: &'a dyn HerdrCli,
         self_exe: &'a str,
+        config_dir_override: Option<&'a str>,
         target_rows: u16,
         probe_every: u64,
     ) -> Self {
@@ -323,6 +328,7 @@ impl<'a> Sweeper<'a> {
             rpc,
             cli,
             self_exe,
+            config_dir_override,
             target_rows,
             probe_every: probe_every.max(1),
             sweep: 0,
@@ -363,6 +369,7 @@ impl<'a> Sweeper<'a> {
                         &target.pane_id,
                         target.pane_rows,
                         self.self_exe,
+                        self.config_dir_override,
                         self.target_rows,
                     ),
                     None => Ok(()), // columned bottom: no full-width strip possible
@@ -538,11 +545,18 @@ pub fn binary_stamp(path: &str) -> Option<u64> {
 /// de-dup label. The ratio is relative to `pane_rows` (the target pane's own
 /// height), so the strip is ~`target_rows` tall wherever the pane sits. Uses
 /// `pane split` (NOT `layout.apply`), so the split pane's process survives.
+///
+/// `config_dir_override` carries the controller's own `HERDR_HERD_CONFIG_DIR`
+/// (if any) into the strip's exec line: a new pane's shell does not inherit it
+/// from the controller process, so without this the strip would fall back to
+/// resolving the real installed plugin's config dir instead of the isolated
+/// one the controller is using.
 pub fn inject_strip(
     cli: &dyn HerdrCli,
     target_pane: &str,
     pane_rows: u16,
     self_exe: &str,
+    config_dir_override: Option<&str>,
     target_rows: u16,
 ) -> io::Result<()> {
     let ratio_arg = format!("{:.4}", slim_ratio(pane_rows, target_rows));
@@ -560,10 +574,17 @@ pub fn inject_strip(
     // `exec` so the renderer *replaces* the pane's shell: when it exits the
     // pane exits with it, rather than lingering as a labelled corpse that every
     // later sweep counts as a working strip. `pane run` executes via a shell,
-    // so `self_exe` is single-quoted rather than pasted in raw: an unescaped
-    // `'` in the path (e.g. `/Users/o'brien/...`) would break the quoting and
-    // the renderer would silently never start.
-    let render_cmd = format!("exec {} render", shell_single_quote(self_exe));
+    // so both `self_exe` and `config_dir` are single-quoted rather than pasted
+    // in raw: an unescaped `'` in either path (e.g. `/Users/o'brien/...`)
+    // would break the quoting and the renderer would silently never start.
+    let render_cmd = match config_dir_override {
+        Some(dir) => format!(
+            "HERDR_HERD_CONFIG_DIR={} exec {} render",
+            shell_single_quote(dir),
+            shell_single_quote(self_exe)
+        ),
+        None => format!("exec {} render", shell_single_quote(self_exe)),
+    };
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     // An unlabelled strip is invisible to every later sweep, which would then
     // inject a second one into the same tab. Rather than leave that orphan
@@ -611,6 +632,7 @@ pub fn control(
     rpc: Option<&dyn RpcClient>,
     cli: &dyn HerdrCli,
     self_exe: &str,
+    config_dir_override: Option<&str>,
     lock_path: &Path,
     interval: Duration,
     target_rows: u16,
@@ -626,6 +648,7 @@ pub fn control(
         rpc,
         cli,
         self_exe,
+        config_dir_override,
         target_rows,
         probe_every_sweeps(interval),
     );
@@ -701,7 +724,7 @@ mod tests {
     /// A sweeper with no socket (so every read goes through the CLI double) and
     /// `probe_every = 1`, i.e. probing every strip every sweep.
     fn sweeper(cli: &dyn HerdrCli) -> Sweeper<'_> {
-        Sweeper::new(None, cli, "/abs/herdr-herd", 7, 1)
+        Sweeper::new(None, cli, "/abs/herdr-herd", None, 7, 1)
     }
 
     const SNAPSHOT: &str = include_str!(concat!(
@@ -836,7 +859,7 @@ mod tests {
     fn inject_strip_splits_runs_and_labels_in_order() {
         let cli = FakeCli::new();
         // pane_rows = 64 (the target pane's own height) -> slim_ratio(64, 7).
-        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7).unwrap();
+        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7).unwrap();
         let calls = cli.calls.borrow();
         // No self-fetch of layout: the sweep already resolved the target + rows.
         // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
@@ -863,13 +886,41 @@ mod tests {
         assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
     }
 
+    /// A test session's isolated config dir must reach the strip's exec line
+    /// too, not just the controller: a new pane's shell does not inherit the
+    /// controller process's env, so without this the strip would resolve the
+    /// real installed plugin's config instead.
+    #[test]
+    fn inject_strip_forwards_the_config_dir_override_into_the_exec_line() {
+        let cli = FakeCli::new();
+        inject_strip(
+            &cli,
+            "w1:p1",
+            64,
+            "/abs/herdr-herd",
+            Some("/abs/.herd-test/config"),
+            7,
+        )
+        .unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                "HERDR_HERD_CONFIG_DIR='/abs/.herd-test/config' exec '/abs/herdr-herd' render"
+            ]
+        );
+    }
+
     /// `pane run` executes via a shell. An unescaped `'` in `self_exe` (e.g.
     /// a home directory like `/Users/o'brien`) would break the quoting and
     /// the renderer would silently never start.
     #[test]
     fn inject_strip_escapes_a_single_quote_in_self_exe() {
         let cli = FakeCli::new();
-        inject_strip(&cli, "w1:p1", 64, "/Users/o'brien/herdr-herd", 7).unwrap();
+        inject_strip(&cli, "w1:p1", 64, "/Users/o'brien/herdr-herd", None, 7).unwrap();
         let calls = cli.calls.borrow();
         assert_eq!(
             calls[1],
@@ -878,6 +929,32 @@ mod tests {
                 "run",
                 "w1:pNEW",
                 r"exec '/Users/o'\''brien/herdr-herd' render"
+            ]
+        );
+    }
+
+    /// The config dir goes through the same escaping as `self_exe` — an
+    /// unescaped `'` there would break the quoting just as badly.
+    #[test]
+    fn inject_strip_escapes_a_single_quote_in_the_config_dir_override() {
+        let cli = FakeCli::new();
+        inject_strip(
+            &cli,
+            "w1:p1",
+            64,
+            "/abs/herdr-herd",
+            Some("/tmp/o'brien/.herd-test/config"),
+            7,
+        )
+        .unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                r"HERDR_HERD_CONFIG_DIR='/tmp/o'\''brien/.herd-test/config' exec '/abs/herdr-herd' render"
             ]
         );
     }
@@ -976,7 +1053,7 @@ mod tests {
     fn a_live_strip_is_probed_once_per_interval_not_once_per_sweep() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         for _ in 0..5 {
             sw.sweep_once().unwrap();
         }
@@ -988,7 +1065,7 @@ mod tests {
 
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut every = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 1);
+        let mut every = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 1);
         for _ in 0..5 {
             every.sweep_once().unwrap();
         }
@@ -1005,7 +1082,7 @@ mod tests {
     fn a_strip_that_dies_between_probes_is_caught_on_its_next_probe() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 3);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 3);
         sw.sweep_once().unwrap(); // sweep 1: probed, alive, confirmed
         rpc.kill("w1:pSTRIP"); // the renderer exits
         sw.sweep_once().unwrap(); // sweep 2: not due
@@ -1030,7 +1107,7 @@ mod tests {
         let cli = one_tab_cli();
         let mut rpc = FakeRpc::new(SNAPSHOT);
         rpc.unanswerable.insert("w1:pSTRIP".to_string());
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
         sw.sweep_once().unwrap();
         assert_eq!(calls_matching(&cli, "pane close"), 0, "the strip is live");
@@ -1066,7 +1143,7 @@ mod tests {
         let cli = NoProcessInfo(one_tab_cli());
         let mut rpc = FakeRpc::new(SNAPSHOT);
         rpc.unanswerable.insert("w1:pSTRIP".to_string());
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
         sw.sweep_once().unwrap();
         assert_eq!(
@@ -1087,7 +1164,7 @@ mod tests {
     fn the_socket_path_reads_the_whole_session_without_a_single_spawn() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
 
         assert_eq!(rpc.calls_of("session.snapshot"), 1);
@@ -1124,7 +1201,7 @@ mod tests {
             tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":1}]}}"#.into(),
             panes: r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}"#.into(),
         };
-        Sweeper::new(Some(&DeadRpc), &cli, "/abs/herdr-herd", 7, 10)
+        Sweeper::new(Some(&DeadRpc), &cli, "/abs/herdr-herd", None, 7, 10)
             .sweep_once()
             .unwrap();
         assert_eq!(calls_matching(&cli, "tab list"), 1);
@@ -1279,7 +1356,7 @@ mod tests {
         let cli = RenameFails {
             calls: RefCell::new(Vec::new()),
         };
-        let err = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
+        let err = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7);
         assert!(err.is_err(), "an unlabellable strip is a failed injection");
         let calls = cli.calls.borrow();
         assert!(
@@ -1518,7 +1595,7 @@ mod tests {
     #[test]
     fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
         let cli = FailableCli::new("", "", "w1:p1");
-        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
+        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7);
         assert!(result.is_err(), "a failed split must surface as an error");
         let calls = cli.calls.borrow();
         assert!(
