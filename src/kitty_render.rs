@@ -1,9 +1,10 @@
 //! Kitty graphics protocol backend for [`MemberRenderer`]: transmits each
 //! distinct sprite frame once and caches the image id, places/re-places it at
-//! the member's cell every frame, and deletes placements for members that departed
-//! or fell out of the visible set. Escapes are written to an injected
-//! `io::Write` sink (real stdout in production, a `Vec<u8>`-backed sink in
-//! tests) so the encoding is unit-testable without a real terminal.
+//! the member's cell whenever its on-screen appearance actually changes, and
+//! deletes placements for members that departed or fell out of the visible
+//! set. Escapes are written to an injected `io::Write` sink (real stdout in
+//! production, a `Vec<u8>`-backed sink in tests) so the encoding is
+//! unit-testable without a real terminal.
 //!
 //! This renderer does NOT own the terminal. Every strip pane is a separate
 //! process forwarding escapes to one outer terminal, so image ids, deletes and
@@ -12,6 +13,16 @@
 //! ids come from this pane's own block of the id space (see [`crate::kitty_ids`]),
 //! deletes always name an id this pane owns (never `d=A`), and images this pane
 //! stopped placing are freed rather than left resident forever.
+//!
+//! A placement's on-screen position is implicit — kitty places at the
+//! current cursor, since we never pass explicit `X=`/`Y=` position keys — so
+//! the cursor-move and the place command for one member are always written
+//! as a single `write_all` (see [`PlacementSig`] and its uses). This is the
+//! best this pane can do on its own to keep the pair from being split by
+//! another pane's own escapes landing in between when both are forwarded
+//! through the same outer terminal; it narrows the window rather than
+//! closing it, since herdr's forwarding can still interleave complete
+//! escape sequences from concurrent panes (issue #64).
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -72,7 +83,15 @@ const Z_ICON_BASE: i32 = 1000;
 /// padded by `pad` units on every side — panning a same-size "camera" over a
 /// larger, static image to fake motion without retransmitting it. Clamped so
 /// a same-size larger offset pins to the padding edge instead of overflowing.
+///
+/// `dx`/`dy` are quantised to whole sprite/icon pixels before the pan is
+/// computed, the same rounding the half-block path already does in
+/// `render::band_ox`/`band_oy`. Rounding after multiplying by `scale` instead
+/// (the old behaviour) let a sub-pixel wobble — e.g. breathing's <1 sprite-px
+/// amplitude — change the crop on nearly every frame, which is visually
+/// nothing but still forces a new placement every time (issue #45).
 fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> Crop {
+    let (dx, dy) = (dx.round(), dy.round());
     let scale_f = scale as f32;
     let max_x = (2 * pad * scale) as i32;
     let max_y = (2 * pad * scale) as i32;
@@ -94,6 +113,9 @@ fn crop_rect(pad: usize, scale: usize, w: usize, h: usize, dx: f32, dy: f32) -> 
 /// then placed into the same cell footprint so the sheep just renders smaller.
 /// `body_pad` must be `>= top_headroom` (the rest offset above the sprite) and
 /// `>=` the max hop (the downward pan room) — `MOTION_PAD + HAT_H` satisfies both.
+///
+/// `dx`/`dy` are quantised to whole sprite pixels first, for the same reason
+/// [`crop_rect`] does — see its doc comment.
 fn member_crop(
     body_pad: usize,
     top_headroom: usize,
@@ -103,6 +125,7 @@ fn member_crop(
     dx: f32,
     dy: f32,
 ) -> Crop {
+    let (dx, dy) = (dx.round(), dy.round());
     let s = scale as f32;
     let win_h = sprite_h + top_headroom;
     // Horizontal pan: identical to `crop_rect` — centered on the sprite, swayed
@@ -265,32 +288,53 @@ fn evict_from<K: Eq + std::hash::Hash + Clone>(
     freed
 }
 
+/// Everything about a placement's on-screen appearance that isn't the image
+/// id itself: the source crop and the cell footprint/stacking it is placed
+/// at. Stored alongside the placement so a later frame can tell whether the
+/// placement it would emit is byte-identical to the one already on screen —
+/// if so, nothing is re-sent (issue #45). `row`/`col` are the cursor position
+/// the placement was made at (kitty places at the current cursor, since we
+/// never pass explicit `X=`/`Y=` keys), so a member that only moved sideways
+/// still counts as changed even with an unchanged crop.
+type PlacementSig = (Crop, u16, u16, i32, i32, i32);
+
+/// A live placement: which image it names, which placement id it was made
+/// under, and the signature it was made with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placed {
+    image_id: u32,
+    placement_id: u32,
+    sig: PlacementSig,
+}
+
 /// Draws the herd via the kitty graphics protocol instead of ratatui cells.
 /// Images are transmitted once per distinct `ImgKey` and cached; each visible
-/// member gets a placement that is re-created every frame (draw-then-delete-old,
-/// to avoid a flicker where the member briefly vanishes).
+/// member gets a placement that is re-created whenever its [`PlacementSig`]
+/// changes (draw-then-delete-old, to avoid a flicker where the member briefly
+/// vanishes) and left untouched otherwise — re-placing an unchanged frame
+/// would just be re-drawing the same pixels in the same spot (issue #45).
 pub struct KittyRenderer {
     scale: usize,
     out: Box<dyn Write + Send>,
     cache: HashMap<ImgKey, Cached>,
-    /// `terminal_id -> (image_id, placement_id)` of that member's current
-    /// placement. The image id is tracked alongside the placement id (not
-    /// just the placement id, per the plan's original shape) because a
-    /// redraw can move the member onto a *different* cached image — a new
-    /// status, frame, or facing direction — and deleting the previous
-    /// on-screen placement requires the image id it was placed under, which
-    /// a `HashMap<String, u32>` of placement ids alone cannot recover.
-    placements: HashMap<String, (u32, u32)>,
+    /// `terminal_id -> Placed` of that member's current placement. The image
+    /// id is tracked alongside the placement id (not just the placement id,
+    /// per the plan's original shape) because a redraw can move the member
+    /// onto a *different* cached image — a new status, frame, or facing
+    /// direction — and deleting the previous on-screen placement requires
+    /// the image id it was placed under, which a `HashMap<String, u32>` of
+    /// placement ids alone cannot recover.
+    placements: HashMap<String, Placed>,
     /// Transmitted overlay icon images, cached by (icon kind, is-dark-theme,
     /// resolved overlay color) since an icon's pixels don't depend on
     /// species/hue/facing, but `done` and `blocked` share `IconKind::Alert`
     /// (both use `!`) and must render as distinct images (accent vs. red).
     icon_cache: HashMap<(IconKind, bool, OverlayColor), Cached>,
-    /// `terminal_id -> (image_id, placement_id)` of that member's current icon
-    /// placement, if its state has an overlay. Tracked separately from
+    /// `terminal_id -> Placed` of that member's current icon placement, if
+    /// its state has an overlay. Tracked separately from
     /// `placements` because a member can lose its overlay (e.g. idle -> working)
     /// while staying visible, which must delete the icon but keep the member.
-    icon_placements: HashMap<String, (u32, u32)>,
+    icon_placements: HashMap<String, Placed>,
     /// This pane's own block of the terminal-global image-id space. Counting
     /// from 1 in every process would have panes overwrite each other's images
     /// (issue #29).
@@ -307,6 +351,11 @@ pub struct KittyRenderer {
     /// transmit — otherwise `place` would reference images that no longer
     /// exist and the strip would go permanently blank after a resize.
     last_area: Option<Rect>,
+    /// The `(row, width, hover_label, hidden)` the name row was last drawn
+    /// with, so an unchanged caption/counter skips re-emitting the clear +
+    /// redraw escapes entirely (issue #45). `None` before the first draw, so
+    /// the first frame always writes.
+    last_overlay_text: Option<(u16, usize, Option<String>, usize)>,
 }
 
 impl KittyRenderer {
@@ -334,6 +383,7 @@ impl KittyRenderer {
             placement_ids: PlacementIds::new(),
             frame: 0,
             last_area: None,
+            last_overlay_text: None,
         }
     }
 
@@ -502,10 +552,7 @@ impl KittyRenderer {
             let row = member_row(pane_h, rows);
             let col = ((animated.x_fraction * max_x).round() as i32 + 1)
                 .clamp(1, area.width.max(1) as i32);
-            self.out
-                .write_all(format!("\x1b[{row};{col}H").as_bytes())?;
 
-            let pid = self.placement_ids.alloc();
             // Pan the crop window by this state's motion offset (breathe/hop/
             // bounce/sway) — the same offset the half-block path bakes
             // straight into its pixel buffer — so the body (and its baked-in
@@ -521,17 +568,39 @@ impl KittyRenderer {
             );
             // z = draw-order index: later-drawn (higher priority) stacks on top,
             // so kitty's visual stacking matches the hit-test's last-wins order.
-            self.out
-                .write_all(place_cropped(image_id, pid, crop, cols, rows, zi as i32).as_bytes())?;
-
-            if let Some((old_img, old_pid)) = self
+            let z = zi as i32;
+            let sig: PlacementSig = (crop, cols, rows, z, row, col);
+            let unchanged = self
                 .placements
-                .insert(member.terminal_id.clone(), (image_id, pid))
-            {
-                // Draw-then-delete: the new placement is already on screen
-                // before the old one disappears, so there is no blank frame.
-                self.out
-                    .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+                .get(&member.terminal_id)
+                .is_some_and(|p| p.image_id == image_id && p.sig == sig);
+            if !unchanged {
+                // Cursor-move and place are written together: kitty places at
+                // the current cursor (no explicit position keys), so keeping
+                // them in one write narrows the window for another pane's own
+                // cursor-move to land in between and steal this placement's
+                // position (issue #64).
+                let pid = self.placement_ids.alloc();
+                self.out.write_all(
+                    format!(
+                        "\x1b[{row};{col}H{}",
+                        place_cropped(image_id, pid, crop, cols, rows, z)
+                    )
+                    .as_bytes(),
+                )?;
+                if let Some(old) = self.placements.insert(
+                    member.terminal_id.clone(),
+                    Placed {
+                        image_id,
+                        placement_id: pid,
+                        sig,
+                    },
+                ) {
+                    // Draw-then-delete: the new placement is already on screen
+                    // before the old one disappears, so there is no blank frame.
+                    self.out
+                        .write_all(delete_placement(old.image_id, old.placement_id).as_bytes())?;
+                }
             }
 
             // Overlay icon: a small pixel-art Zz/!/? floating just above the
@@ -606,36 +675,52 @@ impl KittyRenderer {
                     let icon_col_max = (area.width as i32 - icon_cols as i32 + 1).max(1);
                     let icon_col =
                         (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
-                    self.out
-                        .write_all(format!("\x1b[{icon_row};{icon_col}H").as_bytes())?;
-                    let icon_pid = self.placement_ids.alloc();
-                    self.out.write_all(
-                        place_cropped(
-                            icon_image_id,
-                            icon_pid,
-                            icon_crop,
-                            icon_cols,
-                            icon_rows,
-                            Z_ICON_BASE + zi as i32,
-                        )
-                        .as_bytes(),
-                    )?;
-                    if let Some((old_img, old_pid)) = self
+                    let icon_z = Z_ICON_BASE + zi as i32;
+                    let icon_sig: PlacementSig =
+                        (icon_crop, icon_cols, icon_rows, icon_z, icon_row, icon_col);
+                    let icon_unchanged = self
                         .icon_placements
-                        .insert(member.terminal_id.clone(), (icon_image_id, icon_pid))
-                    {
-                        self.out
-                            .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+                        .get(&member.terminal_id)
+                        .is_some_and(|p| p.image_id == icon_image_id && p.sig == icon_sig);
+                    if !icon_unchanged {
+                        // Cursor-move and place written together — see the
+                        // matching comment on the member's own placement above.
+                        let icon_pid = self.placement_ids.alloc();
+                        self.out.write_all(
+                            format!(
+                                "\x1b[{icon_row};{icon_col}H{}",
+                                place_cropped(
+                                    icon_image_id,
+                                    icon_pid,
+                                    icon_crop,
+                                    icon_cols,
+                                    icon_rows,
+                                    icon_z
+                                )
+                            )
+                            .as_bytes(),
+                        )?;
+                        if let Some(old) = self.icon_placements.insert(
+                            member.terminal_id.clone(),
+                            Placed {
+                                image_id: icon_image_id,
+                                placement_id: icon_pid,
+                                sig: icon_sig,
+                            },
+                        ) {
+                            self.out.write_all(
+                                delete_placement(old.image_id, old.placement_id).as_bytes(),
+                            )?;
+                        }
                     }
                 }
                 None => {
-                    if let Some((old_img, old_pid)) =
-                        self.icon_placements.remove(&member.terminal_id)
-                    {
+                    if let Some(old) = self.icon_placements.remove(&member.terminal_id) {
                         // This status has no overlay (e.g. working) — drop any
                         // icon left over from a previous status (e.g. idle).
-                        self.out
-                            .write_all(delete_placement(old_img, old_pid).as_bytes())?;
+                        self.out.write_all(
+                            delete_placement(old.image_id, old.placement_id).as_bytes(),
+                        )?;
                     }
                 }
             }
@@ -655,8 +740,9 @@ impl KittyRenderer {
             .cloned()
             .collect();
         for tid in departed {
-            if let Some((img, pid)) = self.placements.remove(&tid) {
-                self.out.write_all(delete_placement(img, pid).as_bytes())?;
+            if let Some(old) = self.placements.remove(&tid) {
+                self.out
+                    .write_all(delete_placement(old.image_id, old.placement_id).as_bytes())?;
             }
         }
         let departed_icons: Vec<String> = self
@@ -666,8 +752,9 @@ impl KittyRenderer {
             .cloned()
             .collect();
         for tid in departed_icons {
-            if let Some((img, pid)) = self.icon_placements.remove(&tid) {
-                self.out.write_all(delete_placement(img, pid).as_bytes())?;
+            if let Some(old) = self.icon_placements.remove(&tid) {
+                self.out
+                    .write_all(delete_placement(old.image_id, old.placement_id).as_bytes())?;
             }
         }
 
@@ -682,12 +769,14 @@ impl KittyRenderer {
     /// Draw the hover caption and the `+{hidden}` overflow counter as direct
     /// terminal escapes on the dedicated name row — bypassing ratatui, whose
     /// text the per-frame kitty re-placement clobbers and then never redraws
-    /// (see [`KittyRenderer::draw`]). The row carries no member image, so it's
-    /// cleared and rewritten every frame with no stale trail. Row/column are
-    /// 1-indexed within this pane's own terminal. The lane's layout mirrors the
-    /// half-block path's (`render::draw_herd` / `render::draw_caption`): marker
-    /// at the left, then the caption, then `+N` hard right — so the two
-    /// backends read the same way.
+    /// (see [`KittyRenderer::draw`]). The row is only cleared and rewritten
+    /// when its content actually changes (`row`/`width`/`hover_label`/
+    /// `hidden` fully determine what gets emitted) — otherwise this dirtied a
+    /// row on every frame even with no caption and no marker (issue #45).
+    /// Row/column are 1-indexed within this pane's own terminal. The lane's
+    /// layout mirrors the half-block path's (`render::draw_herd` /
+    /// `render::draw_caption`): marker at the left, then the caption, then
+    /// `+N` hard right — so the two backends read the same way.
     fn draw_overlay_text(
         &mut self,
         area: Rect,
@@ -699,6 +788,11 @@ impl KittyRenderer {
         }
         let row = overlay_lane_row(area.height);
         let width = area.width as usize;
+        let sig = (row, width, hover_label.map(str::to_owned), hidden);
+        if self.last_overlay_text.as_ref() == Some(&sig) {
+            return Ok(());
+        }
+        self.last_overlay_text = Some(sig);
         let mut s = String::new();
         s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
         // The dev build marker takes the left of the lane; a shipped build has
@@ -1053,14 +1147,30 @@ mod tests {
         let first = sink.take();
         assert!(first.contains("a=t"), "first draw transmits the image");
         assert!(first.contains("a=p"), "and places it");
+
+        // An identical frame (same herd, same now_ms) would place byte-for-byte
+        // the same placement already on screen, so nothing is re-sent (#45).
         r.draw_to_sink(&herd, &species, Theme::Dark, 0);
         let second = sink.take();
-        assert!(
-            !second.contains("a=t"),
-            "same frame reuses the cached image (no re-transmit)"
+        assert_eq!(
+            second, "",
+            "an unchanged frame emits nothing: the on-screen placement is still correct"
         );
-        assert!(second.contains("a=p"), "still re-places");
-        assert!(second.contains("a=d"), "and deletes the previous placement");
+
+        // Once the motion offset actually pans the crop by a whole sprite
+        // pixel, the member re-places.
+        let mut moved = None;
+        for ms in (10..2000u64).step_by(10) {
+            r.draw_to_sink(&herd, &species, Theme::Dark, ms);
+            let out = sink.take();
+            if !out.is_empty() {
+                moved = Some(out);
+                break;
+            }
+        }
+        let out = moved.expect("motion must eventually move the crop by a whole sprite pixel");
+        assert!(out.contains("a=p"), "re-places at the new position");
+        assert!(out.contains("a=d"), "and deletes the previous placement");
     }
 
     /// `rasterize` recolors the outline from the theme (`role_color` ->
@@ -1792,12 +1902,13 @@ MMMM
         ));
 
         // Isolate the MEMBER's placement command (z=0; the icon badge places at
-        // z=1000+ and would otherwise pollute the comparison).
-        let member_placement = |out: &str| -> String {
+        // z=1000+ and would otherwise pollute the comparison). A frame whose
+        // placement is unchanged from the one on screen emits nothing at all
+        // (#45), so `None` here means "still at the last known position".
+        let member_placement = |out: &str| -> Option<String> {
             out.split("\x1b_G")
                 .find(|chunk| chunk.contains("a=p") && chunk.contains(",z=0,"))
-                .expect("the member's own placement command")
-                .to_string()
+                .map(str::to_string)
         };
         let y_field = |chunk: &str| -> String {
             chunk
@@ -1808,14 +1919,14 @@ MMMM
         };
 
         let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
-        let y0 = y_field(&member_placement(&sink.take()));
+        let y0 = y_field(&member_placement(&sink.take()).expect("the first frame always places"));
 
         // Some particular pair of instants could coincidentally round to the
         // same pixel; scan a spread of them so the test isn't tied to one
         // sample landing on a flat spot in the bounce curve.
         let panned = (10..500u64).step_by(10).any(|ms| {
             let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
-            y_field(&member_placement(&sink.take())) != y0
+            member_placement(&sink.take()).is_some_and(|chunk| y_field(&chunk) != y0)
         });
         assert!(
             panned,
@@ -1977,11 +2088,12 @@ MMMM
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = one_focused_working_herd();
-        let member_placement = |out: &str| -> String {
+        // A frame whose placement is unchanged from the one on screen emits
+        // nothing at all (#45), so `None` means "still at the last position".
+        let member_placement = |out: &str| -> Option<String> {
             out.split("\x1b_G")
                 .find(|chunk| chunk.contains("a=p") && chunk.contains(",z=0,"))
-                .expect("the member's own placement command")
-                .to_string()
+                .map(str::to_string)
         };
         let y_field = |chunk: &str| -> String {
             chunk
@@ -1991,10 +2103,10 @@ MMMM
                 .to_string()
         };
         let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
-        let y0 = y_field(&member_placement(&sink.take()));
+        let y0 = y_field(&member_placement(&sink.take()).expect("the first frame always places"));
         let panned = (10..500u64).step_by(10).any(|ms| {
             let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
-            y_field(&member_placement(&sink.take())) != y0
+            member_placement(&sink.take()).is_some_and(|chunk| y_field(&chunk) != y0)
         });
         assert!(
             panned,
@@ -2209,13 +2321,18 @@ MMMM
 
         frame(&mut r, &two_anchored_members("t1")); // t1 hatted
         let herd = two_anchored_members("t2");
-        frame(&mut r, &herd); // handoff: t2 hatted, t1 unhatted
-        let steady = frame(&mut r, &herd); // steady: everything cached
+        let handoff = frame(&mut r, &herd); // handoff: t2 hatted, t1 unhatted
+        let steady = frame(&mut r, &herd); // steady: everything cached and unchanged
 
         assert!(
             !steady.contains("a=t"),
             "a steady frame transmits nothing, which is exactly why a transmit \
              count cannot pin the hat: {steady:?}"
+        );
+        assert_eq!(
+            steady, "",
+            "an unchanged frame re-places nothing at all — the on-screen \
+             placements are still correct (#45)"
         );
         assert_eq!(
             hat_ids.len(),
@@ -2225,11 +2342,11 @@ MMMM
         );
 
         let columns = placement_columns(&herd, &species, area.width, 0);
-        let placements = member_placements(&steady);
+        let placements = member_placements(&handoff);
         assert_eq!(
             placements.len(),
             2,
-            "both members are re-placed every frame: {placements:?}"
+            "the handoff frame re-places both members: {placements:?}"
         );
         let hat_columns: Vec<i32> = placements
             .iter()
@@ -2498,8 +2615,19 @@ MMMM
             );
         }
 
-        let _ = b.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
-        let out_b = sink_b.take();
+        // Same herd, same instant as B's first frame would be byte-identical
+        // to what's already on screen and place nothing at all (#45) — advance
+        // time so the idle breathe motion actually moves the crop, which is
+        // what exercises "B keeps drawing from its own cache" here.
+        let out_b = (10..2000u64)
+            .step_by(10)
+            .map(|ms| {
+                let _ =
+                    b.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
+                sink_b.take()
+            })
+            .find(|out| !out.is_empty())
+            .expect("idle breathe motion must eventually move the crop");
         assert!(
             !out_b.contains("a=t"),
             "pane B must not have to re-transmit because pane A resized"
@@ -2741,5 +2869,77 @@ MMMM
             !freed.contains(&live.id),
             "an image placed this frame is never evicted"
         );
+    }
+
+    #[test]
+    fn idle_breathing_settles_into_silence_between_whole_pixel_steps() {
+        // Issue #45: rounding the crop *after* multiplying by scale let
+        // breathing's <1 sprite-pixel wobble change the emitted placement on
+        // nearly every frame — visually nothing, but still a full
+        // delete+place pair. Quantising the offset to whole sprite pixels
+        // first (matching `render::band_ox`/`band_oy`) means most frames in
+        // a short window are byte-identical to the one already on screen and
+        // emit nothing at all.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 7); // shipped member_scale
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_idle_herd();
+
+        let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, 0);
+        let _ = sink.take(); // the first frame always draws; not the churn under test
+
+        let samples: u64 = 200;
+        let changed = (10..=samples * 10)
+            .step_by(10)
+            .filter(|&ms| {
+                let _ =
+                    r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
+                !sink.take().is_empty()
+            })
+            .count();
+        assert!(
+            (changed as u64) < samples / 2,
+            "an idle member should settle between whole-pixel motion steps, \
+             not re-place on most frames ({changed}/{samples} changed)"
+        );
+    }
+
+    #[test]
+    fn every_icon_placement_has_a_body_placement_underneath_it_across_many_frames() {
+        // Issue #64's working hypothesis was that the body and icon caches
+        // and placement maps, tracked independently, could drift apart —
+        // leaving an icon placement referencing a member whose body
+        // placement had gone stale or missing. That never happens in this
+        // code: a visible member's body and icon placements are only ever
+        // inserted/removed together (once per visible member in the loop
+        // below, and together again in the departed-cleanup loop), no
+        // matter whether either one's *escape* was actually re-emitted this
+        // frame — #45 lets either be skipped independently when its own
+        // signature is unchanged, but the two maps still agree by
+        // construction. This drives many frames (varying status, time, and
+        // focus) and checks that invariant holds throughout.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+
+        for ms in (0..5000u64).step_by(17) {
+            let mut herd = Herd::new();
+            let mut a = Member::new("t1".into(), identity_for("t1", 1), AgentStatus::Idle);
+            a.focused = ms % 731 < 300; // focus flips partway through, on and off
+            herd.members.push(a);
+            herd.members.push(Member::new(
+                "t2".into(),
+                identity_for("t2", 2),
+                AgentStatus::Working,
+            ));
+            let _ = r.render_members(&herd, &species, Rect::new(0, 0, 200, 10), Theme::Dark, ms);
+            for tid in r.icon_placements.keys() {
+                assert!(
+                    r.placements.contains_key(tid),
+                    "member {tid} has an icon placement but no body placement at ms={ms}"
+                );
+            }
+        }
+        let _ = sink.take();
     }
 }
