@@ -368,19 +368,52 @@ mod tests {
         }
     }
 
+    /// The first event of a session (nothing sent yet) refreshes right away,
+    /// same as `watch()`'s initial snapshot. Everything that lands inside the
+    /// window it opens is held and coalesced into one trailing refetch once
+    /// the window closes, rather than each being dropped on the floor.
     #[test]
     fn debounce_coalesces_a_burst_into_one_refetch() {
         let mut feed = cli_feed();
-        // 5 events arriving within the debounce window => 1 snapshot.
+        // event 0 primes the schedule (nothing sent yet, so it fires at
+        // once); events 1-4 land inside the 250ms window it opens and must
+        // not each refetch; event 5, past the window, is what finally
+        // flushes them as a single coalesced refetch.
+        let times = [0u64, 10, 50, 100, 200, 300];
+        let mut i = 0;
         let snaps = drain_events(
             &mut feed,
-            &mut FakeSocket::emitting(5),
+            &mut FakeSocket::emitting(times.len()),
             timings(250),
-            |_| 0, /* all same tick */
+            move |_| {
+                let t = times[i];
+                i += 1;
+                t
+            },
         );
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].len(), 1);
-        assert_eq!(snaps[0][0].agent_status, AgentStatus::Idle);
+        assert_eq!(
+            snaps.len(),
+            2,
+            "one immediate refetch for the priming event, one trailing \
+             refetch for the whole burst behind it"
+        );
+        assert_eq!(snaps[1].len(), 1);
+        assert_eq!(snaps[1][0].agent_status, AgentStatus::Idle);
+    }
+
+    /// The core of #38: a burst of events inside one window must not each
+    /// trigger a refetch, and must not be dropped either. Only the window
+    /// closing makes a refetch due, and by then it reflects the burst's
+    /// settled state, not whichever event happened to arrive first.
+    #[test]
+    fn a_burst_of_events_inside_the_window_stays_undue_until_it_closes() {
+        let mut d = Debouncer::new(timings(250));
+        d.sent(0);
+        for t in [1u64, 5, 40, 120, 200] {
+            d.on_event(EventClass::Structural, t);
+            assert!(!d.due(t), "event at {t}ms must not refetch mid-burst");
+        }
+        assert!(d.due(250), "the window closes once the burst has settled");
     }
 
     #[test]
