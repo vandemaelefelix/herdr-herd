@@ -13,6 +13,7 @@ pub mod herdr;
 pub mod icon;
 pub mod identity;
 pub mod kitty;
+pub mod kitty_ids;
 pub mod kitty_render;
 pub mod lock;
 pub mod marker;

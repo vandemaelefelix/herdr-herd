@@ -90,7 +90,8 @@ pub struct Config {
     pub reduced_motion: bool,
     /// Which renderer backend to use.
     pub renderer: RendererKind,
-    /// Member sprite scale factor (clamped to 1..=24).
+    /// Member sprite scale factor (clamped to 1..=24). See the default for why
+    /// it sits near 1 transmitted pixel per screen pixel.
     pub member_scale: usize,
     /// Notification-sound settings.
     pub sounds: SoundConfig,
@@ -104,7 +105,13 @@ impl Default for Config {
             sweep_interval_ms: 3000,
             reduced_motion: false,
             renderer: RendererKind::Auto,
-            member_scale: 7,
+            // The kitty backend displays a member in ~7x4 cells, i.e. roughly
+            // 56x68 screen px, from a 16x19 sprite-pixel crop window. Scale 4
+            // transmits ~64x76 px for that: about 1:1, with a little headroom.
+            // The old default of 7 transmitted 112x133 px, 2-3x oversampled for
+            // a nearest-neighbour upscale the terminal does anyway, and paid
+            // for it in transmission bursts on every cold frame and resize.
+            member_scale: 4,
             sounds: SoundConfig::default(),
         }
     }
@@ -285,7 +292,7 @@ mod tests {
                 sweep_interval_ms: 3000,
                 reduced_motion: false,
                 renderer: RendererKind::Auto,
-                member_scale: 7,
+                member_scale: 4,
                 sounds: SoundConfig::default(),
             }
         );
@@ -304,7 +311,7 @@ mod tests {
                 sweep_interval_ms: 1500,
                 reduced_motion: true,
                 renderer: RendererKind::Auto,
-                member_scale: 7,
+                member_scale: 4,
                 sounds: SoundConfig::default(),
             }
         );
@@ -355,10 +362,10 @@ mod tests {
     }
 
     #[test]
-    fn renderer_defaults_to_auto_and_scale_to_seven() {
+    fn renderer_defaults_to_auto_and_scale_to_four() {
         let c = Config::default();
         assert_eq!(c.renderer, RendererKind::Auto);
-        assert_eq!(c.member_scale, 7);
+        assert_eq!(c.member_scale, 4);
     }
 
     #[test]
