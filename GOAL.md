@@ -65,6 +65,45 @@ single-pane tab. Pre-existing **multi-pane** tabs are left to the **on-demand
 keeps "always everywhere" true for the natural forward workflow while never
 killing work. See `docs/decisions.md` and the Phase 3 design spec.
 
+## The focus hat: one global "you are here" marker
+
+Exactly one sheep in the strip wears a small red hat. It answers one question:
+*which agent am I working with right now?* The decided semantics, locked
+2026-08-19:
+
+- **Session-wide scope.** Every strip lists every agent in the herdr session,
+  across all workspaces and tabs (`herdr agent list` is fetched unfiltered).
+  This is deliberate, not a bug. The strip is a fast way to see and reach *any*
+  agent in the fleet, so it shows the whole fleet.
+- **One hat, globally.** Because the herd is session-wide, the hat is a global
+  marker: exactly one hatted sheep exists across the whole session, whichever
+  tab or workspace you happen to be looking at. Every strip agrees on which
+  sheep it is. `Herd::reconcile` enforces this rather than trusting herdr's
+  per-agent flag, so a future herdr that reported focus per workspace or per tab
+  could never hat the whole herd.
+- **Focus is pane-level, not tab-level.** herdr reports exactly one focused pane
+  for the whole session (verified live on herdr 0.8.0: 1 focused of 45 panes, 1
+  focused of 17 agents). Four agents sharing one tab therefore produce one hat,
+  on the selected pane's agent.
+- **Sticky on non-agent panes.** When the focused pane is not an agent pane (the
+  strip itself, a shell, an editor), herdr reports zero focused agents. The hat
+  then stays on the agent that most recently held focus instead of vanishing
+  from every sheep. Clicking the strip must not make the marker blink out. The
+  memory is dropped when that agent leaves the herd, so a hat never lingers on a
+  dead sheep, and a genuine focus change replaces it immediately.
+
+Two consequences are accepted:
+
+1. A strip in tab A will hat an agent living in workspace B, and the agent
+   running in the pane directly above a strip often has no hat.
+2. Stickiness is per render process. Each strip is its own process and remembers
+   only the focus changes it has observed, so a strip that starts *after* the
+   last focus change has nothing to remember and shows no hat until the next
+   focus event, while older strips show one. herdr's snapshot carries no
+   "focused last" field to recover it from, so this cannot be fixed inside the
+   plugin. Session-wide scope means every strip otherwise sees identical data,
+   so this is the only way two strips can disagree.
+
 ## Design principles
 
 - **Glanceable over detailed.** The win is instant emotional read of the whole
@@ -103,6 +142,8 @@ killing work. See `docs/decisions.md` and the Phase 3 design spec.
 | Labels | None by default; name on hover, jump on click |
 | Rendering | Half-block Unicode + 24-bit color (Kitty sprites = future opt-in) |
 | Interactivity | Click sheep → focus its agent's pane |
+| Herd scope | Session-wide: every strip shows every agent in the session |
+| Focus hat | Exactly one globally, on the focused *pane*'s agent; sticky on non-agent panes |
 | Config | on/off + auto-inject, scope, height + motion, palette + per-state behavior |
 | Language | Rust |
 

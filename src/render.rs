@@ -9,13 +9,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
-};
+use crossterm::terminal::size;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -197,6 +193,12 @@ pub(crate) fn stamp_hat(
     }
 }
 
+/// The two half-block glyphs the blit paints with, hoisted to `&'static str`
+/// so the hot loop below writes a borrowed symbol into the cell instead of
+/// allocating a `String` per painted cell (#43).
+const UPPER_HALF: &str = "▀";
+const LOWER_HALF: &str = "▄";
+
 /// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
 /// each cell packs two pixel rows into one terminal row via `▀` (fg = top
 /// pixel, bg = bottom pixel) or `▄` when only the bottom pixel is set.
@@ -217,11 +219,21 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
             }
             let (ch, style) = match (top, bot) {
                 (None, None) => continue,
-                (Some(t), Some(b)) => ('▀', Style::default().fg(to_color(t)).bg(to_color(b))),
-                (Some(t), None) => ('▀', Style::default().fg(to_color(t))),
-                (None, Some(b)) => ('▄', Style::default().fg(to_color(b))),
+                (Some(t), Some(b)) => {
+                    (UPPER_HALF, Style::default().fg(to_color(t)).bg(to_color(b)))
+                }
+                (Some(t), None) => (UPPER_HALF, Style::default().fg(to_color(t))),
+                (None, Some(b)) => (LOWER_HALF, Style::default().fg(to_color(b))),
             };
-            frame.buffer_mut().set_string(cx, cy, ch.to_string(), style);
+            // Write the cell directly instead of `set_string`, which allocates
+            // (`ch.to_string()`) and re-runs grapheme segmentation for a single
+            // known 1-column glyph. `set_symbol` + `set_style` is exactly what
+            // `set_string` does per grapheme, so the output is byte-identical
+            // — the existing snapshots must not move. `cell_mut` yields `None`
+            // outside the buffer, which the bounds check above already excludes.
+            if let Some(cell) = frame.buffer_mut().cell_mut((cx, cy)) {
+                cell.set_symbol(ch).set_style(style);
+            }
         }
     }
 }
@@ -826,7 +838,11 @@ pub fn run(
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
 ) -> io::Result<()> {
-    enable_raw_mode()?;
+    // Every terminal mutation below belongs to `guard`, so the `?`s here and a
+    // panic inside the loop both hand the terminal back (issue #35).
+    crate::term::install_panic_hook();
+    let mut guard = crate::term::TerminalGuard::new();
+    guard.enter_raw()?;
 
     // Probe for kitty support BEFORE entering the alternate screen and enabling
     // mouse capture: the query/DA round-trip then happens on the main screen
@@ -835,8 +851,7 @@ pub fn run(
     let mut caps = crate::caps::RealCaps::new();
     let mut renderer = select_renderer(renderer_kind, &mut caps, member_scale);
 
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    guard.enter_screen()?;
     // A FIXED viewport, not the default fullscreen one. `Terminal::draw`
     // autoresizes a fullscreen viewport, and `crossterm::terminal::size` is a
     // `File::open("/dev/tty")` + ioctl + close every time (~20 us in a real
@@ -846,7 +861,7 @@ pub fn run(
     // size query left, at startup.
     let (cols, rows) = size()?;
     let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(stdout),
+        CrosstermBackend::new(io::stdout()),
         TerminalOptions {
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
@@ -865,14 +880,10 @@ pub fn run(
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    result
+    // The loop's own failure is the interesting one; a restore failure is only
+    // reported when the loop succeeded. Restoring used to `?` ahead of this and
+    // discard `result` entirely.
+    result.and(guard.restore())
 }
 
 /// The hover caption for the current cursor position: the hovered member's
@@ -911,6 +922,9 @@ where
     // frame: `terminal.size()` opens /dev/tty on every call, which cost more
     // than rendering the sheep did.
     let mut area = terminal.get_frame().area();
+    // One claim store for the whole session: every pane sees every transition,
+    // so the sound is claimed once per transition, not once per pane.
+    let sound_claim = crate::sound::session_claim();
     loop {
         // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
@@ -927,8 +941,7 @@ where
             transitions.extend(herd.reconcile(&agents, species_count, now_ms));
         }
         if !transitions.is_empty() {
-            let sounds = crate::sound::sounds_to_play(&transitions, sound_cfg);
-            crate::sound::play_all(sound_player, &sounds);
+            crate::sound::play_claimed(sound_player, sound_claim.as_ref(), &transitions, sound_cfg);
         }
         // Mouse hit-testing has to agree with what is on screen, so the width
         // it uses is the width the last frame actually drew at.
@@ -1065,6 +1078,49 @@ mod tests {
             next_hover(None, &herd.members),
             None,
             "moving off all sheep must hide the name"
+        );
+    }
+
+    #[test]
+    fn draw_pixels_writes_the_half_block_symbol_and_style_into_each_cell() {
+        // The blit writes cells directly (`set_symbol` + `set_style`) rather
+        // than through `set_string`, which allocated a `String` per painted
+        // cell (#43). That is exactly what `set_string` does per grapheme, so
+        // the output must stay byte-identical — pinned here per cell, where the
+        // strip snapshots only cover it in aggregate.
+        use crate::anim::Rgb;
+        let mut buf = PixelBuf::new(4, 2);
+        buf.set(0, 0, Rgb(1, 2, 3)); // top pixel only
+        buf.set(1, 0, Rgb(1, 2, 3)); // top and bottom
+        buf.set(1, 1, Rgb(4, 5, 6));
+        buf.set(2, 1, Rgb(4, 5, 6)); // bottom pixel only
+        // column 3 stays fully transparent
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        terminal
+            .draw(|f| draw_pixels(f, Rect::new(0, 0, 4, 1), &buf))
+            .unwrap();
+        let rendered = terminal.backend().buffer().clone();
+        let cell = |x: u16| rendered.cell((x, 0)).expect("a cell inside the buffer");
+        assert_eq!(cell(0).symbol(), "▀");
+        assert_eq!(cell(0).fg, Color::Rgb(1, 2, 3));
+        assert_eq!(
+            cell(0).bg,
+            Color::Reset,
+            "no bottom pixel leaves the background untouched"
+        );
+        assert_eq!(cell(1).symbol(), "▀");
+        assert_eq!(cell(1).fg, Color::Rgb(1, 2, 3));
+        assert_eq!(
+            cell(1).bg,
+            Color::Rgb(4, 5, 6),
+            "the bottom pixel is the bg"
+        );
+        assert_eq!(cell(2).symbol(), "▄");
+        assert_eq!(cell(2).fg, Color::Rgb(4, 5, 6));
+        assert_eq!(
+            cell(3).symbol(),
+            " ",
+            "a fully transparent column is skipped, not painted"
         );
     }
 

@@ -445,3 +445,61 @@ process-info, the sweep closing a dead strip, and the control case that a live
 strip is never closed. Verified live in the `herd-test` session: killing a
 renderer removed its pane entirely (`w1:pD` gone, not a shell) and the sweep
 injected `w1:pG` to replace it. Gate green: 257 tests, clippy clean, fmt clean.
+
+## 2026-08-19 — The kitty renderer does not own the terminal
+
+**Context:** Issues #29, #28, #30 and #46, all from the 0.2.1 code review. They
+are one root cause wearing four hats: `KittyRenderer` was written as though it
+were the terminal's only client. Every strip pane is its own process, but they
+all forward their escapes to ONE outer terminal, so image ids, deletes and
+image memory are a single shared, terminal-global namespace.
+
+**Decisions:**
+
+- **Partition the id space by process, do not negotiate it.** kitty's `I=`
+  image-number mechanism exists precisely for uncoordinated clients, but it
+  requires reading the terminal's reply back — which the strip cannot rely on:
+  herdr forwards our escapes, we suppress replies with `q=2`, and the render
+  loop has no reader for them. So each pane claims one of 65535 blocks of
+  65536 ids, mixed from its pid and startup instant (`src/kitty_ids.rs`).
+  Collision is possible but is a ~1-in-65535 coin flip per pair of live panes,
+  against a 100% collision rate before.
+- **Placement ids get their own counter.** They were allocated per member per
+  frame off the same counter as image ids, so ~60 ids/second. Any block-based
+  scheme would have been exhausted in minutes. Placement ids are scoped to
+  their image id in the protocol, and image ids are now disjoint per pane, so a
+  plain wrapping counter is sufficient.
+- **`a=d,d=A` is deleted from the crate, not just avoided.** `kitty::delete_all`
+  is gone and replaced by `delete_image(id)` (`a=d,d=I`). Keeping the builder
+  around as an unused footgun invited exactly the regression #28 describes.
+- **Eviction counts frames, not milliseconds.** The obvious TTL clock is the
+  `now_ms` already threaded through `render_members`, but reduced-motion mode
+  pins it to 0 for the life of the process, which would silently disable
+  eviction for anyone using that setting. The render loop ticks at a fixed
+  ~12 fps, so a frame counter is an equivalent clock that cannot be frozen.
+- **The resize purge stays.** With `d=A` gone, the original reason for purging
+  on resize (another pane having wiped our images) is weaker, and images are
+  placed with an explicit `c=`/`r=` cell footprint, so a resize does not
+  actually need new pixels. Removing it would save the retransmission burst
+  #46 measures, but it is a behaviour change outside these four issues and the
+  existing test pins it. Left as a follow-up.
+- **`member_scale` defaults to 4.** A member is displayed in ~7x4 cells from a
+  16x19 sprite-pixel crop window; scale 4 transmits about one pixel per screen
+  pixel. Scale 7 was 2-3x that, for a nearest-neighbour upscale the terminal
+  does anyway.
+
+**Trade-offs, deliberately accepted:**
+- **Block collision is unlikely, not impossible.** Two panes whose pids and
+  start instants happen to mix into the same block still share ids. A
+  negotiated scheme would need a reply channel we do not have.
+- **An abnormally killed pane leaks its images.** Nothing frees them until the
+  terminal is reset. That was already true, and `d=A` was never a safe way to
+  clean it up.
+
+**Verification:** Unit tests, each confirmed red against the old behaviour by
+re-introducing it (a shared id block; a `d=A` purge; eviction disabled). Two
+`KittyRenderer` instances are driven against separate sinks so the cross-pane
+properties are actually observable. Gate green: 273 tests, clippy clean, fmt
+clean. NOT verified live in a multi-pane session with a real terminal — the
+id-disjointness and the `d=I` frees are proven at the escape-sequence level
+only.
