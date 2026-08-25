@@ -81,11 +81,20 @@ fn main() -> ExitCode {
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "herdr-herd".to_string());
+            // Resolved once here, not re-read deep in the sweep: the strips
+            // this controller spawns get their own fresh shell, which does
+            // not inherit this process's env, so without forwarding it every
+            // strip would fall back to the real installed plugin's config.
+            let config_dir_override = herdr_herd::config::config_dir_override(
+                std::env::var("HERDR_HERD_CONFIG_DIR").ok(),
+            )
+            .and_then(|p| p.to_str().map(String::from));
             let lock_path = herdr_herd::control::controller_lock_path();
             match herdr_herd::control::control(
                 rpc.as_ref().map(|c| c as &dyn RpcClient),
                 &cli,
                 &self_exe,
+                config_dir_override.as_deref(),
                 &lock_path,
                 std::time::Duration::from_millis(cfg.sweep_interval_ms.max(250)),
                 cfg.strip_rows,
