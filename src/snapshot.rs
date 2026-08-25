@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(
             s.agents.len(),
             3,
-            "the fourth agent is unreadable and skipped"
+            "the fourth agent is missing terminal_id and unreadable, not merely null-cwd"
         );
         assert_eq!(s.agents[0].pane_id, "w1:p1");
         assert_eq!(s.agents[0].agent_status, AgentStatus::Working);
@@ -214,16 +214,37 @@ mod tests {
     }
 
     /// herdr types `cwd`/`foreground_cwd` as nullable. Reading them as `null`
-    /// must skip that one agent, not the whole snapshot.
+    /// must parse to `None`, not make the agent unreadable.
+    #[test]
+    fn null_cwd_and_foreground_cwd_are_tolerated_not_dropped() {
+        let json = r#"{"result":{"snapshot":{"agents":[
+            {"agent_status":"idle","cwd":null,"focused":false,"foreground_cwd":null,
+             "pane_id":"null-cwd","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"}]}}}"#;
+        let s = parse_session_snapshot(json).expect("envelope is readable");
+        assert_eq!(
+            s.agents.len(),
+            1,
+            "a null cwd must not be treated as unreadable"
+        );
+        assert_eq!(s.agents[0].cwd, None);
+        assert_eq!(s.agents[0].foreground_cwd, None);
+    }
+
+    /// An entry missing a genuinely required field (no `#[serde(default)]`)
+    /// must skip just that agent, not the whole snapshot.
     #[test]
     fn an_agent_in_a_shape_we_cannot_read_is_skipped_not_fatal() {
         let json = r#"{"result":{"snapshot":{"agents":[
-            {"agent_status":"idle","cwd":null,"focused":false,"foreground_cwd":null,
-             "pane_id":"bad","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"},
+            {"agent_status":"idle","cwd":"/","focused":false,"foreground_cwd":"/",
+             "pane_id":"bad","revision":0,"tab_id":"t","workspace_id":"w"},
             {"agent_status":"idle","cwd":"/","focused":false,"foreground_cwd":"/",
              "pane_id":"good","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"}]}}}"#;
         let s = parse_session_snapshot(json).expect("envelope is readable");
-        assert_eq!(s.agents.len(), 1, "the unreadable agent is dropped");
+        assert_eq!(
+            s.agents.len(),
+            1,
+            "the entry missing terminal_id is dropped"
+        );
         assert_eq!(s.agents[0].pane_id, "good");
     }
 
