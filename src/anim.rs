@@ -49,11 +49,6 @@ pub fn parse_motion(s: &str) -> Result<MotionSpec, String> {
     Ok(MotionSpec { motions })
 }
 
-/// True if `spec` includes `Motion::Wander` (the herd owns its horizontal roam).
-pub fn has_wander(spec: &MotionSpec) -> bool {
-    spec.motions.contains(&Motion::Wander)
-}
-
 /// A pixel offset applied to a sprite before blitting. Negative `dy` = up.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Offset {
@@ -250,7 +245,7 @@ mod tests {
     #[test]
     fn wander_is_detected_and_adds_no_local_offset() {
         let spec = parse_motion("wander").unwrap();
-        assert!(has_wander(&spec));
+        assert!(spec.motions.contains(&Motion::Wander));
         let o = motion_offset(&spec, 0.5);
         assert_eq!((o.dx, o.dy), (0.0, 0.0));
     }

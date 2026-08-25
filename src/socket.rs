@@ -9,12 +9,10 @@
 //!   the connection after answering, so each question gets its own.
 //!
 //! Asking over the socket is how the plugin avoids fork/exec'ing the `herdr`
-//! CLI: see `RpcClient`. The older read-to-EOF `request` helper (from Phase 0
-//! Spike A) is retained for simple calls such as `layout.export` /
-//! `layout.apply`. (Spike A verified the wire uses newline-delimited JSON-RPC
-//! with dotted method names, see the design doc §5.)
+//! CLI: see `RpcClient`. (Spike A verified the wire uses newline-delimited
+//! JSON-RPC with dotted method names, see the design doc §5.)
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -23,21 +21,9 @@ pub fn socket_path() -> Option<PathBuf> {
     std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from)
 }
 
-/// Connect, send `payload` followed by a newline, and read the reply to EOF.
-pub fn request(path: &Path, payload: &str) -> std::io::Result<String> {
-    let mut stream = UnixStream::connect(path)?;
-    stream.write_all(payload.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    Ok(reply)
-}
-
 /// Connect, send `payload` + a newline, and read exactly one reply line (with
-/// the trailing newline stripped). Unlike [`request`], this does **not** wait
-/// for the server to close: the herdr control socket is persistent, so a
-/// request/reply is framed by the newline, not by EOF.
+/// the trailing newline stripped). The herdr control socket is persistent, so
+/// a request/reply is framed by the newline, not by EOF.
 pub fn request_line(path: &Path, payload: &str) -> std::io::Result<String> {
     let stream = UnixStream::connect(path)?;
     let mut writer = stream.try_clone()?;
@@ -220,7 +206,7 @@ pub fn subscribe_request() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
@@ -421,38 +407,6 @@ mod tests {
             client.call(&snapshot_request()).is_err(),
             "a dead socket must surface as an error so the caller can fall back"
         );
-    }
-
-    #[test]
-    fn request_writes_payload_and_reads_reply() {
-        let dir = TempSocketPath::new("sock");
-        let listener = UnixListener::bind(&*dir).unwrap();
-
-        let server = std::thread::spawn({
-            let dir = dir.0.clone();
-            move || {
-                let (mut conn, _) = listener.accept().unwrap();
-                let mut got = String::new();
-                let mut buf = [0u8; 64];
-                // read the one line the client sends
-                loop {
-                    let n = conn.read(&mut buf).unwrap();
-                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if got.contains('\n') {
-                        break;
-                    }
-                }
-                conn.write_all(b"PONG").unwrap();
-                drop(conn); // EOF for the client
-                let _ = std::fs::remove_file(&dir);
-                got
-            }
-        });
-
-        let reply = request(&dir, "PING").unwrap();
-        assert_eq!(reply, "PONG");
-        let got = join_with_timeout(server, JOIN_TIMEOUT);
-        assert_eq!(got, "PING\n");
     }
 
     #[test]
