@@ -252,19 +252,17 @@ pub fn watch(
         }
         schedule.sent(now);
 
-        if let Some(sock) = socket.as_mut()
-            && let Err(e) = sock.send_line(&subscribe_request())
-        {
-            // Only ever printed once: this runs before the loop, not per tick.
-            // A failed subscribe still degrades safely (the slow poll below
-            // carries the herd either way), but silently doing so left no way
-            // to tell "polling only" apart from "everything is fine" (issue
-            // #55).
-            eprintln!(
-                "herdr-herd: could not subscribe to socket events ({e}); \
-                 falling back to polling every {}ms",
-                timings.slow_ms
-            );
+        if let Some(sock) = socket.as_mut() {
+            // A failed subscribe still degrades safely: the slow poll below
+            // carries the herd either way. An `eprintln!` was tried here
+            // (issue #55), but this thread belongs to the render process,
+            // which has the alternate screen and raw mode active — stderr
+            // lands on the strip's own tty and corrupts it rather than
+            // explaining anything. A real diagnostic belongs drawn into the
+            // strip itself; no such surface exists yet (tracked separately
+            // alongside #55/#60, see also PR #81's `sound.rs` reversion for
+            // the same trap).
+            let _ = sock.send_line(&subscribe_request());
         }
         loop {
             if let Some(sock) = socket.as_mut() {

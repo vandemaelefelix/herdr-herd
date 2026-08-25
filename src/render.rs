@@ -941,11 +941,6 @@ where
     // One claim store for the whole session: every pane sees every transition,
     // so the sound is claimed once per transition, not once per pane.
     let sound_claim = crate::sound::session_claim();
-    // Latches the one diagnostic a failed click-to-focus ever gets, rather than
-    // one per click (issue #55): the strip must keep running either way, but a
-    // silently-swallowed error the first time is enough to explain every time
-    // after.
-    let mut focus_warned = false;
     loop {
         // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
@@ -984,16 +979,23 @@ where
             // A failed draw (issue #55) is treated as unrecoverable: the kitty
             // backend's `cache`/`placements` may already claim images the
             // terminal never received, so retrying next frame would only place
-            // against ids that no longer mean anything. Exiting non-zero — once,
-            // with a diagnostic — is what turns the controller's existing
-            // process-liveness probe truthful again (issue #60): the pane falls
-            // back to its shell instead of a wedged renderer masquerading as a
-            // healthy one, so the next sweep replaces it.
+            // against ids that no longer mean anything. Exiting non-zero is what
+            // turns the controller's existing process-liveness probe truthful
+            // again (issue #60): the pane falls back to its shell instead of a
+            // wedged renderer masquerading as a healthy one, so the next sweep
+            // replaces it.
+            //
+            // No `eprintln!` here deliberately: this runs with the alternate
+            // screen and raw mode still active, so writing to stderr would
+            // paint over the strip (and stair-step, with raw mode's bare `\n`)
+            // rather than explain anything. `run`'s caller prints this error
+            // (wrapped with context below) only *after* `guard.restore()` has
+            // handed the terminal back, where it actually lands somewhere
+            // readable.
             if let Err(e) = draw_result {
-                eprintln!(
-                    "herdr-herd: rendering failed ({e}); exiting so the strip can be replaced"
-                );
-                return Err(e);
+                return Err(io::Error::other(format!(
+                    "rendering failed ({e}); exiting so the strip can be replaced"
+                )));
             }
             last_sig = Some(sig);
         }
@@ -1023,20 +1025,16 @@ where
                             renderer.member_at_column(&herd, species, area, column, now_ms)
                         {
                             let tid = herd.members[i].terminal_id.clone();
-                            // The strip must keep running even if focusing
-                            // fails, but a silently-swallowed error left a click
-                            // doing nothing with no explanation (issue #55) —
-                            // latch one diagnostic instead of failing silently
-                            // forever.
-                            if let Err(e) = focus_agent(focus, &tid)
-                                && !focus_warned
-                            {
-                                focus_warned = true;
-                                eprintln!(
-                                    "herdr-herd: focusing {tid} failed ({e}); \
-                                     clicking a sheep may not do anything"
-                                );
-                            }
+                            // Swallow focus errors: the strip must keep running.
+                            // A latched `eprintln!` was tried here (issue #55),
+                            // but this runs with the alternate screen and raw
+                            // mode active — writing to stderr paints over the
+                            // strip instead of explaining anything. A real
+                            // diagnostic belongs drawn into the strip itself; no
+                            // such surface exists yet (tracked separately
+                            // alongside #55/#60, see also PR #81's `sound.rs`
+                            // reversion for the same trap).
+                            let _ = focus_agent(focus, &tid);
                         }
                     }
                     _ => {}
