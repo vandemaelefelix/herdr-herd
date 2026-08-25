@@ -99,7 +99,19 @@ pub struct HerdFeed {
     rpc: Option<Box<dyn RpcClient + Send>>,
     cli: Box<dyn HerdrCli + Send>,
     labels: Option<CachedLabels>,
+    /// Refreshes in a row that have come back empty-handed (neither path
+    /// answered). Resets to 0 the moment either path succeeds.
+    consecutive_failures: u32,
+    /// Whether this stall has already printed its one diagnostic, so a strip
+    /// stuck on `herdr` being unreachable prints once instead of every refresh.
+    warned_stalled: bool,
 }
+
+/// Consecutive empty-handed refreshes before [`HerdFeed::herd`] latches a
+/// one-time warning. Below this a blip is unremarkable (a transient socket
+/// hiccup, herdr mid-restart); at or above it a blank strip needs an answer
+/// rather than silence forever (issue #55).
+const HERD_STALL_WARN_THRESHOLD: u32 = 3;
 
 /// The label maps the CLI fallback reuses between refreshes, with the reading of
 /// the clock they were fetched at.
@@ -117,6 +129,8 @@ impl HerdFeed {
             rpc,
             cli,
             labels: None,
+            consecutive_failures: 0,
+            warned_stalled: false,
         }
     }
 
@@ -126,8 +140,27 @@ impl HerdFeed {
     ///
     /// `now_ms` is a reading of the watcher's clock, used only to age the CLI
     /// fallback's label cache.
+    ///
+    /// A run of [`HERD_STALL_WARN_THRESHOLD`] empty-handed refreshes latches a
+    /// one-time diagnostic: with no message at all, a missing `herdr` binary
+    /// (or a socket and CLI both down) renders as an empty strip forever with
+    /// nothing to explain it (issue #55).
     pub fn herd(&mut self, now_ms: u64) -> Option<Vec<Agent>> {
-        self.via_socket().or_else(|| self.via_cli(now_ms))
+        let result = self.via_socket().or_else(|| self.via_cli(now_ms));
+        if result.is_some() {
+            self.consecutive_failures = 0;
+            self.warned_stalled = false;
+            return result;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= HERD_STALL_WARN_THRESHOLD && !self.warned_stalled {
+            self.warned_stalled = true;
+            eprintln!(
+                "herdr-herd: could not refresh the herd for {HERD_STALL_WARN_THRESHOLD} \
+                 tries in a row; the strip may be showing a stale or empty herd"
+            );
+        }
+        result
     }
 
     /// Drop the cached label maps, so the next CLI-path refresh refetches them.
@@ -456,6 +489,66 @@ mod tests {
         feed.invalidate_labels();
         feed.herd(1);
         assert_eq!(cli.spawns_of("workspace list"), 2);
+    }
+
+    /// Issue #55: with both paths down, a missing `herdr` used to render an
+    /// empty strip forever with no message at all. The latched warning is not
+    /// asserted on directly (nothing here captures stderr, matching how the
+    /// rest of this crate's `eprintln!` diagnostics are tested), but the
+    /// underlying streak-counting must never itself break `herd()`'s contract:
+    /// every failed refresh still degrades to `None`, and does so consistently
+    /// whether it is the first failure or the fifth.
+    #[test]
+    fn repeated_refresh_failures_keep_degrading_to_none() {
+        let (mut feed, _cli) = feed_with(
+            None,
+            RecordingCli {
+                fail: Some("agent list"),
+                ..Default::default()
+            },
+        );
+        for t in 0..5 {
+            assert!(feed.herd(t).is_none(), "both paths are down at tick {t}");
+        }
+    }
+
+    /// A CLI whose `agent list` fails `remaining` times, then succeeds — for
+    /// exercising a stall that recovers.
+    struct FlakyThenOk {
+        remaining: std::sync::Mutex<usize>,
+    }
+    impl HerdrCli for FlakyThenOk {
+        fn run_json(&self, args: &[&str]) -> io::Result<String> {
+            if args == ["agent", "list"] {
+                let mut remaining = self.remaining.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(io::Error::other("boom"));
+                }
+                return Ok(r#"{"result":{"agents":[]}}"#.into());
+            }
+            Ok(r#"{"result":{}}"#.into())
+        }
+    }
+
+    /// A stall that clears must not keep the streak (or a latched warning)
+    /// primed for next time — a later, separate stall deserves its own
+    /// diagnostic rather than being silently pre-warned-out.
+    #[test]
+    fn a_recovered_refresh_resets_the_failure_streak() {
+        let mut feed = HerdFeed::new(
+            None,
+            Box::new(FlakyThenOk {
+                remaining: std::sync::Mutex::new(2),
+            }),
+        );
+        assert!(feed.herd(0).is_none(), "first failure");
+        assert!(feed.herd(1).is_none(), "second failure");
+        assert!(feed.herd(2).is_some(), "recovers on the third try");
+        assert_eq!(
+            feed.consecutive_failures, 0,
+            "a successful refresh clears the streak"
+        );
     }
 
     /// A transient label-list failure must not be cached, or one bad spawn

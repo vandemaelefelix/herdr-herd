@@ -747,8 +747,10 @@ impl KittyRenderer {
 impl MemberRenderer for KittyRenderer {
     /// Kitty images are drawn out of band (direct terminal escapes), not into
     /// the ratatui buffer — `frame` is only consulted for its width. A failed
-    /// write degrades to a skipped frame rather than crashing the strip (the
-    /// render loop already tolerates this for the half-block path).
+    /// write is propagated rather than swallowed (issue #55): by the time
+    /// `self.out` refuses a write, `cache`/`placements` may already claim
+    /// images the terminal never received, so the caller — not this backend —
+    /// decides whether it is safe to keep going.
     fn draw(
         &mut self,
         frame: &mut Frame,
@@ -757,9 +759,9 @@ impl MemberRenderer for KittyRenderer {
         theme: Theme,
         now_ms: u64,
         hover_label: Option<&str>,
-    ) {
+    ) -> io::Result<()> {
         let area = frame.area();
-        let _ = self.render_members(herd, species, area, theme, now_ms);
+        self.render_members(herd, species, area, theme, now_ms)?;
         // The same visible-set split `render_members` made, so the counter
         // reports exactly the members it decided not to draw.
         let capacity = member_capacity(area.width as usize, species);
@@ -771,7 +773,7 @@ impl MemberRenderer for KittyRenderer {
         // drawn through the frame flashed on for one frame and then vanished
         // (the long-standing name-disappears bug). Writing straight to the sink
         // every frame keeps it stable, on its own dedicated top row.
-        let _ = self.draw_overlay_text(area, hover_label, hidden);
+        self.draw_overlay_text(area, hover_label, hidden)
     }
 
     /// The kitty strip's frame signature. Unlike the half-block band, which
@@ -880,17 +882,18 @@ impl MemberRenderer for KittyRenderer {
     /// pixels to cells. We iterate in the SAME z-order `render_members` draws
     /// (priority-sorted, stable) and let the LAST covering member win — the one
     /// drawn on top — so hover selects the sprite that is visually in front when
-    /// members overlap, instead of one hidden behind it. `now_ms` must match the
-    /// value passed to `draw` this frame, so the hit region lines up with what
-    /// was actually placed.
+    /// members overlap, instead of one hidden behind it. `now_ms` and `area` must
+    /// match the values passed to `draw` this frame, so the hit region lines up
+    /// with what was actually placed.
     fn member_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
-        strip_w: usize,
+        area: Rect,
         col: u16,
         now_ms: u64,
     ) -> Option<usize> {
+        let strip_w = area.width as usize;
         let base_w = species.first().map(|s| s.size().0).unwrap_or(12);
         let max_x = (strip_w as f32 - base_w as f32).max(0.0);
         let capacity = member_capacity(strip_w, species);
@@ -901,10 +904,12 @@ impl MemberRenderer for KittyRenderer {
         order.sort_by_key(|&i| priority(herd.members[i].status));
 
         let x = col as i32;
-        // The member footprint depends on the pane height (rows -> cols); use the
-        // last drawn area so the hit range matches what was placed this frame.
-        let pane_h = self.last_area.map(|a| a.height).unwrap_or(8);
-        let rows = member_rows(pane_h);
+        // The member footprint depends on the pane height (rows -> cols); `area`
+        // is the caller's own record of what was last drawn (not an internal
+        // fallback — see issue #55, where `self.last_area` defaulted to an
+        // arbitrary height when `draw` had not run yet), so the hit range
+        // always matches what was placed this frame.
+        let rows = member_rows(area.height);
         let mut best: Option<usize> = None;
         for &i in &order {
             let member = &herd.members[i];
@@ -952,8 +957,15 @@ impl MemberRenderer for KittyRenderer {
     /// Release the images and placements *this pane* transmitted (clean exit),
     /// one `d=I` per owned id. A quitting pane must leave every other pane's
     /// images alone (issue #28).
+    ///
+    /// Also drops `last_area`, so a stray `draw` after teardown (there should
+    /// be none, but nothing enforces it) sees a geometry mismatch and
+    /// retransmits from scratch instead of placing against the images just
+    /// freed (issue #55).
     fn teardown(&mut self) -> io::Result<()> {
-        self.free_all_images()
+        self.free_all_images()?;
+        self.last_area = None;
+        Ok(())
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1154,6 +1166,65 @@ mod tests {
     }
 
     #[test]
+    fn teardown_clears_last_area_so_a_stray_draw_after_it_retransmits() {
+        // Issue #55: teardown froze `cache`/`placements` (via `free_all_images`)
+        // but left `last_area` pointing at the geometry those now-deleted images
+        // were placed at. A `draw` reaching this renderer after teardown would
+        // then see `last_area == area`, skip the resize-purge branch, and place
+        // against ids the terminal no longer has.
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let area = Rect::new(0, 0, 200, 10);
+        let _ = r.render_members(&herd, &species, area, Theme::Dark, 0);
+        sink.take();
+        r.teardown().unwrap();
+        sink.take(); // the teardown's own deletes
+        let _ = r.render_members(&herd, &species, area, Theme::Dark, 0);
+        let out = sink.take();
+        assert!(
+            out.contains("a=t"),
+            "a draw at the same geometry after teardown must retransmit, not \
+             place against freed images: {out:?}"
+        );
+    }
+
+    /// A write sink that always errors, standing in for a broken stdout pipe.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("stdout closed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn draw_propagates_a_write_failure_instead_of_swallowing_it() {
+        // Issue #55: `draw` used to `let _ =` both of its fallible steps, so a
+        // broken pipe vanished with no diagnostic and no way for the caller
+        // (`run_loop`) to notice and stop.
+        let mut r = KittyRenderer::with_image_ids(4, Box::new(FailingSink), ImageIds::for_block(0));
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut draw_result = Ok(());
+        terminal
+            .draw(|f| {
+                draw_result =
+                    MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None);
+            })
+            .unwrap();
+        assert!(
+            draw_result.is_err(),
+            "a stdout write failure must reach the caller, not vanish"
+        );
+    }
+
+    #[test]
     fn member_size_stays_small_and_keeps_aspect() {
         // Rows are capped small even in a very tall pane, and never below 2.
         // Only 1 row is reserved off the top — the caption and the icon/hat
@@ -1244,6 +1315,7 @@ mod tests {
         terminal
             .draw(|f| {
                 MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
+                    .unwrap();
             })
             .unwrap();
         let out = sink.take();
@@ -1270,7 +1342,9 @@ mod tests {
         let pane_h = 10u16;
         let mut terminal = Terminal::new(TestBackend::new(80, pane_h)).unwrap();
         terminal
-            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None).unwrap()
+            })
             .unwrap();
         let out = sink.take();
         let marker = crate::marker::build_marker().unwrap();
@@ -1293,7 +1367,9 @@ mod tests {
         let herd = one_working_herd();
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
-            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None).unwrap()
+            })
             .unwrap();
         let out = sink.take();
         assert!(
@@ -1353,7 +1429,9 @@ mod tests {
         let herd = herd_of(6);
         let mut terminal = Terminal::new(TestBackend::new(w, pane_h)).unwrap();
         terminal
-            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None).unwrap()
+            })
             .unwrap();
         let out = sink.take();
         let (col, text) = lane_run(&out, "\x1b[90m");
@@ -1378,7 +1456,9 @@ mod tests {
         let herd = one_working_herd();
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
-            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None).unwrap()
+            })
             .unwrap();
         assert!(
             !sink.take().contains("\x1b[90m"),
@@ -1401,6 +1481,7 @@ mod tests {
         terminal
             .draw(|f| {
                 MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, Some("agent-x"))
+                    .unwrap();
             })
             .unwrap();
         let out = sink.take();
@@ -1425,7 +1506,9 @@ mod tests {
         let herd = one_working_herd();
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
-            .draw(|f| MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None))
+            .draw(|f| {
+                MemberRenderer::draw(&mut r, f, &herd, &species, Theme::Dark, 0, None).unwrap()
+            })
             .unwrap();
         let out = sink.take();
         // The ochre caption color (217;164;65) is only emitted for a real label.
@@ -1552,7 +1635,8 @@ MMMM
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
         let (col, cols) = placed_footprint(&sink.take());
-        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        let area = Rect::new(0, 0, 200, 10); // matches draw_to_sink's own fixed area
+        let at = |c: i32| r.member_at_column(&herd, &species, area, c as u16, 0);
         // The placement's cursor column is 1-based; hit-test columns are 0-based.
         let left = col - 1;
         let right = left + cols as i32;
@@ -1581,7 +1665,8 @@ MMMM
         let mut r = KittyRenderer::for_test(sink.clone(), 4);
         r.draw_to_sink(&herd, &species, Theme::Dark, 0); // populates last_area for member_rows
         let (col, cols) = placed_footprint(&sink.take());
-        let at = |c: i32| r.member_at_column(&herd, &species, 200, c as u16, 0);
+        let area = Rect::new(0, 0, 200, 10); // matches draw_to_sink's own fixed area
+        let at = |c: i32| r.member_at_column(&herd, &species, area, c as u16, 0);
         let hits: Vec<i32> = (0..200).filter(|&c| at(c) == Some(0)).collect();
         assert!(!hits.is_empty(), "some column under the member hits it");
         let (left, right) = (hits[0], hits[hits.len() - 1] + 1);
@@ -1618,7 +1703,7 @@ MMMM
             right - left
         );
         assert_eq!(
-            r.member_at_column(&herd, &species, 200, 200, 0),
+            r.member_at_column(&herd, &species, area, 200, 0),
             None,
             "column past the strip's edge is empty"
         );

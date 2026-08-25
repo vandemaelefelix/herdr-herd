@@ -252,8 +252,19 @@ pub fn watch(
         }
         schedule.sent(now);
 
-        if let Some(sock) = socket.as_mut() {
-            let _ = sock.send_line(&subscribe_request());
+        if let Some(sock) = socket.as_mut()
+            && let Err(e) = sock.send_line(&subscribe_request())
+        {
+            // Only ever printed once: this runs before the loop, not per tick.
+            // A failed subscribe still degrades safely (the slow poll below
+            // carries the herd either way), but silently doing so left no way
+            // to tell "polling only" apart from "everything is fine" (issue
+            // #55).
+            eprintln!(
+                "herdr-herd: could not subscribe to socket events ({e}); \
+                 falling back to polling every {}ms",
+                timings.slow_ms
+            );
         }
         loop {
             if let Some(sock) = socket.as_mut() {
