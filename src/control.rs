@@ -226,7 +226,7 @@ const RENDERER_PROCESS_NAME: &str = "herdr-herd";
 /// the 3 s sweep floor that is ~3 process spawns a second, asking panes that
 /// answered a moment ago whether they are still there. A strip that has died
 /// stays dead, so a longer interval costs only latency before the replacement
-/// lands — and in the common case the pane exits with its renderer anyway
+/// lands, and in the common case the pane exits with its renderer anyway
 /// (`inject_strip` `exec`s it), which the sweep sees for free in the pane list.
 pub const STRIP_PROBE_INTERVAL_MS: u64 = 30_000;
 
@@ -290,8 +290,8 @@ pub struct SessionView {
 
 /// The controller, sweeping.
 ///
-/// Owns its two sources — the control socket first, the `herdr` CLI as the
-/// fallback — and the per-strip health memo, which only pays for itself if it
+/// Owns its two sources (the control socket first, the `herdr` CLI as the
+/// fallback) and the per-strip health memo, which only pays for itself if it
 /// survives between sweeps.
 pub struct Sweeper<'a> {
     rpc: Option<&'a dyn RpcClient>,
@@ -341,7 +341,7 @@ impl<'a> Sweeper<'a> {
         }
         // Close strips whose renderer has died. Left alone they keep their
         // label forever, so the tab looks covered and never gets a working
-        // strip back. The next sweep injects the replacement — closing and
+        // strip back. The next sweep injects the replacement: closing and
         // re-injecting in one pass would race the layout this sweep already
         // read.
         for dead in self.plan_dead_strips(&view.panes) {
@@ -359,7 +359,7 @@ impl<'a> Sweeper<'a> {
                         self.self_exe,
                         self.target_rows,
                     ),
-                    None => Ok(()), // columned bottom — no full-width strip possible
+                    None => Ok(()), // columned bottom: no full-width strip possible
                 }
             })();
             if let Err(e) = result {
@@ -372,8 +372,8 @@ impl<'a> Sweeper<'a> {
     /// The tabs, panes and (on the socket path) layouts this sweep works from.
     ///
     /// One `session.snapshot` replaces `tab list` + `pane list` + a `pane
-    /// layout` per candidate tab. Anything the socket cannot answer — no
-    /// socket, a failed call, a reply we cannot read — falls back to those CLI
+    /// layout` per candidate tab. Anything the socket cannot answer (no
+    /// socket, a failed call, a reply we cannot read) falls back to those CLI
     /// spawns rather than skipping the sweep.
     fn read_session(&self) -> io::Result<SessionView> {
         if let Some(rpc) = self.rpc
@@ -957,7 +957,7 @@ mod tests {
         );
     }
 
-    /// The socket cannot answer, so the probe falls back to a spawn — and the
+    /// The socket cannot answer, so the probe falls back to a spawn, and the
     /// spawn's answer counts, so the strip is confirmed like any other.
     #[test]
     fn a_probe_the_socket_cannot_answer_falls_back_to_a_spawn() {

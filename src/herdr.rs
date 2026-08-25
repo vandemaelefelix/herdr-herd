@@ -3,7 +3,7 @@
 //! herdr-file-viewer plugin's pattern (unix-only here; platforms exclude
 //! Windows).
 //!
-//! Two paths, in preference order — see [`HerdFeed`]:
+//! Two paths, in preference order (see [`HerdFeed`]):
 //!
 //! 1. the control socket, one `session.snapshot` per refresh; and
 //! 2. the `herdr` CLI (`HerdrCli`/`LiveHerdr`), which fork/execs, as the
@@ -87,8 +87,8 @@ pub const LABEL_TTL_MS: u64 = 30_000;
 /// Preferred path: one `session.snapshot` on the herdr control socket, which
 /// carries the agents **and** the workspace/tab labels in a single reply.
 ///
-/// Fallback path (a hard requirement — a socket failure must degrade the herd,
-/// never break it): the `herdr` CLI. `agent list` every refresh, with the two
+/// Fallback path, a hard requirement because a socket failure must degrade the
+/// herd rather than break it: the `herdr` CLI. `agent list` every refresh, with the two
 /// label lists cached for [`LABEL_TTL_MS`], so the degraded path costs one
 /// fork/exec per refresh instead of three.
 ///
@@ -132,7 +132,7 @@ impl HerdFeed {
 
     /// Drop the cached label maps, so the next CLI-path refresh refetches them.
     /// The watcher calls this when herdr reports a tab or workspace appearing,
-    /// closing or being renamed — the only events that can stale a breadcrumb.
+    /// closing or being renamed: the only events that can stale a breadcrumb.
     pub fn invalidate_labels(&mut self) {
         self.labels = None;
     }

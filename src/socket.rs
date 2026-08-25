@@ -12,7 +12,7 @@
 //! CLI: see `RpcClient`. The older read-to-EOF `request` helper (from Phase 0
 //! Spike A) is retained for simple calls such as `layout.export` /
 //! `layout.apply`. (Spike A verified the wire uses newline-delimited JSON-RPC
-//! with dotted method names — see the design doc §5.)
+//! with dotted method names, see the design doc §5.)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -126,7 +126,7 @@ pub trait RpcClient {
 /// connection per call.
 ///
 /// Per call, not once: herdr closes a control connection as soon as it has
-/// answered a plain request (verified live against 0.8.0 — a second request on
+/// answered a plain request (verified live against 0.8.0: a second request on
 /// the same stream gets `EPIPE`). Only an `events.subscribe` connection stays
 /// open, and that one cannot be reused for requests either, because its replies
 /// would interleave with the event stream the watcher is reading.
@@ -159,7 +159,7 @@ pub fn snapshot_request() -> String {
     rpc_request("herd:snapshot", "session.snapshot", serde_json::json!({}))
 }
 
-/// The `pane.process_info` request line for one pane — what the controller uses
+/// The `pane.process_info` request line for one pane: what the controller uses
 /// to tell a live strip from a labelled corpse.
 pub fn process_info_request(pane_id: &str) -> String {
     rpc_request(

@@ -1,5 +1,5 @@
 //! The `session.snapshot` reply: one control-socket call that carries the whole
-//! session — agents, workspace/tab labels, panes and per-tab layouts.
+//! session: agents, workspace/tab labels, panes and per-tab layouts.
 //!
 //! This is the payload that lets the watcher and the controller stop shelling
 //! out. `herdr agent list` + `workspace list` + `tab list` is three fork/execs
@@ -64,7 +64,7 @@ impl SessionSnapshot {
 /// Parse a `session.snapshot` reply into the parts the herd uses.
 ///
 /// Fails only when the envelope itself is unreadable (junk, or an error reply
-/// with no `result.snapshot`) — that is the signal for the caller to fall back
+/// with no `result.snapshot`). That is the signal for the caller to fall back
 /// to the CLI. Everything below the envelope degrades instead of failing.
 pub fn parse_session_snapshot(json: &str) -> Result<SessionSnapshot, serde_json::Error> {
     let env: Envelope = serde_json::from_str(json)?;

@@ -5,7 +5,7 @@
 //! without threads.
 //!
 //! Events are not all equal. The "active" hat follows focus, so a focus move
-//! gets a short window and everything else gets a long one — see [`Timings`] and
+//! gets a short window and everything else gets a long one. See [`Timings`] and
 //! [`Debouncer`]. The debounce is leading **and** trailing: an event that lands
 //! inside an open window still refreshes when the window closes, instead of
 //! being dropped and leaving the herd on a stale frame until the slow poll.
@@ -60,14 +60,14 @@ pub enum EventClass {
     /// A tab or workspace appeared, closed, was renamed, moved or reordered:
     /// the herd changed *and* the cached breadcrumb labels are stale.
     Labels,
-    /// Any other change — a pane appearing, exiting, or an agent being detected.
+    /// Any other change: a pane appearing, exiting, or an agent being detected.
     Structural,
 }
 
 /// Classify one event line by its `event` name (herdr's stream names use
 /// underscores: `pane_focused`, `tab_created`, …).
 ///
-/// Anything unreadable counts as [`EventClass::Structural`] — the slow window,
+/// Anything unreadable counts as [`EventClass::Structural`], the slow window,
 /// never the fast one, so junk on the wire cannot make the watcher refresh on
 /// every line.
 pub fn classify_event(line: &str) -> EventClass {
