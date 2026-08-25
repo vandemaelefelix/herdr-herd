@@ -30,6 +30,8 @@ use std::io;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::SoundConfig;
@@ -50,30 +52,65 @@ pub struct SystemSoundPlayer;
 
 impl SoundPlayer for SystemSoundPlayer {
     fn play(&self, path: &Path) -> io::Result<()> {
-        let mut last_err = None;
+        let mut errors = Vec::new();
         for player in candidate_players(std::env::consts::OS) {
             match spawn_detached(player, path) {
                 Ok(()) => return Ok(()),
-                Err(e) => last_err = Some(e),
+                // Keep every candidate's error, not just the last one: on
+                // Linux a `paplay` failure (the informative one, e.g. no
+                // PulseAudio socket) would otherwise be discarded the moment
+                // the `aplay` fallback also fails.
+                Err(e) => errors.push(format!("{player}: {e}")),
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| io::Error::other("no sound player available for this platform")))
+        Err(playback_error(errors))
     }
 }
 
-/// Spawn `player path`, then reap it on a background thread so the child
-/// never lingers as a zombie and the caller never waits on it.
+/// The final playback error to report, given every candidate player's own
+/// message: joined, so the first (often the most informative) one survives
+/// alongside the rest, or a generic message when there was nothing to even
+/// attempt (an unsupported OS, whose [`candidate_players`] list is empty).
+fn playback_error(errors: Vec<String>) -> io::Error {
+    io::Error::other(if errors.is_empty() {
+        "no sound player available for this platform".to_string()
+    } else {
+        errors.join("; ")
+    })
+}
+
+/// Spawn `player path`, then hand it to the session's single reaper thread so
+/// the child never lingers as a zombie and the caller never waits on it. One
+/// thread for the whole process, not one per clip (#74): a clip lives a
+/// second or two, and a session can play many of them.
 fn spawn_detached(player: &str, path: &Path) -> io::Result<()> {
-    let mut child: Child = Command::new(player)
+    let child: Child = Command::new(player)
         .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    // The reaper thread never exits (its receiver stays alive as long as the
+    // process does), so a send failure would mean it panicked. Either way, a
+    // child this loses track of is no worse than the old per-clip thread
+    // dying before `wait()` — a transient zombie, not a crash.
+    let _ = reaper().send(child);
     Ok(())
+}
+
+/// The session's single reaper thread, started on first use. It parks on
+/// `rx` and `wait()`s each child as it arrives, replacing what used to be a
+/// dedicated `std::thread::spawn` per clip.
+fn reaper() -> &'static Sender<Child> {
+    static REAPER: OnceLock<Sender<Child>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Child>();
+        std::thread::spawn(move || {
+            for mut child in rx {
+                let _ = child.wait();
+            }
+        });
+        tx
+    })
 }
 
 /// Candidate player programs for `os` (pass `std::env::consts::OS` in
@@ -124,6 +161,17 @@ fn armed_path(cfg: &SoundConfig, status: crate::agent::AgentStatus) -> Option<&P
 /// or an unavailable player must never crash or block rendering. This is the
 /// unconditional primitive; app code goes through [`play_claimed`] so N panes
 /// watching one transition do not each play it.
+///
+/// This deliberately never reports a failure anywhere, not even to stderr.
+/// `run_loop` calls this from inside the strip's alternate screen with raw
+/// mode on (see `render::run`): a bare `eprintln!` there paints straight
+/// over the sheep at whatever the cursor happens to be, `\n` stair-steps
+/// across the pane without a carriage return, and with #62's adaptive tick
+/// an idle pane may not redraw for hundreds of ms, so the corruption would
+/// sit on screen rather than being wiped by the next frame. The strip *is*
+/// the UI here; there is no spare channel to print to. A real user-visible
+/// warning belongs in the strip itself (tracked separately, alongside
+/// #55/#60's renderer-liveness reporting), not bolted onto this cleanup.
 pub fn play_all(player: &dyn SoundPlayer, paths: &[PathBuf]) {
     for p in paths {
         let _ = player.play(p);
@@ -481,6 +529,45 @@ mod tests {
         assert_eq!(candidate_players("windows"), &[] as &[&str]);
     }
 
+    #[test]
+    fn playback_error_keeps_every_candidates_message_not_just_the_last() {
+        let err = playback_error(vec![
+            "paplay: no pulseaudio socket".to_string(),
+            "aplay: not found".to_string(),
+        ]);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("paplay: no pulseaudio socket"),
+            "the first, more informative candidate's error must survive: {msg}"
+        );
+        assert!(
+            msg.contains("aplay: not found"),
+            "the last candidate's error must survive too: {msg}"
+        );
+    }
+
+    #[test]
+    fn playback_error_is_generic_when_no_candidate_was_even_tried() {
+        let err = playback_error(Vec::new());
+        assert!(
+            err.to_string().contains("no sound player available"),
+            "an unsupported OS (empty candidate list) gets a plain explanation"
+        );
+    }
+
+    #[test]
+    fn the_reaper_thread_is_created_once_and_reused() {
+        // One long-lived reaper, not a thread per clip (#74): `reaper()`
+        // must hand back the very same sender on every call, never spin up
+        // a fresh channel/thread pair.
+        let first: *const Sender<Child> = reaper();
+        let second: *const Sender<Child> = reaper();
+        assert_eq!(
+            first, second,
+            "the reaper's sender is created once and reused, not per call"
+        );
+    }
+
     struct Fake {
         calls: RefCell<Vec<PathBuf>>,
         fail: bool,
@@ -517,6 +604,42 @@ mod tests {
         let paths = vec![PathBuf::from("/a.wav"), PathBuf::from("/b.wav")];
         play_all(&fake, &paths); // must not panic
         assert_eq!(fake.calls.borrow().len(), 2, "both paths were attempted");
+    }
+
+    #[test]
+    fn this_module_never_writes_to_stdout_or_stderr() {
+        // Pins the fix for a real corruption bug: this module runs from
+        // inside `run_loop`, which is only ever entered after the strip has
+        // taken the alternate screen and raw mode (see `render::run`). A
+        // bare `println!`/`eprintln!` there paints over the sheep at
+        // whatever the cursor happens to be, and with #62's adaptive tick an
+        // idle pane may not redraw for a while, so the corruption would sit
+        // on screen instead of being wiped by the next frame. `play_all`'s
+        // doc comment explains why this module has no spare channel to print
+        // a warning to; this test makes sure nobody quietly adds one back.
+        // Built from parts rather than spelled out directly, so this list
+        // itself does not trip the scan below.
+        let bang = "!";
+        let banned = [
+            format!("println{bang}"),
+            format!("eprintln{bang}"),
+            format!("print{bang}("),
+            format!("eprint{bang}("),
+            format!("dbg{bang}("),
+        ];
+        let source = include_str!("sound.rs");
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // doc/line comments may mention these macros in prose
+            }
+            for needle in &banned {
+                assert!(
+                    !line.contains(needle.as_str()),
+                    "found `{needle}` outside a comment, in: {line:?}"
+                );
+            }
+        }
     }
 
     /// A clock the test drives by hand. Shared (via `Rc`) between claimants so

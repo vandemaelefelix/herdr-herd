@@ -275,6 +275,12 @@ impl StripHealth {
         let alive: HashSet<&str> = strips.iter().map(String::as_str).collect();
         self.confirmed.retain(|id, _| alive.contains(id.as_str()));
     }
+
+    /// The strip pane ids a previous sweep confirmed were running their
+    /// renderer, for [`plan_reap`]'s liveness tiebreak.
+    pub fn confirmed_ids(&self) -> HashSet<String> {
+        self.confirmed.keys().cloned().collect()
+    }
 }
 
 /// One sweep's view of the session.
@@ -334,7 +340,7 @@ impl<'a> Sweeper<'a> {
         let view = self.read_session()?;
         // Reap before injecting: collapsing a tab to one strip must not be
         // undone by this same sweep deciding the tab still needs one.
-        for extra in plan_reap(&view.panes) {
+        for extra in plan_reap(&view.panes, &self.health.confirmed_ids()) {
             if let Err(e) = self.cli.run_json(&["pane", "close", &extra]) {
                 eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
             }
@@ -462,15 +468,37 @@ pub fn controller_strips(panes: &[PaneRef]) -> Vec<String> {
 }
 
 /// The strip panes to close so each tab is left holding exactly one: every
-/// strip after the first in each tab. Injection alone cannot guarantee this —
-/// it only ever *adds* — so the sweep reaps whatever a lost label, a restored
-/// session, or a `place` racing the sweep left behind.
-pub fn plan_reap(panes: &[PaneRef]) -> Vec<String> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    panes
+/// strip except the one kept for that tab. Injection alone cannot guarantee
+/// this — it only ever *adds* — so the sweep reaps whatever a lost label, a
+/// restored session, or a `place` racing the sweep left behind.
+///
+/// `confirmed_live` is [`StripHealth::confirmed_ids`]: strips a previous
+/// sweep's probe found actually running. Within a tab, a confirmed-live
+/// strip is kept over an unconfirmed one (falling back to list order when
+/// none is confirmed), so a dead-and-alive pair does not get decided by
+/// coincidence of pane-list order. Deciding by order alone can reap the one
+/// live strip in the same sweep [`Sweeper::plan_dead_strips`] closes the dead
+/// one, leaving the tab with zero strips for a full probe interval.
+pub fn plan_reap(panes: &[PaneRef], confirmed_live: &HashSet<String>) -> Vec<String> {
+    let strips: Vec<&PaneRef> = panes
         .iter()
         .filter(|p| p.label.as_deref().is_some_and(is_strip_label))
-        .filter(|p| !seen.insert(p.tab_id.as_str()))
+        .collect();
+
+    let mut keep: HashMap<&str, &str> = HashMap::new();
+    for p in &strips {
+        keep.entry(p.tab_id.as_str())
+            .and_modify(|kept| {
+                if !confirmed_live.contains(*kept) && confirmed_live.contains(p.pane_id.as_str()) {
+                    *kept = p.pane_id.as_str();
+                }
+            })
+            .or_insert(p.pane_id.as_str());
+    }
+
+    strips
+        .into_iter()
+        .filter(|p| keep.get(p.tab_id.as_str()) != Some(&p.pane_id.as_str()))
         .map(|p| p.pane_id.clone())
         .collect()
 }
@@ -531,8 +559,11 @@ pub fn inject_strip(
     let strip_pane = parse_split_pane_id(&split_reply)?;
     // `exec` so the renderer *replaces* the pane's shell: when it exits the
     // pane exits with it, rather than lingering as a labelled corpse that every
-    // later sweep counts as a working strip.
-    let render_cmd = format!("exec '{self_exe}' render");
+    // later sweep counts as a working strip. `pane run` executes via a shell,
+    // so `self_exe` is single-quoted rather than pasted in raw: an unescaped
+    // `'` in the path (e.g. `/Users/o'brien/...`) would break the quoting and
+    // the renderer would silently never start.
+    let render_cmd = format!("exec {} render", shell_single_quote(self_exe));
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     // An unlabelled strip is invisible to every later sweep, which would then
     // inject a second one into the same tab. Rather than leave that orphan
@@ -543,6 +574,22 @@ pub fn inject_strip(
         return Err(e);
     }
     Ok(())
+}
+
+/// Wrap `s` in single quotes for a POSIX shell, escaping any embedded single
+/// quote as `'\''` (close the quote, an escaped literal quote, reopen it).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Extract `result.pane.pane_id` from a `herdr pane split` reply.
@@ -814,6 +861,25 @@ mod tests {
             vec!["pane", "run", "w1:pNEW", "exec '/abs/herdr-herd' render"]
         );
         assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
+    }
+
+    /// `pane run` executes via a shell. An unescaped `'` in `self_exe` (e.g.
+    /// a home directory like `/Users/o'brien`) would break the quoting and
+    /// the renderer would silently never start.
+    #[test]
+    fn inject_strip_escapes_a_single_quote_in_self_exe() {
+        let cli = FakeCli::new();
+        inject_strip(&cli, "w1:p1", 64, "/Users/o'brien/herdr-herd", 7).unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                r"exec '/Users/o'\''brien/herdr-herd' render"
+            ]
+        );
     }
 
     fn tab(id: &str, panes: u32) -> TabRef {
@@ -1119,12 +1185,13 @@ mod tests {
             pane("w1:p1", "w1:t1", None),
             pane("w1:p2", "w1:t1", Some("herdr-herd")),
         ];
-        assert!(plan_reap(&panes).is_empty());
+        assert!(plan_reap(&panes, &HashSet::new()).is_empty());
     }
 
     /// The invariant: one strip per tab, always. Whatever produced the second
     /// one (a lost label, a restored session, a `place` racing the sweep), the
-    /// next sweep collapses it back to one.
+    /// next sweep collapses it back to one. With no liveness info at all, the
+    /// tiebreak falls back to keeping whichever came first.
     #[test]
     fn a_tab_with_two_strips_reaps_all_but_the_first() {
         let panes = vec![
@@ -1132,7 +1199,28 @@ mod tests {
             pane("w1:p2", "w1:t1", Some("Herd")),
             pane("w1:p3", "w1:t1", Some("herdr-herd")),
         ];
-        assert_eq!(plan_reap(&panes), vec!["w1:p2".to_string(), "w1:p3".into()]);
+        assert_eq!(
+            plan_reap(&panes, &HashSet::new()),
+            vec!["w1:p2".to_string(), "w1:p3".into()]
+        );
+    }
+
+    /// A previous sweep's probe found `p1` dead and `p2` alive. Reaping must
+    /// not undo that by closing the confirmed-live strip on the strength of
+    /// list order alone — that would leave the tab with zero strips until the
+    /// next probe interval.
+    #[test]
+    fn a_tab_with_two_strips_keeps_the_confirmed_live_one_even_if_it_is_not_first() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t1", Some("herdr-herd")),
+        ];
+        let confirmed_live: HashSet<String> = ["w1:p2".to_string()].into_iter().collect();
+        assert_eq!(
+            plan_reap(&panes, &confirmed_live),
+            vec!["w1:p1".to_string()],
+            "p1 is unconfirmed and p2 is confirmed live, so p1 is the one to close"
+        );
     }
 
     #[test]
@@ -1141,7 +1229,7 @@ mod tests {
             pane("w1:p1", "w1:t1", Some("herdr-herd")),
             pane("w1:p2", "w1:t2", Some("herdr-herd")),
         ];
-        assert!(plan_reap(&panes).is_empty());
+        assert!(plan_reap(&panes, &HashSet::new()).is_empty());
     }
 
     #[test]

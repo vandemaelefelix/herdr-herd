@@ -202,11 +202,12 @@ fn opaque_col_span(frame: &SpriteFrame, flip: bool) -> Option<(usize, usize)> {
     any.then_some((lo, hi + 1))
 }
 
-/// Cache key for a transmitted image: species/status/frame/flip/hue/focused
-/// fully determine the rasterized pixels (focused bakes the hat directly
-/// into the image — see `render::stamp_hat`), so two members sharing all six
-/// reuse one image id instead of retransmitting.
-type ImgKey = (usize, AgentStatus, usize, bool, u16, bool);
+/// Cache key for a transmitted image: species/status/frame/flip/hue/focused/
+/// theme fully determine the rasterized pixels (focused bakes the hat
+/// directly into the image — see `render::stamp_hat`; theme recolors the
+/// outline via `rasterize` -> `role_color` -> `Role::Outline`), so two
+/// members sharing all seven reuse one image id instead of retransmitting.
+type ImgKey = (usize, AgentStatus, usize, bool, u16, bool, Theme);
 
 /// A transmitted image: the id it lives under in the terminal, and the frame
 /// this renderer last placed it on. The frame stamp drives eviction — without
@@ -432,6 +433,7 @@ impl KittyRenderer {
                 animated.facing_left,
                 member.identity.hue,
                 member.focused,
+                theme,
             );
             // Every member's image reserves hat + hop headroom above the sprite
             // (the hat is baked directly into this same image, not a separate
@@ -1071,6 +1073,25 @@ mod tests {
         );
         assert!(second.contains("a=p"), "still re-places");
         assert!(second.contains("a=d"), "and deletes the previous placement");
+    }
+
+    /// `rasterize` recolors the outline from the theme (`role_color` ->
+    /// `Role::Outline`), so a theme switch must retransmit rather than reuse
+    /// the previous theme's cached pixels under the same key.
+    #[test]
+    fn a_theme_switch_retransmits_instead_of_reusing_the_other_themes_image() {
+        let sink = SharedSink::default();
+        let mut r = KittyRenderer::for_test(sink.clone(), 4);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = one_working_herd();
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0);
+        sink.take();
+        r.draw_to_sink(&herd, &species, Theme::Light, 0);
+        let after_switch = sink.take();
+        assert!(
+            after_switch.contains("a=t"),
+            "the light-theme image is a distinct cache entry, so it must be transmitted"
+        );
     }
 
     /// The image ids named by every kitty command in `out` whose control block
