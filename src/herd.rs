@@ -150,12 +150,23 @@ impl Herd {
                             settled_at_ms: now_ms,
                         });
                     } else if a.agent_status == AgentStatus::Working {
-                        // Entering Working: keep the rest spot but restamp the
-                        // instant, so `motion` eases the member out from there
-                        // starting now. No prior anchor (a pane that never saw
-                        // it rest) leaves it on the plain cycle — nothing to
-                        // walk out from.
-                        if let Some(anchor) = p.anchor.as_mut() {
+                        if p.status == AgentStatus::Unknown {
+                            // Resuming from Unknown: `animate` ignores the
+                            // anchor while Unknown (it shows the plain
+                            // identity rest-x instead), so any anchor from
+                            // before it went Unknown is stale — it does not
+                            // match where the member was actually drawn.
+                            // Easing out from it would walk the member from
+                            // a spot it was never visibly at. Drop it and
+                            // land on the plain cycle instead, same as a
+                            // member with no anchor at all.
+                            p.anchor = None;
+                        } else if let Some(anchor) = p.anchor.as_mut() {
+                            // Entering Working: keep the rest spot but restamp
+                            // the instant, so `motion` eases the member out
+                            // from there starting now. No prior anchor (a pane
+                            // that never saw it rest) leaves it on the plain
+                            // cycle — nothing to walk out from.
                             anchor.settled_at_ms = now_ms;
                         }
                     }
@@ -217,8 +228,8 @@ mod tests {
             agent: Some("claude".into()),
             agent_status: status,
             name: None,
-            cwd: "/".into(),
-            foreground_cwd: "/".into(),
+            cwd: Some("/".into()),
+            foreground_cwd: Some("/".into()),
             workspace_id: "w".into(),
             tab_id: "t".into(),
             pane_id: "p".into(),
@@ -654,6 +665,29 @@ mod tests {
             "freezes at the on-screen eased position, not the raw cycle"
         );
         assert_eq!(frozen.settled_at_ms, 8_300);
+    }
+
+    #[test]
+    fn reconcile_drops_the_anchor_when_resuming_working_from_unknown() {
+        // Working -> Unknown (agent exits) anchors the member at its last
+        // wander spot, but `animate` ignores that anchor while Unknown (it
+        // shows the plain identity rest-x). If the agent restarts (Unknown ->
+        // Working), easing out from the stale anchor would walk the member
+        // from a spot it was never actually drawn at. It must resume
+        // unanchored instead, same as a member that never rested.
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 0);
+        h.reconcile(&[agent("a", AgentStatus::Unknown)], 1, 1_000);
+        assert!(
+            h.members[0].anchor.is_some(),
+            "leaving Working still captures an anchor"
+        );
+
+        h.reconcile(&[agent("a", AgentStatus::Working)], 1, 5_000);
+        assert_eq!(
+            h.members[0].anchor, None,
+            "resuming from Unknown must drop the stale anchor, not restamp it"
+        );
     }
 
     #[test]

@@ -209,7 +209,35 @@ pub fn parse_species(src: &str) -> Result<Species, String> {
             return Err(format!("species '{name}' missing state {st:?}"));
         }
     }
+    check_uniform_frame_size(&name, &states)?;
     Ok(Species { name, states })
+}
+
+/// Every frame across every state must share one size: [`Species::size`]
+/// reads it off just the first state's first frame, so a species with (say)
+/// a wider working pose than idle would parse fine and then desync hit-test
+/// (sized off `size()`) from the actually-blitted frame.
+fn check_uniform_frame_size(
+    name: &str,
+    states: &BTreeMap<AgentStatus, StateSpec>,
+) -> Result<(), String> {
+    let mut expected: Option<(usize, usize)> = None;
+    for state in states.values() {
+        for frame in &state.frames {
+            let size = (frame.w, frame.h);
+            match expected {
+                None => expected = Some(size),
+                Some(e) if e != size => {
+                    return Err(format!(
+                        "species '{name}': frame size mismatch ({}x{} vs {}x{}); all frames in a species must share one size",
+                        e.0, e.1, size.0, size.1
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Embedded sprite sources. Add one line per new animal.
@@ -424,6 +452,43 @@ mod tests {
     #[test]
     fn species_missing_a_state_is_an_error() {
         let bad = "name = X\n[idle] frame_ms=1 motion=none overlay=none\n.M.\nMMM\n.M.\n";
+        assert!(parse_species(bad).is_err());
+    }
+
+    /// A species whose frames are internally square (so `parse_frame`'s
+    /// ragged-rows check passes) but differ in size *across* states must
+    /// still fail: `Species::size()` reads only the first frame, so any
+    /// other size would desync hit-testing from the blitted sprite.
+    #[test]
+    fn frame_size_mismatch_across_states_is_a_parse_error() {
+        let bad = "name = X\n\
+            [idle] frame_ms=1 motion=none overlay=none\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            \n\
+            [working] frame_ms=1 motion=none overlay=none\n\
+            MM\n\
+            MM\n\
+            \n\
+            [done] frame_ms=1 motion=none overlay=none\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            \n\
+            [blocked] frame_ms=1 motion=none overlay=none\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            \n\
+            [unknown] frame_ms=1 motion=none overlay=none\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n\
+            MMMM\n";
         assert!(parse_species(bad).is_err());
     }
 

@@ -333,9 +333,16 @@ mod tests {
     }
     impl FakeSocket {
         fn emitting(n: usize) -> Self {
+            Self::emitting_line(n, r#"{"event":"pane_agent_status_changed"}"#)
+        }
+
+        /// Emit `n` copies of a caller-chosen wire line, verbatim. Lets a
+        /// test push a real herdr event line (e.g. `pane_focused`) through
+        /// `drain_events` instead of a hand-built `EventClass`.
+        fn emitting_line(n: usize, line: &str) -> Self {
             Self {
                 remaining: n,
-                line: r#"{"event":"pane_agent_status_changed"}"#.into(),
+                line: line.to_string(),
             }
         }
     }
@@ -359,19 +366,52 @@ mod tests {
         }
     }
 
+    /// The first event of a session (nothing sent yet) refreshes right away,
+    /// same as `watch()`'s initial snapshot. Everything that lands inside the
+    /// window it opens is held and coalesced into one trailing refetch once
+    /// the window closes, rather than each being dropped on the floor.
     #[test]
     fn debounce_coalesces_a_burst_into_one_refetch() {
         let mut feed = cli_feed();
-        // 5 events arriving within the debounce window => 1 snapshot.
+        // event 0 primes the schedule (nothing sent yet, so it fires at
+        // once); events 1-4 land inside the 250ms window it opens and must
+        // not each refetch; event 5, past the window, is what finally
+        // flushes them as a single coalesced refetch.
+        let times = [0u64, 10, 50, 100, 200, 300];
+        let mut i = 0;
         let snaps = drain_events(
             &mut feed,
-            &mut FakeSocket::emitting(5),
+            &mut FakeSocket::emitting(times.len()),
             timings(250),
-            |_| 0, /* all same tick */
+            move |_| {
+                let t = times[i];
+                i += 1;
+                t
+            },
         );
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].len(), 1);
-        assert_eq!(snaps[0][0].agent_status, AgentStatus::Idle);
+        assert_eq!(
+            snaps.len(),
+            2,
+            "one immediate refetch for the priming event, one trailing \
+             refetch for the whole burst behind it"
+        );
+        assert_eq!(snaps[1].len(), 1);
+        assert_eq!(snaps[1][0].agent_status, AgentStatus::Idle);
+    }
+
+    /// The core of #38: a burst of events inside one window must not each
+    /// trigger a refetch, and must not be dropped either. Only the window
+    /// closing makes a refetch due, and by then it reflects the burst's
+    /// settled state, not whichever event happened to arrive first.
+    #[test]
+    fn a_burst_of_events_inside_the_window_stays_undue_until_it_closes() {
+        let mut d = Debouncer::new(timings(250));
+        d.sent(0);
+        for t in [1u64, 5, 40, 120, 200] {
+            d.on_event(EventClass::Structural, t);
+            assert!(!d.due(t), "event at {t}ms must not refetch mid-burst");
+        }
+        assert!(d.due(250), "the window closes once the burst has settled");
     }
 
     #[test]
@@ -388,6 +428,39 @@ mod tests {
             },
         );
         assert_eq!(snaps.len(), 3);
+    }
+
+    /// #75: the fast focus window only protects the hat if a real wire line
+    /// actually reaches it. Every other test of the fast path builds
+    /// `EventClass::Focus` by hand, so it would stay green even if
+    /// `classify_event` mapped `pane_focused` to the wrong class entirely
+    /// (herdr's wire names are underscored; `subscribe_request`'s
+    /// subscription types are dotted, and it is easy to get that backwards).
+    /// This one starts from the literal line herdr emits and goes through
+    /// `drain_events` end to end, so it fails if that mapping breaks.
+    #[test]
+    fn a_real_pane_focused_wire_line_takes_the_fast_focus_window() {
+        let mut feed = cli_feed();
+        let mut socket = FakeSocket::emitting_line(2, r#"{"event":"pane_focused"}"#);
+        // First line primes the schedule (nothing sent yet, fires at once);
+        // the second lands 150ms later. That is well inside the 100ms focus
+        // window closing, but nowhere near the 750ms structural one, so it
+        // can only be due here if classify_event routed it to Focus.
+        let times = [0u64, 150];
+        let mut i = 0;
+        let snaps = drain_events(&mut feed, &mut socket, Timings::default(), move |_| {
+            let t = times[i];
+            i += 1;
+            t
+        });
+        assert_eq!(
+            snaps.len(),
+            2,
+            "a real pane_focused line must be due within the 100ms focus \
+             window; if it fell back to the 750ms structural one this second \
+             line would not be due yet and only the priming refetch would \
+             have happened"
+        );
     }
 
     #[test]

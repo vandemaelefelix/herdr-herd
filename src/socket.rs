@@ -73,6 +73,13 @@ pub trait SocketClient {
 pub struct RealSocket {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
+    /// Bytes of the current line read so far. `BufRead::read_line` is not
+    /// restartable: on a timeout it has already consumed and appended bytes
+    /// to its buffer before `fill_buf` errors. Keeping that buffer here
+    /// (instead of a fresh `String` per call) means a timeout mid-line
+    /// carries the partial line forward to the next `recv_line` call instead
+    /// of losing it.
+    pending: String,
 }
 
 impl RealSocket {
@@ -89,6 +96,7 @@ impl RealSocket {
         Ok(Self {
             writer: stream,
             reader,
+            pending: String::new(),
         })
     }
 }
@@ -101,12 +109,16 @@ impl SocketClient for RealSocket {
     }
 
     fn recv_line(&mut self) -> std::io::Result<String> {
-        let mut s = String::new();
-        let n = self.reader.read_line(&mut s)?;
+        // On a timeout, `read_line` returns `Err` with whatever it already
+        // appended to `pending` left in place, so the next call resumes
+        // mid-line instead of starting from a blank buffer.
+        let n = self.reader.read_line(&mut self.pending)?;
         if n == 0 {
             return Err(std::io::Error::other("socket closed"));
         }
-        Ok(s.trim_end_matches(['\r', '\n']).to_string())
+        Ok(std::mem::take(&mut self.pending)
+            .trim_end_matches(['\r', '\n'])
+            .to_string())
     }
 }
 
@@ -190,6 +202,17 @@ fn rpc_request(id: &str, method: &str, params: serde_json::Value) -> String {
 /// On connect herdr also replays current state, giving an immediate structural
 /// snapshot. (Stream event names use underscores, e.g. `pane_created`; the
 /// watcher ignores event contents and just refetches.)
+///
+/// The global focus subscriptions wake every render process on one pane
+/// switch (#73). Checked herdr 0.8.0's schema (`herdr api schema --json`) for
+/// a narrower alternative: `pane.focused`/`tab.focused`/`workspace.focused`
+/// take no target filter at all, only `pane.output_matched`/
+/// `pane.agent_status_changed`/`pane.scroll_changed` accept one `pane_id`.
+/// Since the herd strip renders the whole session, not just its own pane
+/// (#31), a per-pane subscription would mean one subscription per pane that
+/// exists, re-issued as panes come and go, not a straight swap for the global
+/// one. Narrowing this needs either a herdr API change or a decision on what
+/// a session-wide strip should actually watch, so it stays global here.
 pub fn subscribe_request() -> String {
     r#"{"id":"members","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"},{"type":"pane.exited"},{"type":"pane.focused"},{"type":"pane.agent_detected"},{"type":"tab.created"},{"type":"tab.closed"},{"type":"tab.focused"},{"type":"workspace.focused"}]}}"#.to_string()
 }
@@ -225,6 +248,51 @@ mod tests {
         assert_eq!(reply, "{\"event\":\"ok\"}");
         let got = server.join().unwrap();
         assert!(got.contains("events.subscribe"));
+    }
+
+    /// A line that crosses the 400ms read-timeout boundary must not lose its
+    /// head: the byte-timeout `recv_line` must resume mid-line rather than
+    /// discarding what it already read and later returning just the tail.
+    #[test]
+    fn recv_line_resumes_a_line_split_across_a_read_timeout() {
+        let path = std::env::temp_dir().join(format!("herdr-herd-split-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                conn.write_all(b"{\"first_half\":").unwrap();
+                conn.flush().unwrap();
+                // Long enough to clear the client's 400ms read timeout at
+                // least once before the rest of the line arrives.
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                conn.write_all(b"\"second_half\"}\n").unwrap();
+                conn.flush().unwrap();
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+
+        let mut c = RealSocket::connect(&path).unwrap();
+        let mut timed_out = false;
+        let line = loop {
+            match c.recv_line() {
+                Ok(line) => break line,
+                Err(e) => {
+                    assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ),
+                        "unexpected error: {e}"
+                    );
+                    timed_out = true;
+                }
+            }
+        };
+        assert!(timed_out, "the test is only meaningful if a timeout fired");
+        assert_eq!(line, r#"{"first_half":"second_half"}"#);
+        server.join().unwrap();
     }
 
     #[test]

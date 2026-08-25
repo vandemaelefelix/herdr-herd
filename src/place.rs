@@ -12,10 +12,13 @@ use serde_json::{Value, json};
 use crate::herdr::HerdrCli;
 use crate::socket;
 
-/// Rows the strip should occupy: a 1-row badge lane, 3 half-block member rows, and
-/// 1 caption row — a slim status strip. Overlays/`+N` live in the lane so they
-/// never cover a member, and the member band is short (members are a glanceable status,
-/// not the focus).
+/// Rows the strip should occupy: a slim status strip, deliberately shorter
+/// than [`crate::render::STRIP_ROWS`] (the half-block band's full height,
+/// #37). Kitty adapts its own band to whatever pane it's given, so it pays
+/// nothing for this; a half-block user sees the band cropped down to fit,
+/// losing headroom, not feet (`render::draw_pixels`, `render::overlay_lane_y`).
+/// A half-block user who wants the whole member, uncropped, should set
+/// `strip_rows = render::STRIP_ROWS` in their `config.toml`.
 pub const TARGET_ROWS: u16 = 5;
 
 /// The split ratio that leaves the bottom `target_rows` for the strip on a tab
@@ -132,8 +135,10 @@ mod tests {
 
     #[test]
     fn target_rows_is_a_slim_status_strip() {
-        // 5 rows = 1 badge lane + 3 half-block pixel rows (MEMBER_PX_H = 6) + 1
-        // caption row. Slim on purpose — the members are a glanceable status line.
+        // Deliberately shorter than render::STRIP_ROWS, the half-block band's
+        // full height (#37): slim on purpose, and kitty (Auto's pick wherever
+        // supported) adapts its own band to whatever pane it's given, so it
+        // pays nothing for staying slim.
         assert_eq!(TARGET_ROWS, 5);
     }
 

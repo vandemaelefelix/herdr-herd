@@ -82,7 +82,13 @@ impl SoundConfig {
 pub struct Config {
     /// Whether the `control` watchdog runs at all.
     pub enabled: bool,
-    /// Strip height in rows.
+    /// Strip height in rows. Defaults to a slim 5, deliberately shorter than
+    /// [`crate::render::STRIP_ROWS`] (the half-block band's full height): the
+    /// kitty backend adapts its own band to whatever pane it's given, so a
+    /// kitty user pays nothing for the slim default, while a half-block user
+    /// sees the member cropped down to fit, losing headroom rather than feet
+    /// (#37). A half-block user who wants the full band, uncropped, should
+    /// set this to `render::STRIP_ROWS` explicitly.
     pub strip_rows: u16,
     /// Controller poll cadence in milliseconds.
     pub sweep_interval_ms: u64,
@@ -132,7 +138,7 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Config {
         let mut cfg = Config::default();
         for raw in s.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
+            let line = strip_comment(raw).trim();
             if line.is_empty() {
                 continue;
             }
@@ -203,6 +209,28 @@ impl Config {
         }
         cfg
     }
+}
+
+/// `line` up to its first `#` that is outside a quoted string, so a value
+/// like `sound_blocked_path = "/Users/felix/Music/#1 alert.wav"` keeps its
+/// `#` instead of being truncated as if the rest were a comment.
+fn strip_comment(line: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match in_quote {
+            Some(q) => {
+                if c == q {
+                    in_quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => in_quote = Some(c),
+                '#' => return &line[..i],
+                _ => {}
+            },
+        }
+    }
+    line
 }
 
 /// Set `status`'s enabled flag from a raw config value; an unparsable value
@@ -443,6 +471,21 @@ mod tests {
         );
         assert!(c.sounds.done.enabled);
         assert_eq!(c.sounds.done.path, Some(PathBuf::from("/home/me/done.wav")));
+    }
+
+    /// A `#` inside a quoted path is not a comment: naive `split('#')`
+    /// truncation would silence this path to a directory, and `afplay`
+    /// spawning successfully against a directory would report "played" with
+    /// no sound and no diagnostic.
+    #[test]
+    fn a_hash_inside_a_quoted_sound_path_is_not_stripped_as_a_comment() {
+        let c = Config::from_toml_str(
+            "sound_blocked_path = \"/Users/felix/Music/#1 alert.wav\" # trailing comment\n",
+        );
+        assert_eq!(
+            c.sounds.blocked.path,
+            Some(PathBuf::from("/Users/felix/Music/#1 alert.wav"))
+        );
     }
 
     #[test]

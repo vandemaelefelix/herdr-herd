@@ -80,7 +80,9 @@ pub fn kind_icon(kind: Option<&str>, style: AgentIconStyle) -> Option<&'static s
 }
 
 /// One agent, as reported in `result.agents[]`. `agent` and `name` are absent
-/// for `unknown`-status panes, so both are optional.
+/// for `unknown`-status panes, so both are optional. `cwd` and
+/// `foreground_cwd` are nullable in herdr's own schema, so they are optional
+/// too; the label fallback chain handles their absence.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     #[serde(default)]
@@ -88,8 +90,10 @@ pub struct Agent {
     pub agent_status: AgentStatus,
     #[serde(default)]
     pub name: Option<String>,
-    pub cwd: String,
-    pub foreground_cwd: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub foreground_cwd: Option<String>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
@@ -140,15 +144,18 @@ impl Agent {
     }
 
     /// Last-resort location label: the basename of `foreground_cwd` (else
-    /// `cwd`), else the legacy [`label`](Agent::label).
+    /// `cwd`), else the legacy [`label`](Agent::label). Both are nullable in
+    /// herdr's schema, so either may be absent.
     fn folder_label(&self) -> String {
         fn basename(path: &str) -> Option<&str> {
             path.trim_end_matches('/')
                 .rsplit('/')
                 .find(|seg| !seg.is_empty())
         }
-        basename(&self.foreground_cwd)
-            .or_else(|| basename(&self.cwd))
+        self.foreground_cwd
+            .as_deref()
+            .and_then(basename)
+            .or_else(|| self.cwd.as_deref().and_then(basename))
             .map(str::to_string)
             .unwrap_or_else(|| self.label())
     }
@@ -161,13 +168,24 @@ struct Envelope {
 
 #[derive(Debug, Deserialize)]
 struct EnvelopeResult {
-    agents: Vec<Agent>,
+    #[serde(default)]
+    agents: Vec<serde_json::Value>,
 }
 
 /// Parse the `herdr agent list` envelope into the agent vector.
+///
+/// Fails only when the envelope itself is unreadable. Each entry below that is
+/// parsed on its own, so one agent in a shape we cannot read is skipped
+/// instead of failing the whole list, matching how [`crate::snapshot`]
+/// degrades.
 pub fn parse_agent_list(json: &str) -> Result<Vec<Agent>, serde_json::Error> {
     let env: Envelope = serde_json::from_str(json)?;
-    Ok(env.result.agents)
+    Ok(env
+        .result
+        .agents
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<Agent>(v).ok())
+        .collect())
 }
 
 #[cfg(test)]
@@ -209,6 +227,31 @@ mod tests {
         assert_eq!(a[0].agent_status, AgentStatus::Unknown);
     }
 
+    /// herdr's schema types `cwd`/`foreground_cwd` as nullable. A null must
+    /// parse to `None`, not fail the agent.
+    #[test]
+    fn null_cwd_and_foreground_cwd_parse_to_none() {
+        let json = r#"{"result":{"agents":[{"agent_status":"idle","cwd":null,"focused":false,"foreground_cwd":null,"pane_id":"p","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"}]}}"#;
+        let a = parse_agent_list(json).unwrap();
+        assert_eq!(a[0].cwd, None);
+        assert_eq!(a[0].foreground_cwd, None);
+    }
+
+    /// The CLI path used to parse `agents[]` as one `Vec<Agent>`, so a single
+    /// unreadable entry failed the whole list. It must now skip just that
+    /// entry, matching how `parse_session_snapshot` degrades.
+    #[test]
+    fn a_single_unreadable_agent_is_skipped_not_fatal_to_the_whole_list() {
+        let json = r#"{"result":{"agents":[
+            {"agent_status":"idle","cwd":"/","focused":false,"foreground_cwd":"/",
+             "pane_id":"good","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"},
+            {"agent_status":"idle","focused":false,"foreground_cwd":"/",
+             "pane_id":"missing-required-field","revision":0,"tab_id":"t","workspace_id":"w"}]}}"#;
+        let a = parse_agent_list(json).unwrap();
+        assert_eq!(a.len(), 1, "the entry missing terminal_id is dropped");
+        assert_eq!(a[0].pane_id, "good");
+    }
+
     #[test]
     fn label_prefers_name_then_agent_then_pane_id() {
         let a = parse_agent_list(FIXTURE).unwrap();
@@ -243,8 +286,8 @@ mod tests {
 
         // An agent with no folder path at all falls back to the legacy label.
         let mut bare = a[0].clone();
-        bare.foreground_cwd = String::new();
-        bare.cwd = String::new();
+        bare.foreground_cwd = None;
+        bare.cwd = None;
         // a[0] has name "members-dev", so legacy label() == "members-dev".
         assert_eq!(bare.sidebar_label(None, None), "members-dev");
     }
