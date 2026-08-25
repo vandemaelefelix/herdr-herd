@@ -74,12 +74,16 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             let cli = LiveHerdr::from_env();
+            // Reads go over the control socket when there is one; the CLI stays
+            // wired in behind it for the mutations and as the fallback.
+            let rpc = UnixRpcClient::from_env();
             let self_exe = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "herdr-herd".to_string());
             let lock_path = herdr_herd::control::controller_lock_path();
             match herdr_herd::control::control(
+                rpc.as_ref().map(|c| c as &dyn RpcClient),
                 &cli,
                 &self_exe,
                 &lock_path,
