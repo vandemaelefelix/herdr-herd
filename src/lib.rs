@@ -23,6 +23,7 @@ pub mod place;
 pub mod raster;
 pub mod render;
 pub mod sidebar;
+pub mod snapshot;
 pub mod socket;
 pub mod sound;
 pub mod sprite;
