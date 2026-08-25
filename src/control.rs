@@ -275,6 +275,12 @@ impl StripHealth {
         let alive: HashSet<&str> = strips.iter().map(String::as_str).collect();
         self.confirmed.retain(|id, _| alive.contains(id.as_str()));
     }
+
+    /// The strip pane ids a previous sweep confirmed were running their
+    /// renderer, for [`plan_reap`]'s liveness tiebreak.
+    pub fn confirmed_ids(&self) -> HashSet<String> {
+        self.confirmed.keys().cloned().collect()
+    }
 }
 
 /// One sweep's view of the session.
@@ -297,6 +303,7 @@ pub struct Sweeper<'a> {
     rpc: Option<&'a dyn RpcClient>,
     cli: &'a dyn HerdrCli,
     self_exe: &'a str,
+    config_dir_override: Option<&'a str>,
     target_rows: u16,
     probe_every: u64,
     sweep: u64,
@@ -305,11 +312,15 @@ pub struct Sweeper<'a> {
 
 impl<'a> Sweeper<'a> {
     /// Wire a sweeper to its sources. `rpc` is `None` outside a herdr session,
-    /// which puts every read back on the CLI.
+    /// which puts every read back on the CLI. `config_dir_override` is the
+    /// controller's own `HERDR_HERD_CONFIG_DIR`, resolved once by the caller
+    /// and forwarded to every strip this sweeper injects, so a test session
+    /// stays isolated end to end rather than only at the controller.
     pub fn new(
         rpc: Option<&'a dyn RpcClient>,
         cli: &'a dyn HerdrCli,
         self_exe: &'a str,
+        config_dir_override: Option<&'a str>,
         target_rows: u16,
         probe_every: u64,
     ) -> Self {
@@ -317,6 +328,7 @@ impl<'a> Sweeper<'a> {
             rpc,
             cli,
             self_exe,
+            config_dir_override,
             target_rows,
             probe_every: probe_every.max(1),
             sweep: 0,
@@ -334,7 +346,7 @@ impl<'a> Sweeper<'a> {
         let view = self.read_session()?;
         // Reap before injecting: collapsing a tab to one strip must not be
         // undone by this same sweep deciding the tab still needs one.
-        for extra in plan_reap(&view.panes) {
+        for extra in plan_reap(&view.panes, &self.health.confirmed_ids()) {
             if let Err(e) = self.cli.run_json(&["pane", "close", &extra]) {
                 eprintln!("herdr-herd: could not close duplicate strip {extra}: {e}");
             }
@@ -357,6 +369,7 @@ impl<'a> Sweeper<'a> {
                         &target.pane_id,
                         target.pane_rows,
                         self.self_exe,
+                        self.config_dir_override,
                         self.target_rows,
                     ),
                     None => Ok(()), // columned bottom: no full-width strip possible
@@ -462,15 +475,37 @@ pub fn controller_strips(panes: &[PaneRef]) -> Vec<String> {
 }
 
 /// The strip panes to close so each tab is left holding exactly one: every
-/// strip after the first in each tab. Injection alone cannot guarantee this —
-/// it only ever *adds* — so the sweep reaps whatever a lost label, a restored
-/// session, or a `place` racing the sweep left behind.
-pub fn plan_reap(panes: &[PaneRef]) -> Vec<String> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    panes
+/// strip except the one kept for that tab. Injection alone cannot guarantee
+/// this — it only ever *adds* — so the sweep reaps whatever a lost label, a
+/// restored session, or a `place` racing the sweep left behind.
+///
+/// `confirmed_live` is [`StripHealth::confirmed_ids`]: strips a previous
+/// sweep's probe found actually running. Within a tab, a confirmed-live
+/// strip is kept over an unconfirmed one (falling back to list order when
+/// none is confirmed), so a dead-and-alive pair does not get decided by
+/// coincidence of pane-list order. Deciding by order alone can reap the one
+/// live strip in the same sweep [`Sweeper::plan_dead_strips`] closes the dead
+/// one, leaving the tab with zero strips for a full probe interval.
+pub fn plan_reap(panes: &[PaneRef], confirmed_live: &HashSet<String>) -> Vec<String> {
+    let strips: Vec<&PaneRef> = panes
         .iter()
         .filter(|p| p.label.as_deref().is_some_and(is_strip_label))
-        .filter(|p| !seen.insert(p.tab_id.as_str()))
+        .collect();
+
+    let mut keep: HashMap<&str, &str> = HashMap::new();
+    for p in &strips {
+        keep.entry(p.tab_id.as_str())
+            .and_modify(|kept| {
+                if !confirmed_live.contains(*kept) && confirmed_live.contains(p.pane_id.as_str()) {
+                    *kept = p.pane_id.as_str();
+                }
+            })
+            .or_insert(p.pane_id.as_str());
+    }
+
+    strips
+        .into_iter()
+        .filter(|p| keep.get(p.tab_id.as_str()) != Some(&p.pane_id.as_str()))
         .map(|p| p.pane_id.clone())
         .collect()
 }
@@ -510,11 +545,18 @@ pub fn binary_stamp(path: &str) -> Option<u64> {
 /// de-dup label. The ratio is relative to `pane_rows` (the target pane's own
 /// height), so the strip is ~`target_rows` tall wherever the pane sits. Uses
 /// `pane split` (NOT `layout.apply`), so the split pane's process survives.
+///
+/// `config_dir_override` carries the controller's own `HERDR_HERD_CONFIG_DIR`
+/// (if any) into the strip's exec line: a new pane's shell does not inherit it
+/// from the controller process, so without this the strip would fall back to
+/// resolving the real installed plugin's config dir instead of the isolated
+/// one the controller is using.
 pub fn inject_strip(
     cli: &dyn HerdrCli,
     target_pane: &str,
     pane_rows: u16,
     self_exe: &str,
+    config_dir_override: Option<&str>,
     target_rows: u16,
 ) -> io::Result<()> {
     let ratio_arg = format!("{:.4}", slim_ratio(pane_rows, target_rows));
@@ -531,8 +573,18 @@ pub fn inject_strip(
     let strip_pane = parse_split_pane_id(&split_reply)?;
     // `exec` so the renderer *replaces* the pane's shell: when it exits the
     // pane exits with it, rather than lingering as a labelled corpse that every
-    // later sweep counts as a working strip.
-    let render_cmd = format!("exec '{self_exe}' render");
+    // later sweep counts as a working strip. `pane run` executes via a shell,
+    // so both `self_exe` and `config_dir` are single-quoted rather than pasted
+    // in raw: an unescaped `'` in either path (e.g. `/Users/o'brien/...`)
+    // would break the quoting and the renderer would silently never start.
+    let render_cmd = match config_dir_override {
+        Some(dir) => format!(
+            "HERDR_HERD_CONFIG_DIR={} exec {} render",
+            shell_single_quote(dir),
+            shell_single_quote(self_exe)
+        ),
+        None => format!("exec {} render", shell_single_quote(self_exe)),
+    };
     cli.run_json(&["pane", "run", &strip_pane, &render_cmd])?;
     // An unlabelled strip is invisible to every later sweep, which would then
     // inject a second one into the same tab. Rather than leave that orphan
@@ -543,6 +595,22 @@ pub fn inject_strip(
         return Err(e);
     }
     Ok(())
+}
+
+/// Wrap `s` in single quotes for a POSIX shell, escaping any embedded single
+/// quote as `'\''` (close the quote, an escaped literal quote, reopen it).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Extract `result.pane.pane_id` from a `herdr pane split` reply.
@@ -585,6 +653,7 @@ pub fn control(
     rpc: Option<&dyn RpcClient>,
     cli: &dyn HerdrCli,
     self_exe: &str,
+    config_dir_override: Option<&str>,
     lock_path: &Path,
     interval: Duration,
     target_rows: u16,
@@ -600,6 +669,7 @@ pub fn control(
         rpc,
         cli,
         self_exe,
+        config_dir_override,
         target_rows,
         probe_every_sweeps(interval),
     );
@@ -690,7 +760,7 @@ mod tests {
     /// A sweeper with no socket (so every read goes through the CLI double) and
     /// `probe_every = 1`, i.e. probing every strip every sweep.
     fn sweeper(cli: &dyn HerdrCli) -> Sweeper<'_> {
-        Sweeper::new(None, cli, "/abs/herdr-herd", 7, 1)
+        Sweeper::new(None, cli, "/abs/herdr-herd", None, 7, 1)
     }
 
     const SNAPSHOT: &str = include_str!(concat!(
@@ -825,7 +895,7 @@ mod tests {
     fn inject_strip_splits_runs_and_labels_in_order() {
         let cli = FakeCli::new();
         // pane_rows = 64 (the target pane's own height) -> slim_ratio(64, 7).
-        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7).unwrap();
+        inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7).unwrap();
         let calls = cli.calls.borrow();
         // No self-fetch of layout: the sweep already resolved the target + rows.
         // slim_ratio(64, 7) = 1 - 7/64 = 0.890625 -> "{:.4}" = "0.8906"
@@ -850,6 +920,79 @@ mod tests {
             vec!["pane", "run", "w1:pNEW", "exec '/abs/herdr-herd' render"]
         );
         assert_eq!(calls[2], vec!["pane", "rename", "w1:pNEW", "herdr-herd"]);
+    }
+
+    /// A test session's isolated config dir must reach the strip's exec line
+    /// too, not just the controller: a new pane's shell does not inherit the
+    /// controller process's env, so without this the strip would resolve the
+    /// real installed plugin's config instead.
+    #[test]
+    fn inject_strip_forwards_the_config_dir_override_into_the_exec_line() {
+        let cli = FakeCli::new();
+        inject_strip(
+            &cli,
+            "w1:p1",
+            64,
+            "/abs/herdr-herd",
+            Some("/abs/.herd-test/config"),
+            7,
+        )
+        .unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                "HERDR_HERD_CONFIG_DIR='/abs/.herd-test/config' exec '/abs/herdr-herd' render"
+            ]
+        );
+    }
+
+    /// `pane run` executes via a shell. An unescaped `'` in `self_exe` (e.g.
+    /// a home directory like `/Users/o'brien`) would break the quoting and
+    /// the renderer would silently never start.
+    #[test]
+    fn inject_strip_escapes_a_single_quote_in_self_exe() {
+        let cli = FakeCli::new();
+        inject_strip(&cli, "w1:p1", 64, "/Users/o'brien/herdr-herd", None, 7).unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                r"exec '/Users/o'\''brien/herdr-herd' render"
+            ]
+        );
+    }
+
+    /// The config dir goes through the same escaping as `self_exe` — an
+    /// unescaped `'` there would break the quoting just as badly.
+    #[test]
+    fn inject_strip_escapes_a_single_quote_in_the_config_dir_override() {
+        let cli = FakeCli::new();
+        inject_strip(
+            &cli,
+            "w1:p1",
+            64,
+            "/abs/herdr-herd",
+            Some("/tmp/o'brien/.herd-test/config"),
+            7,
+        )
+        .unwrap();
+        let calls = cli.calls.borrow();
+        assert_eq!(
+            calls[1],
+            vec![
+                "pane",
+                "run",
+                "w1:pNEW",
+                r"HERDR_HERD_CONFIG_DIR='/tmp/o'\''brien/.herd-test/config' exec '/abs/herdr-herd' render"
+            ]
+        );
     }
 
     fn tab(id: &str, panes: u32) -> TabRef {
@@ -946,7 +1089,7 @@ mod tests {
     fn a_live_strip_is_probed_once_per_interval_not_once_per_sweep() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         for _ in 0..5 {
             sw.sweep_once().unwrap();
         }
@@ -958,7 +1101,7 @@ mod tests {
 
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut every = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 1);
+        let mut every = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 1);
         for _ in 0..5 {
             every.sweep_once().unwrap();
         }
@@ -975,7 +1118,7 @@ mod tests {
     fn a_strip_that_dies_between_probes_is_caught_on_its_next_probe() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 3);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 3);
         sw.sweep_once().unwrap(); // sweep 1: probed, alive, confirmed
         rpc.kill("w1:pSTRIP"); // the renderer exits
         sw.sweep_once().unwrap(); // sweep 2: not due
@@ -1000,7 +1143,7 @@ mod tests {
         let cli = one_tab_cli();
         let mut rpc = FakeRpc::new(SNAPSHOT);
         rpc.unanswerable.insert("w1:pSTRIP".to_string());
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
         sw.sweep_once().unwrap();
         assert_eq!(calls_matching(&cli, "pane close"), 0, "the strip is live");
@@ -1036,7 +1179,7 @@ mod tests {
         let cli = NoProcessInfo(one_tab_cli());
         let mut rpc = FakeRpc::new(SNAPSHOT);
         rpc.unanswerable.insert("w1:pSTRIP".to_string());
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
         sw.sweep_once().unwrap();
         assert_eq!(
@@ -1057,7 +1200,7 @@ mod tests {
     fn the_socket_path_reads_the_whole_session_without_a_single_spawn() {
         let cli = one_tab_cli();
         let rpc = FakeRpc::new(SNAPSHOT);
-        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", 7, 10);
+        let mut sw = Sweeper::new(Some(&rpc), &cli, "/abs/herdr-herd", None, 7, 10);
         sw.sweep_once().unwrap();
 
         assert_eq!(rpc.calls_of("session.snapshot"), 1);
@@ -1094,7 +1237,7 @@ mod tests {
             tabs: r#"{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":1}]}}"#.into(),
             panes: r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}"#.into(),
         };
-        Sweeper::new(Some(&DeadRpc), &cli, "/abs/herdr-herd", 7, 10)
+        Sweeper::new(Some(&DeadRpc), &cli, "/abs/herdr-herd", None, 7, 10)
             .sweep_once()
             .unwrap();
         assert_eq!(calls_matching(&cli, "tab list"), 1);
@@ -1155,12 +1298,13 @@ mod tests {
             pane("w1:p1", "w1:t1", None),
             pane("w1:p2", "w1:t1", Some("herdr-herd")),
         ];
-        assert!(plan_reap(&panes).is_empty());
+        assert!(plan_reap(&panes, &HashSet::new()).is_empty());
     }
 
     /// The invariant: one strip per tab, always. Whatever produced the second
     /// one (a lost label, a restored session, a `place` racing the sweep), the
-    /// next sweep collapses it back to one.
+    /// next sweep collapses it back to one. With no liveness info at all, the
+    /// tiebreak falls back to keeping whichever came first.
     #[test]
     fn a_tab_with_two_strips_reaps_all_but_the_first() {
         let panes = vec![
@@ -1168,7 +1312,28 @@ mod tests {
             pane("w1:p2", "w1:t1", Some("Herd")),
             pane("w1:p3", "w1:t1", Some("herdr-herd")),
         ];
-        assert_eq!(plan_reap(&panes), vec!["w1:p2".to_string(), "w1:p3".into()]);
+        assert_eq!(
+            plan_reap(&panes, &HashSet::new()),
+            vec!["w1:p2".to_string(), "w1:p3".into()]
+        );
+    }
+
+    /// A previous sweep's probe found `p1` dead and `p2` alive. Reaping must
+    /// not undo that by closing the confirmed-live strip on the strength of
+    /// list order alone — that would leave the tab with zero strips until the
+    /// next probe interval.
+    #[test]
+    fn a_tab_with_two_strips_keeps_the_confirmed_live_one_even_if_it_is_not_first() {
+        let panes = vec![
+            pane("w1:p1", "w1:t1", Some("herdr-herd")),
+            pane("w1:p2", "w1:t1", Some("herdr-herd")),
+        ];
+        let confirmed_live: HashSet<String> = ["w1:p2".to_string()].into_iter().collect();
+        assert_eq!(
+            plan_reap(&panes, &confirmed_live),
+            vec!["w1:p1".to_string()],
+            "p1 is unconfirmed and p2 is confirmed live, so p1 is the one to close"
+        );
     }
 
     #[test]
@@ -1177,7 +1342,7 @@ mod tests {
             pane("w1:p1", "w1:t1", Some("herdr-herd")),
             pane("w1:p2", "w1:t2", Some("herdr-herd")),
         ];
-        assert!(plan_reap(&panes).is_empty());
+        assert!(plan_reap(&panes, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -1227,7 +1392,7 @@ mod tests {
         let cli = RenameFails {
             calls: RefCell::new(Vec::new()),
         };
-        let err = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
+        let err = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7);
         assert!(err.is_err(), "an unlabellable strip is a failed injection");
         let calls = cli.calls.borrow();
         assert!(
@@ -1466,7 +1631,7 @@ mod tests {
     #[test]
     fn inject_strip_aborts_the_tab_without_running_or_renaming_when_split_fails() {
         let cli = FailableCli::new("", "", "w1:p1");
-        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", 7);
+        let result = inject_strip(&cli, "w1:p1", 64, "/abs/herdr-herd", None, 7);
         assert!(result.is_err(), "a failed split must surface as an error");
         let calls = cli.calls.borrow();
         assert!(
@@ -1608,6 +1773,7 @@ mod tests {
             None,
             &cli,
             "/abs/herdr-herd",
+            None,
             &lock_path,
             Duration::from_secs(1),
             7,

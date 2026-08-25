@@ -19,7 +19,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentIconStyle};
 use crate::anim::{Overlay, OverlayColor, Rgb};
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
@@ -62,6 +62,24 @@ fn wall_clock_now_ms() -> u64 {
 /// lift, plus [`HAT_H`] rows so the focus hat has room above even the tallest
 /// (standing) pose without clipping.
 pub const MEMBER_PX_H: usize = 15 + HAT_H;
+
+/// Terminal rows the half-block band needs: [`MEMBER_PX_H`] pixel rows packed
+/// two per cell.
+const BAND_ROWS: u16 = MEMBER_PX_H.div_ceil(2) as u16;
+
+/// Terminal rows the half-block strip needs end to end to show the whole
+/// member with no cropping: the band ([`BAND_ROWS`]) plus one overlay lane
+/// row for badges/`+N`/the caption/the build marker (#37).
+///
+/// This is **not** the shipped default: the kitty backend derives its own
+/// band height from whatever pane it is given (`kitty_render::member_rows`),
+/// so it needs no extra room, and `Auto` picks kitty wherever the terminal
+/// supports it. Raising the shipped default would double the strip's
+/// vertical footprint for every kitty user for no benefit to them. A user who
+/// is on half-block (no kitty support, or `renderer = "half-block"`) and
+/// wants the full band, uncropped, should set `strip_rows` to this value
+/// explicitly.
+pub const STRIP_ROWS: u16 = BAND_ROWS + 1;
 
 /// A pixel canvas: `w * h` optional colors, row-major. `None` = transparent.
 pub struct PixelBuf {
@@ -199,12 +217,18 @@ pub(crate) fn stamp_hat(
 const UPPER_HALF: &str = "▀";
 const LOWER_HALF: &str = "▄";
 
-/// Emit the pixel buffer as half-block cells into `area` (top-left aligned):
-/// each cell packs two pixel rows into one terminal row via `▀` (fg = top
-/// pixel, bg = bottom pixel) or `▄` when only the bottom pixel is set.
+/// Emit the pixel buffer as half-block cells into `area`, left-aligned: each
+/// cell packs two pixel rows into one terminal row via `▀` (fg = top pixel,
+/// bg = bottom pixel) or `▄` when only the bottom pixel is set. Bottom-aligned
+/// vertically: when `area` has fewer rows than the buffer needs, rows are
+/// dropped off the *top* (the sprite's headroom) rather than the bottom, so a
+/// squeezed pane still shows the feet at the floor instead of cropping them
+/// off (#37).
 pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     let rows = buf.h.div_ceil(2);
-    for ry in 0..rows {
+    let skip = rows.saturating_sub(area.height as usize);
+    for ry in skip..rows {
+        let out_y = ry - skip;
         for x in 0..buf.w {
             let top = buf.px[(ry * 2) * buf.w + x];
             let bot = if ry * 2 + 1 < buf.h {
@@ -213,7 +237,7 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
                 None
             };
             let cx = area.x + x as u16;
-            let cy = area.y + ry as u16;
+            let cy = area.y + out_y as u16;
             if cx >= area.right() || cy >= area.bottom() {
                 continue;
             }
@@ -438,17 +462,20 @@ pub fn draw_herd(
     // floor, and the icon lane sits just above it. Any extra rows fall at the
     // top, blending with the pane above. The icon lane keeps overlays/`+N`/the
     // caption off the member.
-    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
-    let band_top = area.bottom().saturating_sub(band_rows);
+    //
+    // `band_top` is derived from `overlay_lane_y` (rather than recomputing
+    // `band_rows` here) so the lane and the band agree on where one ends and
+    // the other begins: a pane shorter than `STRIP_ROWS` shrinks the band
+    // instead of overlapping the lane (#37). `draw_pixels` crops a squeezed
+    // band from the top (the sprite's headroom), so the feet stay visible at
+    // the pane floor.
     let lane_y = overlay_lane_y(area);
+    let band_top = lane_y.saturating_add(1);
     let member_area = Rect {
         x: area.x,
         y: band_top,
         width: area.width,
-        // Clamped so a pane shorter than the band (below herdr's enforced
-        // minimum) crops the top of the members instead of handing
-        // `draw_pixels` a Rect that overruns the real frame buffer.
-        height: band_rows.min(area.height.saturating_sub(band_top)),
+        height: area.bottom().saturating_sub(band_top),
     };
     draw_pixels(frame, member_area, &buf);
 
@@ -510,9 +537,11 @@ pub fn draw_herd(
 }
 
 /// The row of the overlay lane that holds `+N`, the caption, and the build
-/// marker: one row above the bottom-aligned member band.
+/// marker: one row above the bottom-aligned member band. The band shrinks
+/// below [`BAND_ROWS`] whenever the pane is shorter than [`STRIP_ROWS`] (#37),
+/// so the lane always keeps its own row and can never collide with a member.
 pub fn overlay_lane_y(area: Rect) -> u16 {
-    let band_rows = MEMBER_PX_H.div_ceil(2) as u16;
+    let band_rows = BAND_ROWS.min(area.height.saturating_sub(1));
     area.bottom().saturating_sub(band_rows).saturating_sub(1)
 }
 
@@ -549,7 +578,10 @@ const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
 /// right-aligned and ochre, or nothing when `label` is `None`. When `hidden`
 /// members overflow (the `+N` marker also lives in this lane, further right) the
 /// caption stops one column short of it; either way it's truncated so it
-/// never overruns the strip width.
+/// never overruns the strip width. Measured in terminal cells, not chars —
+/// the label may carry a wide agent-kind icon (see `src/width.rs`), and a
+/// char-count budget would let a wide glyph overrun by a cell or get sliced
+/// in half.
 pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, hidden: usize) {
     let Some(label) = label else { return };
     if area.height == 0 || area.width == 0 {
@@ -567,12 +599,12 @@ pub fn draw_caption(frame: &mut Frame, area: Rect, y: u16, label: Option<&str>, 
     // starts after it. `reserved_cols` is 0 in a shipped build, leaving the
     // shipped layout unchanged.
     let left = area.x.saturating_add(marker::reserved_cols());
-    let max_chars = right.saturating_sub(left) as usize;
-    if max_chars == 0 {
+    let max_cols = right.saturating_sub(left) as usize;
+    if max_cols == 0 {
         return;
     }
-    let text: String = label.chars().take(max_chars).collect();
-    let w = text.chars().count() as u16;
+    let text = crate::width::truncate_to_width(label, max_cols);
+    let w = crate::width::display_width(&text) as u16;
     let x = right.saturating_sub(w);
     frame.buffer_mut().set_span(
         x,
@@ -828,7 +860,10 @@ pub fn focus_agent(cli: &dyn HerdrCli, terminal_id: &str) -> io::Result<()> {
 /// real tty, which a test has no way to feed.
 pub trait EventSource {
     /// Wait up to `timeout` for the next terminal event, or `None` if none
-    /// arrived. The timeout is what paces the loop at ~12 fps.
+    /// arrived. The timeout is what paces the loop, from ~12 fps down to
+    /// [`AdaptiveTick`]'s idle floor; real input still returns immediately
+    /// either way, since `event::poll` does not wait out the timeout once
+    /// something is actually there to read.
     fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
 }
 
@@ -845,9 +880,62 @@ impl EventSource for CrosstermEvents {
     }
 }
 
-/// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
-/// draws, handles mouse hover/click, and quits on `q`/Ctrl-C. Restores the
-/// terminal (raw mode, alternate screen, mouse capture) on exit.
+/// The render loop's poll timeout schedule, fastest first: ~12 fps while
+/// anything is actually changing, backing off to a floor of ~3 fps once a
+/// pane has gone idle. Capped here rather than left to grow further, so a
+/// watcher snapshot's worst-case latency (bounded by whatever tick the loop
+/// is currently blocking on — see [`AdaptiveTick`]) never grows into a
+/// visible regression.
+const TICKS: [Duration; 3] = [
+    Duration::from_millis(83),
+    Duration::from_millis(166),
+    Duration::from_millis(333),
+];
+
+/// Backs off the render loop's terminal-poll timeout across consecutive idle
+/// frames, and resets to the fastest tick the instant a frame actually
+/// redraws (issue #62). Piggybacks on the frame signature #42/#70 already
+/// computes: a redraw only happens when something on screen changed, and any
+/// watcher snapshot that carries a real status transition changes what's on
+/// screen, so no separate "did a snapshot arrive" bookkeeping is needed.
+///
+/// The one rule that makes this correct: [`AdaptiveTick::advance`] must run
+/// in the same loop iteration as the redraw it reports, strictly before that
+/// same iteration's own [`AdaptiveTick::tick`] feeds `EventSource::poll_event`.
+/// `rx` is only drained at the top of the loop, so a tick computed from the
+/// *previous* iteration's idle state — one iteration stale — would leave the
+/// loop blocking on a long-since-outdated wait right after it had every
+/// reason to expect another change soon.
+struct AdaptiveTick {
+    level: usize,
+}
+
+impl AdaptiveTick {
+    fn new() -> Self {
+        Self { level: 0 }
+    }
+
+    /// The timeout to poll with for the upcoming wait.
+    fn tick(&self) -> Duration {
+        TICKS[self.level]
+    }
+
+    /// Step the schedule for the next wait: back off one level on another
+    /// idle frame, capped at `TICKS`' slowest; snap back to the fastest the
+    /// moment a frame redraws.
+    fn advance(&mut self, redrew: bool) {
+        self.level = if redrew {
+            0
+        } else {
+            (self.level + 1).min(TICKS.len() - 1)
+        };
+    }
+}
+
+/// Render thread: adaptive tick, ~12 fps while busy backing off toward ~3 fps
+/// when idle (see [`AdaptiveTick`]). Drains snapshots, reconciles, steps the
+/// herd, draws, handles mouse hover/click, and quits on `q`/Ctrl-C. Restores
+/// the terminal (raw mode, alternate screen, mouse capture) on exit.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     rx: Receiver<Vec<Agent>>,
@@ -859,6 +947,7 @@ pub fn run(
     member_scale: usize,
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
+    agent_icon: AgentIconStyle,
 ) -> io::Result<()> {
     // Every terminal mutation below belongs to `guard`, so the `?`s here and a
     // panic inside the loop both hand the terminal back (issue #35).
@@ -906,6 +995,7 @@ pub fn run(
         sound_player.as_ref(),
         sound_claim.as_ref(),
         &mut CrosstermEvents,
+        agent_icon,
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
@@ -916,11 +1006,26 @@ pub fn run(
 }
 
 /// The hover caption for the current cursor position: the hovered member's
-/// label when the cursor is over one (`hit`), or `None` over empty strip.
+/// label when the cursor is over one (`hit`), or `None` over empty strip,
+/// prefixed with its agent-kind icon (`agent::kind_icon`) when one applies.
 /// Clearing on empty is deliberate — the name vanishes when you're not on a
-/// sheep, rather than sticking at the last one shown.
-fn next_hover(hit: Option<usize>, members: &[Member]) -> Option<String> {
-    hit.map(|i| members[i].label.clone())
+/// sheep, rather than sticking at the last one shown. Baked in here, once,
+/// rather than in either renderer: both `draw_caption` and the kitty
+/// backend's caption path already draw an opaque label string through the
+/// same lane, so this is the one place the icon needs to be added for both
+/// to show it.
+fn next_hover(
+    hit: Option<usize>,
+    members: &[Member],
+    agent_icon: AgentIconStyle,
+) -> Option<String> {
+    hit.map(|i| {
+        let m = &members[i];
+        match crate::agent::kind_icon(m.agent_kind.as_deref(), agent_icon) {
+            Some(icon) => format!("{icon} {}", m.label),
+            None => m.label.clone(),
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -936,11 +1041,12 @@ fn run_loop<B: ratatui::backend::Backend>(
     sound_player: &dyn crate::sound::SoundPlayer,
     sound_claim: &dyn crate::sound::TransitionClaim,
     events: &mut dyn EventSource,
+    agent_icon: AgentIconStyle,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
 {
-    let tick = Duration::from_millis(83); // ~12 fps
+    let mut tick = AdaptiveTick::new();
     let species_count = species.len().max(1);
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
@@ -983,14 +1089,18 @@ where
         // depends on independent processes agreeing on absolute wall-clock
         // time) is untouched.
         let sig = renderer.frame_signature(&herd, species, theme, area, now_ms, caption.as_deref());
-        if last_sig != Some(sig) {
+        let redrew = last_sig != Some(sig);
+        if redrew {
             terminal.draw(|f| {
                 renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
             })?;
             last_sig = Some(sig);
         }
+        // Same-iteration reset (#62): computed from this frame's own redraw
+        // before the wait below uses it, not the frame after.
+        tick.advance(redrew);
 
-        if let Some(ev) = events.poll_event(tick)? {
+        if let Some(ev) = events.poll_event(tick.tick())? {
             match ev {
                 Event::Key(k) => {
                     let quit = k.code == KeyCode::Char('q')
@@ -1007,7 +1117,7 @@ where
                         // caption disappears when you're not on a sheep.
                         let hit =
                             renderer.member_at_column(&herd, species, strip_w, column, now_ms);
-                        hovered = next_hover(hit, &herd.members);
+                        hovered = next_hover(hit, &herd.members, agent_icon);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
@@ -1068,8 +1178,8 @@ mod tests {
             agent: None,
             agent_status: s,
             name: None,
-            cwd: "/".into(),
-            foreground_cwd: "/".into(),
+            cwd: Some("/".into()),
+            foreground_cwd: Some("/".into()),
             workspace_id: "w".into(),
             tab_id: "t".into(),
             pane_id: "p".into(),
@@ -1094,17 +1204,39 @@ mod tests {
     #[test]
     fn hover_caption_follows_the_cursor_and_clears_over_empty_strip() {
         let herd = fixed_herd(&[AgentStatus::Idle, AgentStatus::Working]);
-        // Over a member: its label is shown.
+        // Over a member: its label is shown. This fixture's agents have no
+        // detected kind, so there is no icon to prepend.
         assert_eq!(
-            next_hover(Some(1), &herd.members),
+            next_hover(Some(1), &herd.members, AgentIconStyle::Emoji),
             Some(herd.members[1].label.clone())
         );
         // Over empty strip: the caption clears. Regression guard — a "sticky"
         // hover that kept the last name here is the bug this restores.
         assert_eq!(
-            next_hover(None, &herd.members),
+            next_hover(None, &herd.members, AgentIconStyle::Emoji),
             None,
             "moving off all sheep must hide the name"
+        );
+    }
+
+    #[test]
+    fn next_hover_prepends_the_agent_kind_icon_when_one_is_known() {
+        let mut h = Herd::new();
+        let mut a = agent("t0", AgentStatus::Idle);
+        a.agent = Some("claude".into());
+        h.reconcile(&[a], 1, NOW_MS);
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Emoji),
+            Some(format!("🤖 {}", h.members[0].label))
+        );
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Ascii),
+            Some(format!("Cl {}", h.members[0].label))
+        );
+        assert_eq!(
+            next_hover(Some(0), &h.members, AgentIconStyle::Off),
+            Some(h.members[0].label.clone()),
+            "Off shows the bare label even for a known kind"
         );
     }
 
@@ -1448,6 +1580,45 @@ mod tests {
         assert!(row0.chars().count() <= 24, "never overruns the strip width");
     }
 
+    /// Pins the caption's *cell* width, not its char count, against a wide
+    /// (2-cell) agent-kind icon at the strip edge — regression guard against
+    /// #15's original bug class: a char-count budget lets a wide glyph either
+    /// overrun the strip or get sliced in half mid-glyph. `unicode-width`
+    /// agrees with ratatui's own internal measurement (both resolve the same
+    /// pinned crate version — see `src/width.rs`), so this also pins that a
+    /// future glyph swap can't silently break truncation.
+    #[test]
+    fn caption_with_a_wide_icon_truncates_on_a_whole_cell_boundary() {
+        let label = "🤖 claude"; // icon (2 cells) + space (1) + name (6) = 9
+        // `draw_caption`'s own budget is `width - 1 (margin) - reserved_cols`;
+        // building `width` from `max_cols` this way keeps the pinned
+        // boundaries below exact whether or not the `dev-marker` feature
+        // (which makes `reserved_cols` nonzero) is enabled.
+        let reserved = marker::reserved_cols();
+        let draw_at = |max_cols: u16| -> String {
+            let width = max_cols + 1 + reserved;
+            let area = Rect::new(0, 0, width, 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| draw_caption(f, area, 0, Some(label), 0))
+                .unwrap();
+            let (row, _) = row_text_and_fg(terminal.backend().buffer(), 0);
+            row.trim().to_string()
+        };
+        // Room for the whole caption (9 cells of content).
+        // The wide icon's own second cell reads back as a space (ratatui
+        // resets it — see `Buffer::set_stringn`), so the reconstructed
+        // per-cell string carries two spaces here though only one is a real
+        // char in the source label.
+        assert_eq!(draw_at(9), "🤖  claude");
+        // Exactly room for the icon's 2 cells and nothing else: the space and
+        // name are dropped whole, not the icon sliced down to 1 cell.
+        assert_eq!(draw_at(2), "🤖", "only the icon fits; the name drops whole");
+        // One cell too narrow even for the icon: draw nothing rather than a
+        // corrupted half-glyph.
+        assert_eq!(draw_at(1), "", "too narrow for the icon: nothing is drawn");
+    }
+
     /// A dev build has to answer "which build is in this pane?" at a glance,
     /// so the marker takes the left of the overlay lane the caption already
     /// shares with `+N` on the right.
@@ -1702,6 +1873,67 @@ mod tests {
         terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
+    }
+
+    #[test]
+    fn draw_herd_shows_feet_at_the_floor_of_the_shipped_five_row_strip() {
+        // The shipped strip (config.rs's `strip_rows: 5`, place.rs's
+        // `TARGET_ROWS: 5`) is shorter than the band the half-block renderer
+        // needs (#37): the sheep loses its headroom, cropped to fit, but a
+        // pane this short must still show the member's feet at the pane
+        // floor, and the overlay lane (row 0) must never collide with the
+        // band below it. (Kitty users don't pay this cost: `member_rows`
+        // derives its band from the pane it's given, so `Auto` picking kitty
+        // is unaffected either way.)
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        let bottom = rows.last().expect("at least one row");
+        assert!(
+            bottom.contains('▀') || bottom.contains('▄'),
+            "the bottom row must show the member's feet, not cropped-off blank space: {bottom:?}"
+        );
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the overlay lane (row 0) must hold no member pixels, even when the pane is short: {:?}",
+            rows[0]
+        );
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn draw_herd_shows_the_whole_band_uncropped_at_strip_rows() {
+        // A half-block user who sets `strip_rows = render::STRIP_ROWS` (the
+        // documented tradeoff for the full band) gets the entire member drawn
+        // with no cropping at all: every half-block row of the band, plus its
+        // own untouched overlay lane row above it.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Working]);
+        let mut terminal = Terminal::new(TestBackend::new(60, STRIP_ROWS)).unwrap();
+        terminal
+            .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .unwrap();
+        let rows = rows_of(terminal.backend());
+        assert_eq!(rows.len(), STRIP_ROWS as usize);
+        let bottom = rows.last().expect("at least one row");
+        assert!(
+            bottom.contains('▀') || bottom.contains('▄'),
+            "the bottom row must show the member's feet: {bottom:?}"
+        );
+        assert!(
+            !rows[0].contains('▀') && !rows[0].contains('▄'),
+            "the overlay lane (row 0) must hold no member pixels: {:?}",
+            rows[0]
+        );
+        let band_rows = &rows[1..];
+        assert!(
+            band_rows.iter().any(|r| r.contains('▀') || r.contains('▄')),
+            "the band (every row below the lane) must actually be used"
+        );
     }
 
     /// Total non-transparent pixels in `HAT_ROWS` — how many hat pixels should
@@ -2154,9 +2386,130 @@ mod tests {
             &SilentPlayer,
             &AlwaysClaims,
             &mut events,
+            AgentIconStyle::Emoji,
         )
         .expect("the scripted loop quits cleanly");
         renderer
+    }
+
+    // ---- issue #62: adaptive tick -------------------------------------------
+
+    #[test]
+    fn adaptive_tick_backs_off_on_idle_frames_and_caps_at_the_slowest_level() {
+        let mut t = AdaptiveTick::new();
+        assert_eq!(t.tick(), TICKS[0]);
+        t.advance(false);
+        assert_eq!(t.tick(), TICKS[1], "backs off after one idle frame");
+        t.advance(false);
+        assert_eq!(
+            t.tick(),
+            TICKS[2],
+            "backs off again after a second idle frame"
+        );
+        t.advance(false);
+        assert_eq!(
+            t.tick(),
+            TICKS[2],
+            "stays capped rather than backing off further"
+        );
+    }
+
+    #[test]
+    fn adaptive_tick_resets_to_the_fastest_level_as_soon_as_a_frame_redraws() {
+        let mut t = AdaptiveTick::new();
+        t.advance(false);
+        t.advance(false);
+        assert_eq!(t.tick(), TICKS[2], "backed off to the capped level");
+        t.advance(true);
+        assert_eq!(
+            t.tick(),
+            TICKS[0],
+            "a redraw resets the very next wait to the fastest tick"
+        );
+    }
+
+    /// Records every timeout `run_loop` asks `poll_event` for, and — right
+    /// after the call at `inject_after` — sends `injected` on `tx`. That
+    /// models a watcher snapshot landing while the loop is off waiting on
+    /// that call; it sits in the channel until `run_loop` drains `rx` at the
+    /// top of the very next iteration, whose own wait is what issue #62
+    /// requires to already be back at the fastest tick.
+    struct TimingEvents {
+        tx: std::sync::mpsc::Sender<Vec<Agent>>,
+        inject_after: usize,
+        injected: Vec<Agent>,
+        timeouts: Rc<RefCell<Vec<Duration>>>,
+        len: usize,
+    }
+
+    impl EventSource for TimingEvents {
+        fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+            let i = self.timeouts.borrow().len();
+            self.timeouts.borrow_mut().push(timeout);
+            if i == self.inject_after {
+                self.tx
+                    .send(self.injected.clone())
+                    .expect("the receiver is still alive");
+            }
+            if i + 1 >= self.len {
+                Ok(Some(Event::Key(KeyCode::Char('q').into())))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn a_status_change_resets_the_wait_in_the_same_iteration_it_is_drained() {
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(40, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 40, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = CountingRenderer::default();
+        let timeouts = Rc::new(RefCell::new(Vec::new()));
+        let mut events = TimingEvents {
+            tx,
+            // Back off through every level (idle for a few frames), then have
+            // the Blocked snapshot land while the loop waits on this call.
+            inject_after: 4,
+            injected: vec![agent("t0", Blocked)],
+            timeouts: Rc::clone(&timeouts),
+            len: 6,
+        };
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true, // reduced motion: only the status change should move anything
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &AlwaysClaims,
+            &mut events,
+            AgentIconStyle::Emoji,
+        )
+        .expect("the scripted loop quits cleanly");
+
+        assert_eq!(
+            timeouts.borrow().as_slice(),
+            [TICKS[0], TICKS[1], TICKS[2], TICKS[2], TICKS[2], TICKS[0]],
+            "the wait backs off while idle, then snaps back to the fastest tick \
+             in the same iteration the Blocked snapshot is drained, not the one after"
+        );
     }
 
     #[test]
@@ -2397,6 +2750,7 @@ mod tests {
             &sound_player,
             &AlwaysClaims,
             &mut events,
+            AgentIconStyle::Emoji,
         )
         .expect("the scripted loop quits cleanly");
 
@@ -2460,6 +2814,7 @@ mod tests {
             &SilentPlayer,
             &AlwaysClaims,
             &mut events,
+            AgentIconStyle::Emoji,
         )
         .expect("the scripted loop quits cleanly");
 
@@ -2516,6 +2871,7 @@ mod tests {
             &SilentPlayer,
             &AlwaysClaims,
             &mut events,
+            AgentIconStyle::Emoji,
         )
         .expect("the scripted loop quits cleanly");
 

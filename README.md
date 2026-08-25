@@ -127,7 +127,7 @@ an opinionated default:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `true` | Whether the `control` watchdog runs. |
-| `strip_rows` | int | `5` | Strip height, in rows (1 icon lane + 3 pixel rows + 1 caption). |
+| `strip_rows` | int | `5` | Strip height, in rows. Slim on purpose: a herd is a glanceable status line, not the focus. |
 | `sweep_interval_ms` | int | `3000` | Controller poll cadence (ms). |
 | `reduced_motion` | bool | `false` | Calm herd — no wandering or bounce. |
 | `renderer` | `auto` \| `kitty` \| `half-block` | `auto` | Which rendering backend to draw the herd with. |
@@ -135,9 +135,17 @@ an opinionated default:
 | `sounds_enabled` | bool | `false` | Master switch for notification sounds. Off out of the box. |
 | `sound_<status>_enabled` | bool | `true` for `blocked`, else `false` | Per-status toggle. `<status>` is `idle`, `working`, `blocked`, or `done`. |
 | `sound_<status>_path` | string | unset | Sound file to play on that status's transition. No bundled sounds ship, so a status plays nothing until you point it at a file. |
+| `agent_icon` | `emoji` \| `ascii` \| `off` | `emoji` | How to show the detected agent kind (Claude, Codex, ...) next to the name in the hover caption. `ascii` swaps in a two-letter tag for a terminal or config that doesn't want wide emoji glyphs; `off` shows no icon. |
 
 `strip_rows` applies to the always-on `control` watchdog; the on-demand
 `herdr-herd place` uses a fixed height.
+
+The kitty backend adapts its own band to whatever pane it's given, so `auto`
+picking kitty (wherever the terminal supports it) is unaffected by
+`strip_rows`. The half-block backend's band has a fixed pixel height, so at
+the default 5 rows it shows the member cropped, losing headroom above the
+head rather than the feet. A half-block user who wants the whole member drawn
+uncropped should raise `strip_rows` to 10 (9 band rows + 1 overlay lane row).
 
 Example `config.toml`:
 

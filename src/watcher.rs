@@ -502,6 +502,39 @@ mod tests {
         }
     }
 
+    /// A `Send` clock that returns each of `values` in order, then freezes at
+    /// the last one forever. Unlike [`StepClock`], this never advances on its
+    /// own: a test that must distinguish "due because of window A" from "due
+    /// because of window B" cannot use an ever-advancing clock, since `watch`'s
+    /// idle branch has no real sleep and will eventually trip *any* window,
+    /// however large, defeating the distinction (see
+    /// `a_pane_focused_wire_line_reaches_watch_via_the_fast_focus_window`).
+    struct ScriptedClock {
+        values: Vec<u64>,
+        next: std::sync::Mutex<usize>,
+    }
+
+    impl ScriptedClock {
+        fn new(values: Vec<u64>) -> Self {
+            assert!(!values.is_empty());
+            Self {
+                values,
+                next: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl Clock for ScriptedClock {
+        fn now_ms(&self) -> u64 {
+            let mut i = self.next.lock().unwrap();
+            let v = self.values[(*i).min(self.values.len() - 1)];
+            if *i + 1 < self.values.len() {
+                *i += 1;
+            }
+            v
+        }
+    }
+
     /// One scripted `recv_line` outcome for [`ScriptedSocket`].
     #[derive(Clone)]
     enum SocketOutcome {
@@ -669,5 +702,72 @@ mod tests {
 
         drop(rx);
         join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    /// #75: the fast focus window only protects the hat if a real wire line
+    /// actually reaches it. Every other test of the fast path builds
+    /// `EventClass::Focus` by hand, so it would stay green even if
+    /// `classify_event` mapped `pane_focused` to the wrong class entirely
+    /// (herdr's wire names are underscored; `subscribe_request`'s subscription
+    /// types are dotted, and it is easy to get that backwards).
+    ///
+    /// Ported from a `drain_events`-based test (issue #49: `drain_events` is a
+    /// test-only reimplementation of this same debounce rule and has been
+    /// deleted) to drive the real `watch()` loop instead, which is a strictly
+    /// stronger proof: it shows the wire line reaches the fast path through
+    /// production code, not through a seam that mirrors it.
+    ///
+    /// `now_ms` is pinned to an exact, non-advancing sequence (`ScriptedClock`,
+    /// not the auto-advancing `StepClock`): with no real sleep on the idle
+    /// path, an ever-advancing clock eventually trips *any* window, focus,
+    /// structural or the slow poll, so it can't tell them apart. Freezing the
+    /// clock the instant this scenario is decided means a second snapshot can
+    /// only arrive if the 100ms focus window closed it, not the 750ms
+    /// structural one or the 2500ms slow poll.
+    ///
+    /// Verified against the exact mutation issue #75 names — replacing
+    /// `classify_event`'s `name.ends_with("_focused")` branch with `false` —
+    /// which routes this line to `Structural` and makes the assertion below
+    /// time out (the clock freezes at 150ms, short of the 750ms structural
+    /// close), while it passes against the real function.
+    #[test]
+    fn a_pane_focused_wire_line_reaches_watch_via_the_fast_focus_window() {
+        let socket = ScriptedSocket::new(vec![
+            SocketOutcome::Line(r#"{"event":"pane_focused"}"#),
+            // Closes right after, so the loop settles into a real (bounded)
+            // `thread::sleep` once the clock freezes, instead of a tight
+            // CPU-spinning idle loop for the rest of the test binary's life.
+            SocketOutcome::Closed,
+        ]);
+        // call 1 (before the loop): the initial snapshot, t=0.
+        // call 2: on_event(Focus, 50) for the pane_focused line -> due_at=100.
+        // call 3: the same iteration's due-check at t=50 -> not due yet.
+        // call 4 (next iteration, right as the socket closes): due-check at
+        // t=150 -> due only if the 100ms focus window applies; frozen here
+        // forever after, so the 750ms structural window and the 2500ms slow
+        // poll (which do not care about t=150) can never fire instead.
+        let clock = ScriptedClock::new(vec![0, 50, 50, 150]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Not joined: once the clock freezes at 150ms and the socket has
+        // closed, due() is false forever, so the thread just sleeps
+        // (Timings::default()'s slow_ms) harmlessly until the test binary
+        // exits, the same as a real watcher whose pane was simply killed.
+        let _handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(clock),
+            tx,
+            Timings::default(),
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        let focused = rx.recv_timeout(RECV_TIMEOUT).expect(
+            "a pane_focused line must be due within the 100ms focus window; if \
+             it fell back to the 750ms structural window (or the 2500ms slow \
+             poll) the clock freezes at 150ms and this would never arrive",
+        );
+        assert_eq!(focused.len(), 1);
     }
 }

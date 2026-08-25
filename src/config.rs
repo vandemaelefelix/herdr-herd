@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::agent::AgentStatus;
+use crate::agent::{AgentIconStyle, AgentStatus};
 
 /// Which rendering backend to use. `Auto` probes for kitty support and falls
 /// back to half-blocks.
@@ -82,7 +82,13 @@ impl SoundConfig {
 pub struct Config {
     /// Whether the `control` watchdog runs at all.
     pub enabled: bool,
-    /// Strip height in rows.
+    /// Strip height in rows. Defaults to a slim 5, deliberately shorter than
+    /// [`crate::render::STRIP_ROWS`] (the half-block band's full height): the
+    /// kitty backend adapts its own band to whatever pane it's given, so a
+    /// kitty user pays nothing for the slim default, while a half-block user
+    /// sees the member cropped down to fit, losing headroom rather than feet
+    /// (#37). A half-block user who wants the full band, uncropped, should
+    /// set this to `render::STRIP_ROWS` explicitly.
     pub strip_rows: u16,
     /// Controller poll cadence in milliseconds.
     pub sweep_interval_ms: u64,
@@ -95,6 +101,9 @@ pub struct Config {
     pub member_scale: usize,
     /// Notification-sound settings.
     pub sounds: SoundConfig,
+    /// How to render the detected agent kind in the hover caption. No `Auto`:
+    /// emoji rendering can't be reliably probed, so this is a plain choice.
+    pub agent_icon: AgentIconStyle,
 }
 
 impl Default for Config {
@@ -113,6 +122,10 @@ impl Default for Config {
             // for it in transmission bursts on every cold frame and resize.
             member_scale: 4,
             sounds: SoundConfig::default(),
+            // Felix's own call (#15): emoji, distinct at a glance, with the
+            // ASCII tag table kept as an explicit opt-out for a terminal or
+            // config that doesn't want wide multi-cell glyphs.
+            agent_icon: AgentIconStyle::Emoji,
         }
     }
 }
@@ -125,7 +138,7 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Config {
         let mut cfg = Config::default();
         for raw in s.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
+            let line = strip_comment(raw).trim();
             if line.is_empty() {
                 continue;
             }
@@ -162,6 +175,13 @@ impl Config {
                         _ => RendererKind::Auto, // "auto" or anything unrecognized
                     };
                 }
+                "agent_icon" => {
+                    cfg.agent_icon = match val {
+                        "ascii" => AgentIconStyle::Ascii,
+                        "off" | "none" => AgentIconStyle::Off,
+                        _ => AgentIconStyle::Emoji, // "emoji" or anything unrecognized
+                    };
+                }
                 "member_scale" => {
                     if let Ok(v) = val.parse::<usize>() {
                         cfg.member_scale = v.clamp(1, 24);
@@ -189,6 +209,28 @@ impl Config {
         }
         cfg
     }
+}
+
+/// `line` up to its first `#` that is outside a quoted string, so a value
+/// like `sound_blocked_path = "/Users/felix/Music/#1 alert.wav"` keeps its
+/// `#` instead of being truncated as if the rest were a comment.
+fn strip_comment(line: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match in_quote {
+            Some(q) => {
+                if c == q {
+                    in_quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => in_quote = Some(c),
+                '#' => return &line[..i],
+                _ => {}
+            },
+        }
+    }
+    line
 }
 
 /// Set `status`'s enabled flag from a raw config value; an unparsable value
@@ -294,6 +336,7 @@ mod tests {
                 renderer: RendererKind::Auto,
                 member_scale: 4,
                 sounds: SoundConfig::default(),
+                agent_icon: AgentIconStyle::Emoji,
             }
         );
     }
@@ -313,6 +356,7 @@ mod tests {
                 renderer: RendererKind::Auto,
                 member_scale: 4,
                 sounds: SoundConfig::default(),
+                agent_icon: AgentIconStyle::Emoji,
             }
         );
     }
@@ -375,6 +419,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_icon_defaults_to_emoji() {
+        assert_eq!(Config::default().agent_icon, AgentIconStyle::Emoji);
+    }
+
+    #[test]
+    fn parses_agent_icon_ascii_and_off() {
+        assert_eq!(
+            Config::from_toml_str("agent_icon = ascii\n").agent_icon,
+            AgentIconStyle::Ascii
+        );
+        assert_eq!(
+            Config::from_toml_str("agent_icon = off\n").agent_icon,
+            AgentIconStyle::Off
+        );
+    }
+
+    #[test]
+    fn unknown_agent_icon_value_falls_back_to_emoji() {
+        let c = Config::from_toml_str("agent_icon = hologram\n");
+        assert_eq!(c.agent_icon, AgentIconStyle::Emoji);
+    }
+
+    #[test]
     fn sounds_default_to_quiet_with_blocked_pre_armed() {
         let c = Config::default();
         assert!(!c.sounds.enabled, "master switch is off out of the box");
@@ -404,6 +471,21 @@ mod tests {
         );
         assert!(c.sounds.done.enabled);
         assert_eq!(c.sounds.done.path, Some(PathBuf::from("/home/me/done.wav")));
+    }
+
+    /// A `#` inside a quoted path is not a comment: naive `split('#')`
+    /// truncation would silence this path to a directory, and `afplay`
+    /// spawning successfully against a directory would report "played" with
+    /// no sound and no diagnostic.
+    #[test]
+    fn a_hash_inside_a_quoted_sound_path_is_not_stripped_as_a_comment() {
+        let c = Config::from_toml_str(
+            "sound_blocked_path = \"/Users/felix/Music/#1 alert.wav\" # trailing comment\n",
+        );
+        assert_eq!(
+            c.sounds.blocked.path,
+            Some(PathBuf::from("/Users/felix/Music/#1 alert.wav"))
+        );
     }
 
     #[test]

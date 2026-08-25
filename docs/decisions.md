@@ -503,3 +503,122 @@ properties are actually observable. Gate green: 273 tests, clippy clean, fmt
 clean. NOT verified live in a multi-pane session with a real terminal — the
 id-disjointness and the `d=I` frees are proven at the escape-sequence level
 only.
+
+## 2026-08-25 — Orphaned Zz icon (#64): the cursor is shared too; and #45's crop churn
+
+**Context:** Issue #64, caught live: a strip with 2 idle + 1 done member across
+two workspaces (two `herdr-herd render` processes, one session) rendered one
+idle member correctly (sheep + `Zz`) and the other with only the floating
+`Zz`, no sheep underneath. The issue's own working hypothesis — the body and
+icon caches/placements, tracked independently, drift apart under the #30
+TTL/cap eviction or the #29 id partitioning — was explicitly filed as
+unconfirmed. Issue #45 (measured on the same 0.2.1 review): `render_members`
+re-creates every member's and every icon's placement unconditionally, every
+frame, even though 52%/62%/19% of idle/done/working frames leave the
+placement completely unchanged.
+
+**#64 investigation — the eviction hypothesis is refuted.** Reading
+`render_members` end to end: a visible member's body and icon placements are
+written unconditionally, back to back, in the same loop iteration — the only
+way to skip one is a `continue` (unresolvable species/state) that skips both.
+`evict_stale_images` runs once at the end of the call, by which point every
+visible member's cache entry has already been touched (`last_used =
+self.frame`) this frame, and `evict_from` explicitly exempts anything touched
+on the current frame from both the TTL and the cap. So a currently-visible
+member's body image cannot be evicted out from under a still-live icon
+placement within one pane — body and icon are always created and torn down
+as a pair. A new regression test
+(`every_icon_placement_has_a_body_placement_underneath_it_across_many_frames`)
+drives one renderer through ~300 frames of status/focus/time changes and
+asserts every `terminal_id` in `icon_placements` also has one in
+`placements`; it holds throughout, and pins the invariant against a future
+regression. This rules the single-pane caching path out as the mechanism.
+
+**#64 — the actual mechanism.** Kitty's `a=p` placement command never carries
+an explicit screen position (`kitty::place_cropped` passes no `X=`/`Y=` key),
+so a placement lands at *the terminal's current cursor*, set immediately
+beforehand by a raw `\x1b[{row};{col}H`. The cursor is a single piece of
+terminal-global state, and (per the 2026-08-19 entry above) every strip pane
+is its own process forwarding escapes to the same one outer terminal. If
+another pane's own cursor-move escape lands, via herdr's forwarding, between
+this pane's cursor-move and its place command — which were two separate
+`write_all` calls — the placement renders wherever that other pane just left
+the cursor, not where this pane intended. That reproduces the exact
+asymmetry reported: each member's body-placement pair and icon-placement pair
+independently risk this race on every frame, so one member landing correctly
+while its neighbour's body silently lands elsewhere (or is overdrawn) is
+exactly what an intermittent, per-placement race predicts — while the
+in-memory bookkeeping (verified above) stays consistent throughout, which is
+why this never showed up as a cache-state bug.
+
+**Evidence for that mechanism, not just plausibility:**
+- The 2026-07-24 kitty-graphics-backend entry already records that herdr
+  "vendors `libghostty-vt`, with first-class kitty-graphics support
+  (including the unicode-placeholder / virtual-placement feature that
+  survives a multiplexer)" — herdr itself distinguishes a placement method
+  that survives being multiplexed across panes from one that does not, and
+  plain cursor-relative placement (what this renderer uses) is the one that
+  carries no such guarantee.
+- The 2026-08-19 entry for #67 explicitly flags that its cross-pane fixes
+  were "NOT verified live in a multi-pane session with a real terminal" —
+  #64 is exactly that untested scenario surfacing a real bug, in a class
+  (shared cursor) #67 never addressed (it partitioned image ids and deletes,
+  not cursor position).
+- #64's own repro context is two panes/processes against one session,
+  matching a cross-process race rather than a single-process cache bug.
+- The structural code reading above independently rules out the single-pane
+  eviction theory.
+
+**What was not verified.** This environment cannot attach to a real terminal
+or to herdr's actual pane-forwarding implementation, so the interleaving
+itself — where it splits, how often — was not reproduced live. This is the
+explanation best supported by the code and by herdr's own documented
+distinction between placement methods, not a live-confirmed root cause.
+
+**#64 fix — a narrowing, not a close.** The cursor-move and the placement
+escape are now written as a single `write_all` for both the body and the
+icon. This is strictly better (fewer syscalls, a narrower window) but does
+not close the race: herdr's forwarding loop reads from each pane's pty and
+relays to the outer terminal independently of our write boundaries, and can
+still interleave two complete escape sequences from different panes at any
+point — including between our now-combined pair — if that relay is not
+itself escape-aware. Fully closing it needs either a herdr-side atomicity
+guarantee per forwarded escape sequence, or moving kitty placement onto the
+position-independent virtual-placement/Unicode-placeholder mechanism herdr
+already documents support for — which means printing a placeholder glyph
+through the ratatui `Frame` buffer instead of out-of-band, the architectural
+line this renderer's own module doc currently draws on purpose. That decision
+is not this PR's to make unilaterally, so #64 is not claimed closed here —
+it stays open with this finding recorded.
+
+**#45 fix — independent, and it also narrows #64's window.** `crop_rect`/
+`member_crop` rounded the motion offset *after* multiplying by `scale`, so a
+sub-sprite-pixel wobble (breathing's <=0.5px amplitude) changed the crop on
+nearly every frame even though nothing moved visibly. Quantising `dx`/`dy`
+to whole sprite pixels first — matching `render::band_ox`/`band_oy`, the
+half-block path's existing approach — fixes that directly. Combined with
+widening `placements`/`icon_placements` to a full signature (crop, cols,
+rows, z, row, col) and skipping the emit entirely when it matches what is
+already on screen, an unchanged frame for an idle/done member now emits
+nothing at all: no cursor-move, no place, no delete. `draw_overlay_text`'s
+unconditional per-frame clear+redraw of the name row got the same treatment,
+guarded on `(row, width, hover_label, hidden)`. This is a genuine fix for
+#45's measured churn on its own terms. Its relationship to #64 is real but
+indirect: an idle pane now emits close to nothing per frame instead of a
+steady stream of cursor-move+place pairs, so there are correspondingly fewer
+chances for another pane's escapes to land inside one of ours — it changes
+the race's frequency, not its mechanism.
+
+**Trade-offs, deliberately accepted:**
+- **The single-write mitigation for #64 narrows, not closes, the race** —
+  stated as such above and in the PR, not claimed as a fix.
+- **Test coverage for #64 is structural, not live.** Nothing here drives two
+  real processes through a real multiplexed pty; the regression test pins
+  the in-memory invariant (bodies and icons always paired), which is the part
+  that was never actually broken — the terminal-level race is the part that
+  remains unconfirmed live.
+
+**Verification:** `cargo test` (366, up from 364 on `main`; two new regression
+tests), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — all
+clean. NOT verified live in a real kitty-capable terminal with two panes —
+same caveat as the 2026-08-19 entry above.
