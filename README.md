@@ -135,6 +135,7 @@ an opinionated default:
 | `sounds_enabled` | bool | `false` | Master switch for notification sounds. Off out of the box. |
 | `sound_<status>_enabled` | bool | `true` for `blocked`, else `false` | Per-status toggle. `<status>` is `idle`, `working`, `blocked`, or `done`. |
 | `sound_<status>_path` | string | unset | Sound file to play on that status's transition. No bundled sounds ship, so a status plays nothing until you point it at a file. |
+| `agent_icon` | `emoji` \| `ascii` \| `off` | `emoji` | How to show the detected agent kind (Claude, Codex, ...) next to the name in the hover caption. `ascii` swaps in a two-letter tag for a terminal or config that doesn't want wide emoji glyphs; `off` shows no icon. |
 
 `strip_rows` applies to the always-on `control` watchdog; the on-demand
 `herdr-herd place` uses a fixed height.

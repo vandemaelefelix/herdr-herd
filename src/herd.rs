@@ -173,6 +173,7 @@ impl Herd {
                 }
                 p.status = a.agent_status;
                 p.label = a.display_label();
+                p.agent_kind = a.agent.clone();
                 p.focused = is_focused(&a.terminal_id);
             } else {
                 let mut member = Member::new(
@@ -181,6 +182,7 @@ impl Herd {
                     a.agent_status,
                 );
                 member.label = a.display_label();
+                member.agent_kind = a.agent.clone();
                 member.focused = is_focused(&a.terminal_id);
                 self.members.push(member);
             }
@@ -289,6 +291,19 @@ mod tests {
         a2.name = Some("frontend".into());
         h.reconcile(&[a2], 1, 0);
         assert_eq!(h.members[0].label, "frontend");
+    }
+
+    #[test]
+    fn reconcile_carries_the_agent_kind_onto_new_and_surviving_members() {
+        let mut h = Herd::new();
+        h.reconcile(&[agent("a", AgentStatus::Idle)], 1, 0);
+        assert_eq!(h.members[0].agent_kind, Some("claude".into()));
+
+        // A survivor whose detected kind changes (or clears) picks that up too.
+        let mut a2 = agent("a", AgentStatus::Idle);
+        a2.agent = None;
+        h.reconcile(&[a2], 1, 0);
+        assert_eq!(h.members[0].agent_kind, None);
     }
 
     #[test]

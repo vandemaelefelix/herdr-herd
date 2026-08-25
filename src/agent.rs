@@ -15,6 +15,70 @@ pub enum AgentStatus {
     Unknown,
 }
 
+/// How to render the detected agent kind next to a hover caption's name.
+/// `Ascii` is the safe fallback for a terminal (or a user) that doesn't want
+/// wide multi-cell emoji; `Off` shows no icon at all. There is deliberately
+/// no `Auto` — emoji rendering support isn't something a terminal can be
+/// reliably probed for, so the choice is a plain config knob, not detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentIconStyle {
+    Emoji,
+    Ascii,
+    Off,
+}
+
+/// Every agent kind herdr's own config template enumerates as an accepted
+/// `agent` value (its `cjk_ime_agents` allow-list comment) — the authoritative
+/// set of strings herdr can detect and report, not a guess. `(kind, emoji,
+/// ascii tag)`. Every emoji here is a single non-CJK codepoint outside any
+/// variation-selector-dependent range, so `unicode-width` reports it as 2
+/// cells without relying on a following U+FE0F (see `src/width.rs`).
+const KNOWN_KINDS: &[(&str, &str, &str)] = &[
+    ("claude", "🤖", "Cl"),
+    ("codex", "🦊", "Cx"),
+    ("gemini", "🐙", "Ge"),
+    ("cursor", "👻", "Cu"),
+    ("devin", "🌀", "Dv"),
+    ("cline", "🚀", "Cn"),
+    ("opencode", "🦉", "Oc"),
+    ("copilot", "🐝", "Co"),
+    ("kimi", "🦎", "Ki"),
+    ("kiro", "🐢", "Kr"),
+    ("droid", "🦄", "Dr"),
+    ("amp", "🐬", "Am"),
+    ("grok", "🦋", "Gr"),
+    ("hermes", "🐧", "Hm"),
+    ("kilo", "🦖", "Kl"),
+    ("qodercli", "🐳", "Qc"),
+    ("qoder", "🦁", "Qo"),
+    ("pi", "🐸", "Pi"),
+];
+
+/// The generic fallback glyph for a non-empty `kind` this table doesn't
+/// recognize yet (herdr can add a new detected kind after this ships) — kept
+/// distinct from every entry in [`KNOWN_KINDS`] in both styles.
+const FALLBACK_EMOJI: &str = "❓";
+const FALLBACK_ASCII: &str = "?";
+
+/// The glyph to show next to a hover caption's name for a detected agent
+/// `kind`, in the given `style`. `None` when `kind` is absent or blank (no
+/// agent detected — nothing to convey) or when `style` is `Off`.
+pub fn kind_icon(kind: Option<&str>, style: AgentIconStyle) -> Option<&'static str> {
+    if style == AgentIconStyle::Off {
+        return None;
+    }
+    let kind = kind?.trim();
+    if kind.is_empty() {
+        return None;
+    }
+    let found = KNOWN_KINDS.iter().find(|(k, _, _)| *k == kind);
+    Some(if style == AgentIconStyle::Ascii {
+        found.map_or(FALLBACK_ASCII, |(_, _, tag)| tag)
+    } else {
+        found.map_or(FALLBACK_EMOJI, |(_, emoji, _)| emoji)
+    })
+}
+
 /// One agent, as reported in `result.agents[]`. `agent` and `name` are absent
 /// for `unknown`-status panes, so both are optional. `cwd` and
 /// `foreground_cwd` are nullable in herdr's own schema, so they are optional
@@ -238,5 +302,64 @@ mod tests {
         );
         a.hover_label = Some("home › shell".to_string());
         assert_eq!(a.display_label(), "home › shell");
+    }
+
+    #[test]
+    fn kind_icon_maps_known_kinds_to_distinct_glyphs_in_each_style() {
+        assert_eq!(kind_icon(Some("claude"), AgentIconStyle::Emoji), Some("🤖"));
+        assert_eq!(kind_icon(Some("codex"), AgentIconStyle::Emoji), Some("🦊"));
+        assert_ne!(
+            kind_icon(Some("claude"), AgentIconStyle::Emoji),
+            kind_icon(Some("codex"), AgentIconStyle::Emoji)
+        );
+        assert_eq!(kind_icon(Some("claude"), AgentIconStyle::Ascii), Some("Cl"));
+        assert_eq!(kind_icon(Some("codex"), AgentIconStyle::Ascii), Some("Cx"));
+        assert_ne!(
+            kind_icon(Some("claude"), AgentIconStyle::Ascii),
+            kind_icon(Some("codex"), AgentIconStyle::Ascii)
+        );
+    }
+
+    #[test]
+    fn kind_icon_every_known_kind_has_a_distinct_glyph_per_style() {
+        let emoji: Vec<_> = KNOWN_KINDS
+            .iter()
+            .map(|(k, _, _)| kind_icon(Some(k), AgentIconStyle::Emoji).unwrap())
+            .collect();
+        let ascii: Vec<_> = KNOWN_KINDS
+            .iter()
+            .map(|(k, _, _)| kind_icon(Some(k), AgentIconStyle::Ascii).unwrap())
+            .collect();
+        for glyphs in [&emoji, &ascii] {
+            let unique: std::collections::HashSet<_> = glyphs.iter().collect();
+            assert_eq!(
+                unique.len(),
+                glyphs.len(),
+                "every known kind must render distinctly: {glyphs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_icon_falls_back_to_a_neutral_glyph_for_an_unrecognized_kind() {
+        assert_eq!(
+            kind_icon(Some("some-future-agent"), AgentIconStyle::Emoji),
+            Some(FALLBACK_EMOJI)
+        );
+        assert_eq!(
+            kind_icon(Some("some-future-agent"), AgentIconStyle::Ascii),
+            Some(FALLBACK_ASCII)
+        );
+    }
+
+    #[test]
+    fn kind_icon_shows_nothing_when_no_agent_was_detected() {
+        assert_eq!(kind_icon(None, AgentIconStyle::Emoji), None);
+        assert_eq!(kind_icon(Some("   "), AgentIconStyle::Emoji), None);
+    }
+
+    #[test]
+    fn kind_icon_off_style_shows_nothing_even_for_a_known_kind() {
+        assert_eq!(kind_icon(Some("claude"), AgentIconStyle::Off), None);
     }
 }

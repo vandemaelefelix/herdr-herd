@@ -818,8 +818,13 @@ impl KittyRenderer {
         }
         if let Some(label) = hover_label {
             let max = width.saturating_sub(1 + counter_w + crate::marker::reserved_cols() as usize);
-            let text: String = label.chars().take(max).collect();
-            let tw = text.chars().count();
+            // Measured in terminal cells, not chars: the label may carry a
+            // wide agent-kind icon (see `src/width.rs`), and this path writes
+            // raw escapes with no buffer to clip it for us the way ratatui
+            // does on the half-block side — a char-count budget here would
+            // let a wide glyph overrun the strip or collide with `+N`.
+            let text = crate::width::truncate_to_width(label, max);
+            let tw = crate::width::display_width(&text);
             // Right-aligned, ochre, with a 1-column margin from the edge — and
             // clear of `+N` by a further column when the strip is overflowing.
             let col = width.saturating_sub(tw + counter_w).max(1);
@@ -1544,6 +1549,39 @@ mod tests {
             caption_end < counter_col,
             "the caption ({caption_col}..{caption_end}) must stop clear of `+3` at {counter_col}"
         );
+    }
+
+    /// Pins the caption's *cell* width, not its char count, against a wide
+    /// (2-cell) agent-kind icon at the strip edge. Unlike the half-block path
+    /// there is no ratatui buffer clipping this for us — a char-count budget
+    /// here would let a wide glyph overrun the strip or land on top of `+N`.
+    /// Exercises `draw_overlay_text` directly rather than the full `draw`
+    /// pipeline, since only this column math is under test.
+    #[test]
+    fn caption_with_a_wide_icon_truncates_on_a_whole_cell_boundary() {
+        let label = "🤖 claude"; // icon (2 cells) + space (1) + name (6) = 9
+        // `draw_overlay_text`'s own budget is `width - 1 (margin) -
+        // reserved_cols`; building `width` from `max_cols` this way keeps the
+        // pinned boundaries below exact whether or not the `dev-marker`
+        // feature (which makes `reserved_cols` nonzero) is enabled.
+        let reserved = crate::marker::reserved_cols();
+        let draw_at = |max_cols: u16| -> String {
+            let width = max_cols + 1 + reserved;
+            let sink = SharedSink::default();
+            let mut r = KittyRenderer::for_test(sink.clone(), 4);
+            let area = Rect::new(0, 0, width, 10);
+            r.draw_overlay_text(area, Some(label), 0).unwrap();
+            let (_col, text) = lane_run(&sink.take(), "\x1b[38;2;217;164;65m");
+            text
+        };
+        // Room for the whole caption (9 cells of content).
+        assert_eq!(draw_at(9), "🤖 claude");
+        // Exactly room for the icon's 2 cells and nothing else: the space and
+        // name are dropped whole, not the icon sliced down to 1 cell.
+        assert_eq!(draw_at(2), "🤖", "only the icon fits; the name drops whole");
+        // One cell too narrow even for the icon: the caption run is empty
+        // rather than a corrupted half-glyph.
+        assert_eq!(draw_at(1), "", "too narrow for the icon: nothing is drawn");
     }
 
     #[test]
