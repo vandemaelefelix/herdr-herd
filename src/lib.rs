@@ -27,4 +27,5 @@ pub mod snapshot;
 pub mod socket;
 pub mod sound;
 pub mod sprite;
+pub mod term;
 pub mod watcher;
