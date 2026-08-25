@@ -2,6 +2,8 @@
 //! `▀` cells (fg = top pixel, bg = bottom pixel), then overlay state bubbles/
 //! badges and a `+N` counter.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,12 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossterm::event::{
     self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::terminal::size;
 use ratatui::Frame;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::agent::Agent;
 use crate::anim::{Overlay, OverlayColor, Rgb};
@@ -22,9 +25,9 @@ use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
 use crate::marker;
 use crate::member::{Member, priority};
-use crate::motion::animate;
+use crate::motion::{Animated, animate};
 use crate::palette::{StateStyle, Theme, role_color};
-use crate::sprite::{Frame as SpriteFrame, Role, Species};
+use crate::sprite::{Frame as SpriteFrame, Role, Species, StateSpec};
 
 /// Rows the focus hat occupies above a member's head, plus the 1px hop/bounce
 /// headroom sprites already reserve (see `sprites/*.sprite`, `<= 14` px).
@@ -235,6 +238,100 @@ pub fn draw_pixels(frame: &mut Frame, area: Rect, buf: &PixelBuf) {
     }
 }
 
+/// One visible member's fully-resolved draw inputs at a single instant: where
+/// it sits in the draw order, which member it is, and the state/frame/animation
+/// it draws. Produced by [`visible_members`] so the band blit and each
+/// backend's frame signature are built from one walk of the simulation and can
+/// never disagree about *what* is on screen, only about how finely each
+/// backend quantises it.
+pub(crate) struct VisibleMember<'a> {
+    /// Draw-order index: 0 is drawn first (furthest back), matching the `z`
+    /// the kitty backend stamps onto its placements.
+    pub z: usize,
+    /// Index into `herd.members`.
+    pub index: usize,
+    pub member: &'a Member,
+    pub state: &'a StateSpec,
+    pub frame: &'a SpriteFrame,
+    pub animated: Animated,
+}
+
+/// The walkable pixel range a member's left edge can occupy in a `strip_w`-wide
+/// strip: what `motion::animate`'s `x_fraction` is scaled by. A fraction (not
+/// a pixel) is what makes the same agent land in the same relative spot in
+/// panes of different widths.
+pub(crate) fn band_max_x(species: &[Species], strip_w: usize) -> f32 {
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    (strip_w as f32 - member_w as f32).max(0.0)
+}
+
+/// A member's band-space left edge, in pixels: the exact quantity
+/// [`build_band`] blits at. Shared with the frame signature so a suppressed
+/// repaint can never hide a member that actually moved a pixel.
+pub(crate) fn band_ox(a: &Animated, max_x: f32) -> i32 {
+    (a.x_fraction * max_x + a.offset.dx).round() as i32
+}
+
+/// A member's band-space top edge, in pixels. Bottom-anchored: feet rest on the
+/// band floor, and motion (`dy <= 0`) lifts the member up into the headroom
+/// above it, so a hop/bounce never clips.
+pub(crate) fn band_oy(a: &Animated, frame_h: usize) -> i32 {
+    MEMBER_PX_H as i32 - frame_h as i32 + a.offset.dy.round() as i32
+}
+
+/// The visible members in draw z-order (lowest priority first, so blocked draws
+/// last / on top), each resolved to the species state and sprite frame it draws
+/// at `now_ms`, plus the number of members the strip has no room for (the `+N`
+/// count). Members whose species, state, or frame can't be resolved are
+/// dropped; they draw nothing either way.
+pub(crate) fn visible_members<'a>(
+    herd: &'a Herd,
+    species: &'a [Species],
+    strip_w: usize,
+    now_ms: u64,
+) -> (Vec<VisibleMember<'a>>, usize) {
+    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
+    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
+    let (visible, hidden) = visible_and_hidden(&herd.members, capacity);
+
+    // z-order: lowest priority first so blocked draws last (on top).
+    let mut order = visible;
+    order.sort_by_key(|&i| priority(herd.members[i].status));
+
+    let mut out = Vec::with_capacity(order.len());
+    for (z, &index) in order.iter().enumerate() {
+        let member = &herd.members[index];
+        let Some(sp) = species
+            .get(member.identity.species_index)
+            .or_else(|| species.first())
+        else {
+            continue;
+        };
+        let Some(state) = sp.states.get(&member.status) else {
+            continue;
+        };
+        let animated = animate(
+            &member.terminal_id,
+            member.status,
+            state,
+            now_ms,
+            member.anchor,
+        );
+        let Some(frame) = state.frames.get(animated.frame_index) else {
+            continue;
+        };
+        out.push(VisibleMember {
+            z,
+            index,
+            member,
+            state,
+            frame,
+            animated,
+        });
+    }
+    (out, hidden)
+}
+
 /// Blit every visible member's body — and, for the focused member, its focus hat —
 /// into a fresh pixel buffer, in priority z-order (blocked draws last, i.e. on
 /// top). The hat is composited into the same buffer right after its member's
@@ -254,47 +351,21 @@ fn build_band(
     now_ms: u64,
 ) -> (PixelBuf, Vec<usize>) {
     let mut buf = PixelBuf::new(strip_w, MEMBER_PX_H);
+    let max_x = band_max_x(species, strip_w);
+    let (visible, _hidden) = visible_members(herd, species, strip_w, now_ms);
 
-    let member_w = species.first().map(|s| s.size().0).unwrap_or(12);
-    let max_x = (strip_w as f32 - member_w as f32).max(0.0);
-    let capacity = (strip_w / (member_w * 3 / 4).max(1)).max(1);
-    let (visible, _hidden) = visible_and_hidden(&herd.members, capacity);
-
-    // z-order: lowest priority first so blocked draws last (on top).
-    let mut order = visible;
-    order.sort_by_key(|&i| priority(herd.members[i].status));
-
-    for &i in &order {
-        let member = &herd.members[i];
-        let Some(sp) = species
-            .get(member.identity.species_index)
-            .or_else(|| species.first())
-        else {
-            continue;
-        };
-        let Some(state) = sp.states.get(&member.status) else {
-            continue;
-        };
-        let animated = animate(
-            &member.terminal_id,
-            member.status,
-            state,
-            now_ms,
-            member.anchor,
-        );
-        let fr = &state.frames[animated.frame_index];
+    for v in &visible {
+        let member = v.member;
+        let fr = v.frame;
         let style = StateStyle {
-            dim: state.dim,
-            ghost: state.ghost,
+            dim: v.state.dim,
+            ghost: v.state.ghost,
         };
-        let ox = (animated.x_fraction * max_x + animated.offset.dx).round() as i32;
-        // Bottom-anchor: feet rest on the band floor; motion (dy<=0) lifts the
-        // member up into the headroom above it, so a hop/bounce never clips.
-        let floor = MEMBER_PX_H as i32 - fr.h as i32;
-        let oy = floor + animated.offset.dy.round() as i32;
+        let ox = band_ox(&v.animated, max_x);
+        let oy = band_oy(&v.animated, fr.h);
         for y in 0..fr.h {
             for x in 0..fr.w {
-                let sx = if animated.facing_left {
+                let sx = if v.animated.facing_left {
                     fr.w - 1 - x
                 } else {
                     x
@@ -307,11 +378,11 @@ fn build_band(
             }
         }
         if member.focused {
-            let (head_row, head_col) = head_anchor(fr, animated.facing_left);
+            let (head_row, head_col) = head_anchor(fr, v.animated.facing_left);
             draw_hat(&mut buf, ox, oy, head_row, head_col);
         }
     }
-    (buf, order)
+    (buf, visible.iter().map(|v| v.index).collect())
 }
 
 /// Draw the whole strip: visible members in priority z-order (blocked draws
@@ -543,6 +614,58 @@ pub fn member_at_column(
     best
 }
 
+/// The half-block strip's frame signature: a hash of every input
+/// [`draw_herd`] quantises down to a cell, and nothing finer. Sub-pixel motion
+/// that rounds away before it reaches [`band_ox`]/[`band_oy`] deliberately
+/// does *not* change it. That is the whole point, since an idle member
+/// breathes continuously but paints the same pixels for minutes at a time.
+///
+/// `area` is hashed first because it is the one input whose omission breaks
+/// something silently: without it a resize produces the same signature as the
+/// frame before it and the strip stops reflowing.
+fn band_signature(
+    herd: &Herd,
+    species: &[Species],
+    theme: Theme,
+    area: Rect,
+    now_ms: u64,
+    hover_label: Option<&str>,
+) -> u64 {
+    let strip_w = area.width as usize;
+    let max_x = band_max_x(species, strip_w);
+    let (visible, hidden) = visible_members(herd, species, strip_w, now_ms);
+
+    let mut h = DefaultHasher::new();
+    (area.x, area.y, area.width, area.height).hash(&mut h);
+    theme.hash(&mut h);
+    // The `+N` marker and the hover caption are the only other things in the
+    // reserved lane that can change between frames (the dev build marker is a
+    // compile-time constant).
+    hidden.hash(&mut h);
+    hover_label.hash(&mut h);
+    for v in &visible {
+        let member = v.member;
+        (
+            v.index,
+            member.identity.species_index,
+            member.identity.hue,
+            member.status,
+            v.animated.frame_index,
+            v.animated.facing_left,
+            member.focused,
+            band_ox(&v.animated, max_x),
+            band_oy(&v.animated, v.frame.h),
+            // `draw_herd` places the overlay bubble/badge from the *un-swayed*
+            // x, a different rounding from `band_ox`, which folds the sway in.
+            // So it needs its own entry, or a sway that cancels a step could
+            // freeze a bubble that should have moved a column.
+            (v.animated.x_fraction * max_x).round() as i32,
+        )
+            .hash(&mut h);
+    }
+    h.finish()
+}
+
 /// A pluggable member-strip renderer. The simulation is shared; only drawing and
 /// hit-testing differ between backends (half-block vs kitty graphics).
 pub trait MemberRenderer {
@@ -559,6 +682,29 @@ pub trait MemberRenderer {
         now_ms: u64,
         hover_label: Option<&str>,
     );
+    /// A hash of everything this frame would put on screen, at this backend's
+    /// own quantisation: the visible members' already-rounded poses and
+    /// positions, the `+N` overflow count, the hover caption, and `area`.
+    /// `run_loop` skips [`MemberRenderer::draw`] entirely when it matches the
+    /// previously drawn frame's: an idle pane produces literally zero changed
+    /// cells in ~100% of frames, so the whole frame is pointless work.
+    ///
+    /// The arguments are exactly `draw`'s, so the rule is simple: the signature
+    /// is a hash of the draw's inputs. `area` is one of them; leave it out and
+    /// a resize silently stops repainting.
+    ///
+    /// Cheap by construction: it re-runs `motion::animate` for the visible
+    /// members (0.1-0.9 us for a full herd, against a 12-41 us frame) and
+    /// allocates nothing per pixel.
+    fn frame_signature(
+        &self,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        area: Rect,
+        now_ms: u64,
+        hover_label: Option<&str>,
+    ) -> u64;
     /// The visible member under terminal column `col`, if any (for hover/click).
     /// `now_ms` must match the value passed to `draw` this frame.
     fn member_at_column(
@@ -597,6 +743,17 @@ impl MemberRenderer for HalfBlockRenderer {
         // strip whichever way the crate is built. Mirrors the kitty path, which
         // emits its marker from its own `MemberRenderer::draw`.
         draw_build_marker(frame, frame.area(), overlay_lane_y(frame.area()));
+    }
+    fn frame_signature(
+        &self,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        area: Rect,
+        now_ms: u64,
+        hover_label: Option<&str>,
+    ) -> u64 {
+        band_signature(herd, species, theme, area, now_ms, hover_label)
     }
     fn member_at_column(
         &self,
@@ -643,6 +800,29 @@ pub fn focus_agent(cli: &dyn HerdrCli, terminal_id: &str) -> io::Result<()> {
     cli.run_json(&["agent", "focus", terminal_id]).map(|_| ())
 }
 
+/// Where the render loop gets its terminal events. A seam (see the project's
+/// testability-seams convention) purely so `run_loop` can be driven from a
+/// scripted sequence in tests: `crossterm::event::poll` reads the process's
+/// real tty, which a test has no way to feed.
+pub trait EventSource {
+    /// Wait up to `timeout` for the next terminal event, or `None` if none
+    /// arrived. The timeout is what paces the loop at ~12 fps.
+    fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
+}
+
+/// Production: crossterm's global tty event queue.
+pub struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// Render thread: ~12 fps tick. Drains snapshots, reconciles, steps the herd,
 /// draws, handles mouse hover/click, and quits on `q`/Ctrl-C. Restores the
 /// terminal (raw mode, alternate screen, mouse capture) on exit.
@@ -672,7 +852,20 @@ pub fn run(
     let mut renderer = select_renderer(renderer_kind, &mut caps, member_scale);
 
     guard.enter_screen()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    // A FIXED viewport, not the default fullscreen one. `Terminal::draw`
+    // autoresizes a fullscreen viewport, and `crossterm::terminal::size` is a
+    // `File::open("/dev/tty")` + ioctl + close every time (~20 us in a real
+    // pty, and 15-35 ms via the `tput` fallback when /dev/tty can't be
+    // opened). A fixed viewport performs none of them: `run_loop` resizes it
+    // from the `Event::Resize` it already receives. This one call is the only
+    // size query left, at startup.
+    let (cols, rows) = size()?;
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+        },
+    )?;
     let result = run_loop(
         &mut terminal,
         rx,
@@ -683,6 +876,7 @@ pub fn run(
         renderer.as_mut(),
         &sound_cfg,
         sound_player.as_ref(),
+        &mut CrosstermEvents,
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
@@ -711,6 +905,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     renderer: &mut dyn MemberRenderer,
     sound_cfg: &crate::config::SoundConfig,
     sound_player: &dyn crate::sound::SoundPlayer,
+    events: &mut dyn EventSource,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -719,6 +914,14 @@ where
     let species_count = species.len().max(1);
     let mut herd = Herd::new();
     let mut hovered: Option<String> = None;
+    // The signature of the frame currently on screen. `None` until the first
+    // draw, which is why the first frame is never skipped.
+    let mut last_sig: Option<u64> = None;
+    // The geometry the strip is drawn at. Read once from the viewport here and
+    // then kept in step with `Event::Resize` below, rather than re-queried per
+    // frame: `terminal.size()` opens /dev/tty on every call, which cost more
+    // than rendering the sheep did.
+    let mut area = terminal.get_frame().area();
     // One claim store for the whole session: every pane sees every transition,
     // so the sound is claimed once per transition, not once per pane.
     let sound_claim = crate::sound::session_claim();
@@ -740,14 +943,28 @@ where
         if !transitions.is_empty() {
             crate::sound::play_claimed(sound_player, sound_claim.as_ref(), &transitions, sound_cfg);
         }
-        let strip_w = terminal.size()?.width as usize;
+        // Mouse hit-testing has to agree with what is on screen, so the width
+        // it uses is the width the last frame actually drew at.
+        let strip_w = area.width as usize;
         let caption = hovered.clone();
-        terminal.draw(|f| {
-            renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
-        })?;
+        // Skip the whole frame when nothing visible changed. Measured on an
+        // idle pane, 1197 of 1199 frames produce zero changed cells, yet each
+        // one still allocates an 8.6-14.4 KB `PixelBuf`, blits it, and writes
+        // ratatui's trailer. Note this suppresses an identical *repaint* only:
+        // `now_ms` above is still sampled fresh every iteration and
+        // `motion::animate` stays pure, so cross-pane animation sync (which
+        // depends on independent processes agreeing on absolute wall-clock
+        // time) is untouched.
+        let sig = renderer.frame_signature(&herd, species, theme, area, now_ms, caption.as_deref());
+        if last_sig != Some(sig) {
+            terminal.draw(|f| {
+                renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
+            })?;
+            last_sig = Some(sig);
+        }
 
-        if event::poll(tick)? {
-            match event::read()? {
+        if let Some(ev) = events.poll_event(tick)? {
+            match ev {
                 Event::Key(k) => {
                     let quit = k.code == KeyCode::Char('q')
                         || (k.code == KeyCode::Char('c')
@@ -776,6 +993,22 @@ where
                     }
                     _ => {}
                 },
+                // A fixed viewport is never autoresized, so this is what keeps
+                // the strip reflowing. `area` feeds the next frame signature,
+                // which is what forces the repaint (`terminal.resize` has
+                // already cleared the viewport and reset the back buffer, and
+                // the kitty backend purges and retransmits its images when it
+                // sees the new area).
+                Event::Resize(w, h) => {
+                    let resized = Rect::new(0, 0, w, h);
+                    // Terminals emit a resize for a geometry that did not
+                    // actually change; honouring it would clear the viewport
+                    // and leave the strip blank until something else moved.
+                    if resized != area {
+                        terminal.resize(resized)?;
+                        area = resized;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1280,7 +1513,7 @@ mod tests {
     }
 
     use crate::herdr::{CommandRunner, LiveHerdr};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::ffi::OsStr;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
@@ -1633,6 +1866,389 @@ mod tests {
         assert!(
             row_has_hat_pixel,
             "the hat's bottom row must overlap the head's own top row"
+        );
+    }
+
+    // ---- issue #42: skipping frames that would change nothing ----------------
+
+    /// A [`TestBackend`] whose error type is `io::Error`. `run_loop` is bounded
+    /// on `io::Error: From<B::Error>` so the real `CrosstermBackend`'s errors
+    /// reach the caller with their kind intact; `TestBackend`'s own
+    /// `Infallible` doesn't satisfy that, so the tests wrap it rather than
+    /// loosening the production bound.
+    struct IoTestBackend {
+        inner: TestBackend,
+        /// How many times the terminal asked the backend for its size. In
+        /// production every one of these is a `/dev/tty` open + ioctl + close,
+        /// so issue #44 is really the claim that this stays at zero per frame.
+        size_calls: Rc<Cell<usize>>,
+    }
+
+    impl IoTestBackend {
+        fn new(width: u16, height: u16) -> (Self, Rc<Cell<usize>>) {
+            let size_calls = Rc::new(Cell::new(0));
+            let backend = Self {
+                inner: TestBackend::new(width, height),
+                size_calls: Rc::clone(&size_calls),
+            };
+            (backend, size_calls)
+        }
+    }
+
+    /// A `Result` that cannot be an error, retyped. `match e {}` is total
+    /// because `Infallible` has no variants.
+    fn infallible<T>(r: Result<T, std::convert::Infallible>) -> io::Result<T> {
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => match e {},
+        }
+    }
+
+    impl ratatui::backend::Backend for IoTestBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            infallible(self.inner.draw(content))
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            infallible(self.inner.hide_cursor())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            infallible(self.inner.show_cursor())
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            infallible(self.inner.get_cursor_position())
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            infallible(self.inner.set_cursor_position(position))
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            infallible(self.inner.clear())
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            infallible(self.inner.clear_region(clear_type))
+        }
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.size_calls.set(self.size_calls.get() + 1);
+            infallible(self.inner.size())
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            infallible(self.inner.window_size())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            infallible(self.inner.flush())
+        }
+    }
+
+    /// Counts `draw` calls and records the area each one drew at, so a test can
+    /// assert a frame was *not* painted. Its `frame_signature` delegates to the
+    /// shipped half-block one, so the loop under test is gated on the real
+    /// thing rather than a test-only stand-in.
+    #[derive(Default)]
+    struct CountingRenderer {
+        draws: usize,
+        areas: Vec<Rect>,
+    }
+
+    impl MemberRenderer for CountingRenderer {
+        fn draw(
+            &mut self,
+            frame: &mut Frame,
+            _herd: &Herd,
+            _species: &[Species],
+            _theme: Theme,
+            _now_ms: u64,
+            _hover_label: Option<&str>,
+        ) {
+            self.draws += 1;
+            self.areas.push(frame.area());
+        }
+        fn frame_signature(
+            &self,
+            herd: &Herd,
+            species: &[Species],
+            theme: Theme,
+            area: Rect,
+            now_ms: u64,
+            hover_label: Option<&str>,
+        ) -> u64 {
+            band_signature(herd, species, theme, area, now_ms, hover_label)
+        }
+        fn member_at_column(
+            &self,
+            _herd: &Herd,
+            _species: &[Species],
+            _strip_w: usize,
+            _col: u16,
+            _now_ms: u64,
+        ) -> Option<usize> {
+            None
+        }
+        fn backend_name(&self) -> &'static str {
+            "counting"
+        }
+    }
+
+    /// Replays a fixed script of loop ticks: `None` is a 12 fps timeout with no
+    /// input, `Some(e)` an event. Once the script runs out it presses `q`, so a
+    /// test can never hang in `run_loop`'s infinite loop.
+    struct ScriptedEvents {
+        script: std::vec::IntoIter<Option<Event>>,
+    }
+
+    impl ScriptedEvents {
+        fn new(script: Vec<Option<Event>>) -> Self {
+            Self {
+                script: script.into_iter(),
+            }
+        }
+    }
+
+    impl EventSource for ScriptedEvents {
+        fn poll_event(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(match self.script.next() {
+                Some(ev) => ev,
+                None => Some(Event::Key(KeyCode::Char('q').into())),
+            })
+        }
+    }
+
+    struct SilentPlayer;
+    impl crate::sound::SoundPlayer for SilentPlayer {
+        fn play(&self, _path: &std::path::Path) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drive the real `run_loop` over `script`, starting from a herd of
+    /// `states`, and hand back the renderer so the caller can inspect what it
+    /// was actually asked to draw. `reduced_motion` pins `now_ms` to 0, which
+    /// makes every frame byte-identical: exactly the case issue #42 measured
+    /// as 1197 zero-change frames out of 1199.
+    fn drive_run_loop(
+        backend: IoTestBackend,
+        width: u16,
+        height: u16,
+        states: &[AgentStatus],
+        script: Vec<Option<Event>>,
+    ) -> CountingRenderer {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let agents: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| agent(&format!("t{i}"), *s))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(agents).expect("the receiver is still alive");
+        drop(tx); // no further snapshots: the herd never changes again
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        // A fixed viewport, exactly as `run` builds it, so the loop under test
+        // is the one that ships (a fullscreen viewport would autoresize and
+        // hide the `Event::Resize` handling).
+        let viewport = Viewport::Fixed(Rect::new(0, 0, width, height));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = CountingRenderer::default();
+        let mut events = ScriptedEvents::new(script);
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true, // reduced motion: `now_ms` is pinned, so nothing can move
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &mut events,
+        )
+        .expect("the scripted loop quits cleanly");
+        renderer
+    }
+
+    #[test]
+    fn an_unchanging_herd_is_drawn_once_and_then_skipped() {
+        use AgentStatus::*;
+        // 40 idle ticks after the herd arrives. Only the first frame has
+        // anything new to say; the other 40 must not reach the renderer at all.
+        let (backend, size_calls) = IoTestBackend::new(90, 11);
+        let renderer = drive_run_loop(
+            backend,
+            90,
+            11,
+            &[Idle, Done, Working, Blocked],
+            vec![None; 40],
+        );
+        assert_eq!(
+            renderer.draws, 1,
+            "an unchanged strip must be painted once, not once per tick"
+        );
+        // Issue #44: a fixed viewport never autoresizes, and the loop no longer
+        // asks for the size itself, so 41 ticks must cost zero `/dev/tty`
+        // opens.
+        assert_eq!(
+            size_calls.get(),
+            0,
+            "the render loop must not query the terminal size per frame"
+        );
+    }
+
+    #[test]
+    fn a_resize_repaints_even_though_the_herd_did_not_change() {
+        use AgentStatus::*;
+        // The regression that would otherwise ship silently: with an unchanged
+        // herd every frame after the first is skipped, so the resize event is
+        // the *only* thing that can force the strip to reflow.
+        let (backend, _) = IoTestBackend::new(90, 11);
+        let renderer = drive_run_loop(
+            backend,
+            90,
+            11,
+            &[Idle, Done],
+            vec![None, None, Some(Event::Resize(60, 11)), None, None],
+        );
+        assert_eq!(
+            renderer.areas,
+            vec![Rect::new(0, 0, 90, 11), Rect::new(0, 0, 60, 11)],
+            "the strip is painted once at the old size and again at the new one"
+        );
+    }
+
+    #[test]
+    fn a_resize_to_the_same_geometry_does_not_repaint() {
+        use AgentStatus::*;
+        // Terminals emit resize events for geometry that did not change.
+        // Acting on one would clear the viewport, and the frame that would
+        // have repainted it is the one the signature says to skip.
+        let (backend, _) = IoTestBackend::new(90, 11);
+        let renderer = drive_run_loop(
+            backend,
+            90,
+            11,
+            &[Idle, Done],
+            vec![None, Some(Event::Resize(90, 11)), None],
+        );
+        assert_eq!(renderer.draws, 1, "a no-op resize must stay a no-op");
+    }
+
+    #[test]
+    fn the_frame_signature_changes_when_the_pane_is_resized() {
+        // The one trap in the whole change: leave `area` out of the signature
+        // and a resized pane keeps showing the old layout forever.
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[Idle, Working]);
+        let sig = |w: u16, h: u16| {
+            band_signature(
+                &herd,
+                &species,
+                Theme::Dark,
+                Rect::new(0, 0, w, h),
+                NOW_MS,
+                None,
+            )
+        };
+        assert_eq!(sig(90, 11), sig(90, 11), "same area, same frame");
+        assert_ne!(sig(90, 11), sig(60, 11), "a narrower pane must repaint");
+        assert_ne!(sig(90, 11), sig(90, 8), "a shorter pane must repaint");
+    }
+
+    #[test]
+    fn the_frame_signature_changes_when_the_hover_caption_changes() {
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Idle]);
+        let area = Rect::new(0, 0, 90, 11);
+        let sig =
+            |label: Option<&str>| band_signature(&herd, &species, Theme::Dark, area, NOW_MS, label);
+        assert_ne!(sig(None), sig(Some("sheep")), "showing a name repaints");
+        assert_ne!(
+            sig(Some("sheep")),
+            sig(Some("goat")),
+            "a different name repaints"
+        );
+    }
+
+    /// Render the strip at `now_ms` and return the finished cells as text:
+    /// the ground truth a signature must never disagree with.
+    fn strip_at(herd: &Herd, species: &[Species], area: Rect, now_ms: u64) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut renderer = HalfBlockRenderer;
+        terminal
+            .draw(|f| renderer.draw(f, herd, species, Theme::Dark, now_ms, None))
+            .unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    /// Every distinct signature seen over `sweep`, mapped to the strip that was
+    /// rendered the first time it appeared.
+    fn sweep_signatures(
+        herd: &Herd,
+        species: &[Species],
+        area: Rect,
+        sweep: impl Iterator<Item = u64>,
+    ) -> (usize, std::collections::HashMap<u64, String>) {
+        let mut seen: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut frames = 0;
+        for now_ms in sweep {
+            frames += 1;
+            let sig = band_signature(herd, species, Theme::Dark, area, now_ms, None);
+            let strip = strip_at(herd, species, area, now_ms);
+            match seen.get(&sig) {
+                Some(first) => assert_eq!(
+                    first, &strip,
+                    "two frames hashed the same at {now_ms} ms but do not look the same; \
+                     skipping the second would drop a visible change"
+                ),
+                None => {
+                    seen.insert(sig, strip);
+                }
+            }
+        }
+        (frames, seen)
+    }
+
+    #[test]
+    fn a_repeated_frame_signature_always_means_an_identical_strip() {
+        // The safety property the skip rests on: same signature => same pixels.
+        // Swept over 60 s of animation at 12 fps for a mixed herd, so walking
+        // members, hopping members and dozing ones all get their turn.
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[Working, Working, Idle, Done, Blocked, Unknown]);
+        let area = Rect::new(0, 0, 90, 11);
+        let (frames, seen) = sweep_signatures(&herd, &species, area, (0..60_000).step_by(83));
+        assert!(
+            seen.len() < frames,
+            "the sweep never repeated a signature, so it proved nothing"
+        );
+    }
+
+    #[test]
+    fn an_idle_herd_holds_one_signature_across_a_minute_of_animation() {
+        // The win, stated as a test: idle members breathe continuously, but the
+        // breath rounds away before it reaches a pixel, so 60 s of frames
+        // collapse to a single repaint.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = fixed_herd(&[AgentStatus::Idle; 4]);
+        let area = Rect::new(0, 0, 200, 11);
+        let (frames, seen) = sweep_signatures(&herd, &species, area, (0..60_000).step_by(83));
+        assert_eq!(frames, 723, "60 s at ~12 fps");
+        assert_eq!(
+            seen.len(),
+            1,
+            "an all-idle strip must collapse to one drawn frame, got {}",
+            seen.len()
         );
     }
 }

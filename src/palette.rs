@@ -6,7 +6,7 @@ use crate::anim::Rgb;
 use crate::sprite::Role;
 
 /// Which theme is active; only affects the outline color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Theme {
     Dark,
     Light,

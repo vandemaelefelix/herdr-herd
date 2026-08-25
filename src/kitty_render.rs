@@ -14,6 +14,8 @@
 //! stopped placing are freed rather than left resident forever.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 
 use ratatui::Frame;
@@ -29,7 +31,7 @@ use crate::member::priority;
 use crate::motion::animate;
 use crate::palette::{StateStyle, Theme, role_color};
 use crate::raster::{pad_frame, rasterize};
-use crate::render::{HAT_H, MemberRenderer, head_anchor, stamp_hat};
+use crate::render::{HAT_H, MemberRenderer, band_max_x, head_anchor, stamp_hat, visible_members};
 use crate::sprite::{Frame as SpriteFrame, Species};
 
 /// Sprite-pixel margin padded around a transmitted member image, so a motion
@@ -770,6 +772,106 @@ impl MemberRenderer for KittyRenderer {
         // (the long-standing name-disappears bug). Writing straight to the sink
         // every frame keeps it stable, on its own dedicated top row.
         let _ = self.draw_overlay_text(area, hover_label, hidden);
+    }
+
+    /// The kitty strip's frame signature. Unlike the half-block band, which
+    /// quantises to whole sprite pixels, a kitty placement pans a crop window
+    /// at `scale` sub-pixels and lands on a cell column, so this hashes the
+    /// *placement* values (`col`/`cols`/`rows` and the crop rectangles) that
+    /// [`KittyRenderer::render_members`] would actually emit. Reusing the
+    /// coarser half-block rounding here would visibly chunk the animation.
+    ///
+    /// `last_area` is hashed too: a geometry change purges and retransmits
+    /// every image, so a frame that still has a stale `last_area` must never be
+    /// suppressed.
+    ///
+    /// Note this deliberately does *not* try to detect that a member's
+    /// placement is byte-identical to the one already on screen. The backend
+    /// re-places every visible member every frame regardless (issue #45). This
+    /// only answers "would this frame emit the same escapes as the last one?".
+    fn frame_signature(
+        &self,
+        herd: &Herd,
+        species: &[Species],
+        theme: Theme,
+        area: Rect,
+        now_ms: u64,
+        hover_label: Option<&str>,
+    ) -> u64 {
+        let strip_w = area.width as usize;
+        let max_x = band_max_x(species, strip_w);
+        let (visible, hidden) = visible_members(herd, species, strip_w, now_ms);
+
+        let mut h = DefaultHasher::new();
+        (area.x, area.y, area.width, area.height).hash(&mut h);
+        self.last_area
+            .map(|a| (a.x, a.y, a.width, a.height))
+            .hash(&mut h);
+        theme.hash(&mut h);
+        hidden.hash(&mut h);
+        hover_label.hash(&mut h);
+
+        let rows = member_rows(area.height);
+        let body_pad = MOTION_PAD + HAT_H;
+        for v in &visible {
+            let member = v.member;
+            let fr = v.frame;
+            let a = &v.animated;
+            let cols = member_cols(rows, fr.w, fr.h + TOP_HEADROOM);
+            let col =
+                ((a.x_fraction * max_x).round() as i32 + 1).clamp(1, area.width.max(1) as i32);
+            let crop = member_crop(
+                body_pad,
+                TOP_HEADROOM,
+                self.scale,
+                fr.w,
+                fr.h,
+                a.offset.dx,
+                a.offset.dy,
+            );
+            (
+                v.z,
+                v.index,
+                member.identity.species_index,
+                member.identity.hue,
+                member.status,
+                a.frame_index,
+                a.facing_left,
+                member.focused,
+                col,
+                cols,
+                rows,
+                crop,
+            )
+                .hash(&mut h);
+
+            // The overlay icon rides its own wave (`icon_offset`), independent
+            // of the body's motion, so its crop has to be hashed separately:
+            // a still member with a bobbing `Zz` is a changing frame.
+            let glyph = match &v.state.overlay.kind {
+                Overlay::Bubble(g) | Overlay::Badge(g) => Some(g.as_str()),
+                Overlay::None => None,
+            };
+            let kind = glyph.and_then(IconKind::from_glyph);
+            (kind, v.state.overlay.color).hash(&mut h);
+            if let Some(kind) = kind {
+                let (iw, ih) = icon_size(kind);
+                let icon_crop = crop_rect(
+                    ICON_PAD - ICON_MARGIN,
+                    self.scale,
+                    iw + ICON_MARGIN * 2,
+                    ih + ICON_MARGIN * 2,
+                    a.icon_offset.dx,
+                    a.icon_offset.dy,
+                );
+                let icon_cols = member_cols(1, iw, ih);
+                let icon_col_max = (area.width as i32 - icon_cols as i32 + 1).max(1);
+                let icon_col =
+                    (col + (cols as i32) / 2 - (icon_cols as i32) / 2).clamp(1, icon_col_max);
+                (icon_col, icon_cols, icon_crop).hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     /// Hit-test using the same visible set as `render_members`. A member's hit range
@@ -2190,6 +2292,75 @@ MMMM
         );
     }
 
+    // ---- issue #42: skipping frames that would change nothing ----------------
+
+    /// The area [`KittyRenderer::draw_to_sink`] renders into, so a signature
+    /// computed against it describes the escapes that call actually emits.
+    const SINK_AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 10,
+    };
+
+    fn herd_of_states(states: &[AgentStatus]) -> Herd {
+        let mut h = Herd::new();
+        for (i, &s) in states.iter().enumerate() {
+            let tid = format!("t{i}");
+            h.members
+                .push(Member::new(tid.clone(), identity_for(&tid, 1), s));
+        }
+        h
+    }
+
+    /// Every distinct signature over `sweep`, mapped to the escapes emitted the
+    /// first time it appeared. A *fresh* renderer per instant is deliberate:
+    /// image and placement ids are handed out in draw order, so two logically
+    /// identical frames only emit identical bytes when both start from an empty
+    /// cache.
+    fn kitty_sweep(
+        herd: &Herd,
+        species: &[Species],
+        sweep: impl Iterator<Item = u64>,
+    ) -> (usize, HashMap<u64, String>) {
+        let mut seen: HashMap<u64, String> = HashMap::new();
+        let mut frames = 0;
+        for now_ms in sweep {
+            frames += 1;
+            let sink = SharedSink::default();
+            let mut r = KittyRenderer::for_test(sink.clone(), 2);
+            let sig = r.frame_signature(herd, species, Theme::Dark, SINK_AREA, now_ms, None);
+            r.draw_to_sink(herd, species, Theme::Dark, now_ms);
+            let escapes = sink.take();
+            match seen.get(&sig) {
+                Some(first) => assert_eq!(
+                    first, &escapes,
+                    "two frames hashed the same at {now_ms} ms but emit different escapes; \
+                     skipping the second would drop a visible change"
+                ),
+                None => {
+                    seen.insert(sig, escapes);
+                }
+            }
+        }
+        (frames, seen)
+    }
+
+    #[test]
+    fn a_repeated_kitty_frame_signature_always_means_identical_escapes() {
+        // The safety property the frame skip rests on for this backend. Swept
+        // over 30 s at 12 fps across a mixed herd, so walking, hopping, dozing
+        // and overlay-bearing members all get their turn.
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = herd_of_states(&[Working, Idle, Done, Blocked, Unknown]);
+        let (frames, seen) = kitty_sweep(&herd, &species, (0..30_000).step_by(83));
+        assert!(
+            seen.len() < frames,
+            "the sweep never repeated a signature, so it proved nothing"
+        );
+    }
+
     // ---- Cross-pane properties ----------------------------------------
     //
     // Every strip pane is its own process writing into ONE outer terminal, so
@@ -2315,6 +2486,45 @@ MMMM
         assert!(
             !placed_image_ids(&out_b).is_empty(),
             "pane B keeps drawing from its own cache"
+        );
+    }
+
+    #[test]
+    fn the_kitty_frame_signature_changes_when_the_pane_is_resized() {
+        // The trap: without `area` in the signature, a resized pane would keep
+        // its old placements and never purge/retransmit (see `render_members`).
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = herd_of_states(&[Working, Idle]);
+        let r = KittyRenderer::for_test(SharedSink::default(), 2);
+        let sig = |w: u16, h: u16| {
+            r.frame_signature(&herd, &species, Theme::Dark, Rect::new(0, 0, w, h), 0, None)
+        };
+        assert_eq!(sig(200, 10), sig(200, 10), "same area, same frame");
+        assert_ne!(sig(200, 10), sig(120, 10), "a narrower pane must repaint");
+        assert_ne!(sig(200, 10), sig(200, 8), "a shorter pane must repaint");
+    }
+
+    #[test]
+    fn a_kitty_frame_is_never_skipped_while_the_transmitted_images_are_stale() {
+        // `render_members` purges and retransmits everything when the area it
+        // last drew at changes. A renderer that has not drawn since (or drew at
+        // a different area) must therefore never match the signature of one
+        // that has, or the strip would go permanently blank after a resize.
+        let species = vec![parse_species(BLOB).unwrap()];
+        let herd = herd_of_states(&[AgentStatus::Idle]);
+        let mut r = KittyRenderer::for_test(SharedSink::default(), 2);
+        let before = r.frame_signature(&herd, &species, Theme::Dark, SINK_AREA, 0, None);
+        r.draw_to_sink(&herd, &species, Theme::Dark, 0);
+        let after = r.frame_signature(&herd, &species, Theme::Dark, SINK_AREA, 0, None);
+        assert_ne!(
+            before, after,
+            "the first frame at an area must not hash like a later one at the same area"
+        );
+        let settled = r.frame_signature(&herd, &species, Theme::Dark, SINK_AREA, 0, None);
+        assert_eq!(
+            after, settled,
+            "once drawn, an unchanged frame is skippable"
         );
     }
 
