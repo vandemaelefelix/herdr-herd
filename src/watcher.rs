@@ -290,6 +290,76 @@ mod tests {
         HerdFeed::new(None, Box::new(LiveHerdr::with_runner("herdr", FakeRunner)))
     }
 
+    /// The first event of a session (nothing sent yet) refreshes right away,
+    /// same as `watch()`'s initial snapshot. Everything that lands inside the
+    /// window it opens is held and coalesced into one trailing refetch once
+    /// the window closes, rather than each being dropped on the floor. Tests
+    /// `Debouncer` directly (see issue #49: `drain_events`, a test-only
+    /// reimplementation of this same rule, has been replaced by driving
+    /// `watch()` itself further down).
+    #[test]
+    fn debounce_delivers_an_immediate_priming_refresh_then_one_trailing_refetch_for_the_burst() {
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
+        });
+        // event 0 primes the schedule (nothing sent yet, so it fires at
+        // once); events 1-4 land inside the 250ms window it opens and must
+        // not each refetch; event 5, past the window, is what finally
+        // flushes them as a single coalesced refetch.
+        let mut refetches = 0;
+        for t in [0u64, 10, 50, 100, 200, 300] {
+            d.on_event(EventClass::Structural, t);
+            if d.due(t) {
+                refetches += 1;
+                d.sent(t);
+            }
+        }
+        assert_eq!(
+            refetches, 2,
+            "one immediate refetch for the priming event, one trailing \
+             refetch for the whole burst behind it"
+        );
+    }
+
+    /// The core of #38: a burst of events inside one window must not each
+    /// trigger a refetch, and must not be dropped either. Only the window
+    /// closing makes a refetch due, and by then it reflects the burst's
+    /// settled state, not whichever event happened to arrive first.
+    #[test]
+    fn a_burst_of_events_inside_the_window_stays_undue_until_it_closes() {
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
+        });
+        d.sent(0);
+        for t in [1u64, 5, 40, 120, 200] {
+            d.on_event(EventClass::Structural, t);
+            assert!(!d.due(t), "event at {t}ms must not refetch mid-burst");
+        }
+        assert!(d.due(250), "the window closes once the burst has settled");
+    }
+
+    #[test]
+    fn debounce_produces_a_separate_refetch_for_each_widely_spaced_event() {
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
+        });
+        let mut refetches = 0;
+        for t in [1_000u64, 2_000, 3_000] {
+            d.on_event(EventClass::Structural, t);
+            if d.due(t) {
+                refetches += 1;
+                d.sent(t);
+            }
+        }
+        assert_eq!(
+            refetches, 3,
+            "events spaced well past the debounce window each get their own refetch"
+        );
+    }
+
     #[test]
     fn focus_events_are_classified_apart_from_structural_ones() {
         assert_eq!(
