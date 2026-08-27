@@ -357,6 +357,32 @@ pub(crate) fn visible_members<'a>(
     (out, hidden)
 }
 
+/// Blit one sprite frame into `buf` at pixel offset `(ox, oy)`, optionally
+/// mirrored horizontally (`flip`). Extracted out of [`build_band`] so
+/// mirroring itself is directly testable, independent of position/animation
+/// (which vary with `now_ms` and would otherwise be the only lever a test has
+/// to force a flip — see `blit_frame_mirrors_the_sprite_horizontally_when_flip_is_true`).
+#[allow(clippy::too_many_arguments)]
+fn blit_frame(
+    buf: &mut PixelBuf,
+    fr: &SpriteFrame,
+    hue: u16,
+    theme: Theme,
+    style: StateStyle,
+    ox: i32,
+    oy: i32,
+    flip: bool,
+) {
+    for y in 0..fr.h {
+        for x in 0..fr.w {
+            let sx = if flip { fr.w - 1 - x } else { x };
+            if let Some(c) = role_color(fr.cells[y * fr.w + sx], hue, theme, style) {
+                buf.set(ox + x as i32, oy + y as i32, c);
+            }
+        }
+    }
+}
+
 /// Blit every visible member's body — and, for the focused member, its focus hat —
 /// into a fresh pixel buffer, in priority z-order (blocked draws last, i.e. on
 /// top). The hat is composited into the same buffer right after its member's
@@ -389,20 +415,16 @@ fn build_band<'a>(
         };
         let ox = band_ox(&v.animated, max_x);
         let oy = band_oy(&v.animated, fr.h);
-        for y in 0..fr.h {
-            for x in 0..fr.w {
-                let sx = if v.animated.facing_left {
-                    fr.w - 1 - x
-                } else {
-                    x
-                };
-                if let Some(c) =
-                    role_color(fr.cells[y * fr.w + sx], member.identity.hue, theme, style)
-                {
-                    buf.set(ox + x as i32, oy + y as i32, c);
-                }
-            }
-        }
+        blit_frame(
+            &mut buf,
+            fr,
+            member.identity.hue,
+            theme,
+            style,
+            ox,
+            oy,
+            v.animated.facing_left,
+        );
         if member.focused {
             let (head_row, head_col) = head_anchor(fr, v.animated.facing_left);
             draw_hat(&mut buf, ox, oy, head_row, head_col);
@@ -934,6 +956,12 @@ pub fn run(
             viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)),
         },
     )?;
+    // One claim store for the whole session: every pane sees every transition,
+    // so the sound is claimed once per transition, not once per pane. Built
+    // here (rather than inside `run_loop`) so a test can inject its own
+    // `TransitionClaim` and drive `run_loop` without ever touching the real
+    // filesystem-backed claim store.
+    let sound_claim = crate::sound::session_claim();
     let result = run_loop(
         &mut terminal,
         rx,
@@ -944,6 +972,7 @@ pub fn run(
         renderer.as_mut(),
         &sound_cfg,
         sound_player.as_ref(),
+        sound_claim.as_ref(),
         &mut CrosstermEvents,
         agent_icon,
         &diag,
@@ -990,6 +1019,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     renderer: &mut dyn MemberRenderer,
     sound_cfg: &crate::config::SoundConfig,
     sound_player: &dyn crate::sound::SoundPlayer,
+    sound_claim: &dyn crate::sound::TransitionClaim,
     events: &mut dyn EventSource,
     agent_icon: AgentIconStyle,
     diag: &Diagnostic,
@@ -1009,9 +1039,6 @@ where
     // frame: `terminal.size()` opens /dev/tty on every call, which cost more
     // than rendering the sheep did.
     let mut area = terminal.get_frame().area();
-    // One claim store for the whole session: every pane sees every transition,
-    // so the sound is claimed once per transition, not once per pane.
-    let sound_claim = crate::sound::session_claim();
     loop {
         // Reduced motion freezes every member at one fixed instant (0) instead of
         // the live clock — `motion::animate` is a pure function of this value,
@@ -1028,7 +1055,7 @@ where
             transitions.extend(herd.reconcile(&agents, species_count, now_ms));
         }
         if !transitions.is_empty() {
-            crate::sound::play_claimed(sound_player, sound_claim.as_ref(), &transitions, sound_cfg);
+            crate::sound::play_claimed(sound_player, sound_claim, &transitions, sound_cfg);
         }
         // A latched diagnostic outranks the hover caption: a real problem is
         // more useful than "which sheep the cursor is over" (issue #84).
@@ -1270,9 +1297,39 @@ mod tests {
         let species = vec![parse_species(BLOB).unwrap()];
         let herd = fixed_herd(&[Idle, Working, Done, Blocked, Unknown]);
         let mut terminal = Terminal::new(TestBackend::new(90, 11)).unwrap();
-        terminal
+        let completed = terminal
             .draw(|f| draw_herd(f, &herd, &species, Theme::Dark, NOW_MS, None))
             .unwrap();
+
+        // TestBackend's Display emits symbols only, no colour, so the snapshot
+        // below would stay byte-identical if every status's overlay rendered
+        // the same coat, or if blocked's red badge became grey — the five
+        // statuses are differentiated almost entirely by colour (see
+        // `palette::role_color`/`StateStyle`). Both `done` and `blocked` share
+        // the same "!" glyph (only their colour differs), so pin that colour
+        // directly rather than trusting the snapshot to catch a regression.
+        let lane_y = overlay_lane_row0(Rect::new(0, 0, 90, 11));
+        let (row, fg) = row_text_and_fg(completed.buffer, lane_y);
+        let bang_colors: Vec<Color> = row
+            .chars()
+            .enumerate()
+            .filter(|&(_, c)| c == '!')
+            .map(|(i, _)| fg[i])
+            .collect();
+        assert_eq!(
+            bang_colors.len(),
+            2,
+            "both done and blocked show a '!' badge in the overlay lane: {row:?}"
+        );
+        assert!(
+            bang_colors.contains(&Color::Rgb(0xe6, 0x2d, 0x23)),
+            "blocked's badge must be the alert red: {bang_colors:?}"
+        );
+        assert!(
+            bang_colors.contains(&Color::Rgb(0xe6, 0xc8, 0x77)),
+            "done's badge must be the accent ochre, distinct from blocked's red: {bang_colors:?}"
+        );
+
         insta::assert_snapshot!(terminal.backend());
     }
 
@@ -1715,34 +1772,39 @@ mod tests {
     }
 
     #[test]
-    fn left_facing_member_is_mirrored() {
-        // A working member's facing flips as it wanders back and forth. Find two
-        // instants where the same agent faces opposite ways (motion::animate
-        // as an oracle, rather than forcing the field directly — it's derived
-        // now, not stored), and assert the rendered band differs between them.
-        use crate::agent::AgentStatus::Working;
-        let species = vec![parse_species(BLOB).unwrap()];
-        let herd = fixed_herd(&[Working]);
-        let state = &species[0].states[&Working];
-        let right_ms = (0..80_000u64)
-            .step_by(97)
-            .find(|&ms| !animate("t0", Working, state, ms, None).facing_left)
-            .expect("some instant facing right");
-        let left_ms = (0..80_000u64)
-            .step_by(97)
-            .find(|&ms| animate("t0", Working, state, ms, None).facing_left)
-            .expect("some instant facing left");
-        let render = |ms: u64| {
-            let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
-            t.draw(|f| draw_herd(f, &herd, &species, Theme::Dark, ms, None))
-                .unwrap();
-            format!("{}", t.backend())
-        };
+    fn blit_frame_mirrors_the_sprite_horizontally_when_flip_is_true() {
+        // Holds every input but the flip itself fixed (position, frame, hue,
+        // now_ms — there is no now_ms here at all), unlike asserting on two
+        // different instants: `x_fraction`, `frame_index` and `offset.dy` all
+        // differ between any two instants too, so a test comparing rendered
+        // bands at different times can pass for reasons that have nothing to
+        // do with mirroring (e.g. it would still pass with the flip deleted
+        // from `build_band` entirely).
+        let species = parse_species(BLOB).unwrap();
+        // The working frame is asymmetric (`MM../MMM./M##./.MM.`), so a flip
+        // is actually visible rather than a no-op on a symmetric shape.
+        let fr = &species.states[&AgentStatus::Working].frames[0];
+        let style = StateStyle::none();
+
+        let mut right = PixelBuf::new(fr.w, fr.h);
+        blit_frame(&mut right, fr, 0, Theme::Dark, style, 0, 0, false);
+        let mut left = PixelBuf::new(fr.w, fr.h);
+        blit_frame(&mut left, fr, 0, Theme::Dark, style, 0, 0, true);
+
         assert_ne!(
-            render(right_ms),
-            render(left_ms),
-            "mirroring must change the pixels"
+            right.px, left.px,
+            "an asymmetric frame's pixels must actually change when mirrored"
         );
+        for y in 0..fr.h {
+            for x in 0..fr.w {
+                assert_eq!(
+                    right.px[y * fr.w + x],
+                    left.px[y * fr.w + (fr.w - 1 - x)],
+                    "column {x} of the unflipped frame must equal the mirrored \
+                     column of the flipped one, at row {y}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2130,6 +2192,15 @@ mod tests {
         size_calls: Rc<Cell<usize>>,
     }
 
+    /// Forwards to the inner `TestBackend`'s own `Display`, so tests that
+    /// drive `run_loop` through `IoTestBackend` can still inspect the drawn
+    /// cells with `rows_of`/`row_text_and_fg`.
+    impl std::fmt::Display for IoTestBackend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.inner, f)
+        }
+    }
+
     impl IoTestBackend {
         fn new(width: u16, height: u16) -> (Self, Rc<Cell<usize>>) {
             let size_calls = Rc::new(Cell::new(0));
@@ -2320,6 +2391,16 @@ mod tests {
         }
     }
 
+    /// A `TransitionClaim` that grants every transition, so a test never has
+    /// to touch the real filesystem-backed claim store `run` wires up in
+    /// production (see `sound::session_claim`).
+    struct AlwaysClaims;
+    impl crate::sound::TransitionClaim for AlwaysClaims {
+        fn claim(&self, _t: &crate::herd::StatusTransition) -> bool {
+            true
+        }
+    }
+
     /// Drive the real `run_loop` over `script`, starting from a herd of
     /// `states`, and hand back the renderer so the caller can inspect what it
     /// was actually asked to draw. `reduced_motion` pins `now_ms` to 0, which
@@ -2365,6 +2446,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &Diagnostic::new(),
@@ -2457,6 +2539,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &Diagnostic::new(),
@@ -2574,6 +2657,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &Diagnostic::new(),
@@ -2680,6 +2764,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -2740,6 +2825,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -2808,6 +2894,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -2970,6 +3057,205 @@ mod tests {
             1,
             "an all-idle strip must collapse to one drawn frame, got {}",
             seen.len()
+        );
+    }
+
+    // ---- issue #49: run_loop connects reconcile, sound and input ---------
+
+    #[derive(Default)]
+    struct RecordingPlayer {
+        calls: RefCell<Vec<std::path::PathBuf>>,
+    }
+    impl crate::sound::SoundPlayer for RecordingPlayer {
+        fn play(&self, path: &std::path::Path) -> io::Result<()> {
+            self.calls.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_loop_drains_every_queued_snapshot_in_one_tick_and_plays_its_transitions_sound() {
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Two snapshots queued before run_loop ever ticks. If only the newest
+        // were reconciled (a single `try_recv` instead of draining the
+        // channel), "t0" would simply appear already Working — a first
+        // appearance, which `reconcile` never turns into a sound-eligible
+        // transition — instead of transitioning into it from the first
+        // snapshot's Idle.
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+        tx.send(vec![agent("t0", Working), agent("t1", Idle)])
+            .expect("the receiver is still alive");
+        drop(tx);
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(40, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 40, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = CountingRenderer::default();
+        let mut events = ScriptedEvents::new(vec![]); // quits with 'q' after the first tick
+        let sound_player = RecordingPlayer::default();
+        let sound_cfg = crate::config::SoundConfig {
+            enabled: true,
+            working: crate::config::SoundSetting {
+                enabled: true,
+                path: Some(std::path::PathBuf::from("/tmp/working.wav")),
+            },
+            ..crate::config::SoundConfig::default()
+        };
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true, // reduced motion: reconcile and the frame draw share now_ms=0
+            &mut renderer,
+            &sound_cfg,
+            &sound_player,
+            &AlwaysClaims,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &Diagnostic::new(),
+        )
+        .expect("the scripted loop quits cleanly");
+
+        assert_eq!(
+            *sound_player.calls.borrow(),
+            vec![std::path::PathBuf::from("/tmp/working.wav")],
+            "the Idle->Working transition only exists if both queued snapshots \
+             were drained and reconciled within the same tick"
+        );
+    }
+
+    #[test]
+    fn run_loop_updates_the_hover_caption_when_the_mouse_moves_over_a_member() {
+        use AgentStatus::Idle;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let strip_w = 40u16;
+        let state = &species[0].states[&Idle];
+        // Reduced motion pins now_ms to 0 for the whole loop, so the member's
+        // rest column at ms=0 is exactly where the click below must land.
+        let left = (animate("t0", Idle, state, 0, None).x_fraction
+            * band_max_x(&species, strip_w as usize))
+        .round() as u16;
+
+        let mut a = agent("t0", Idle);
+        a.name = Some("sheepy".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![a]).expect("the receiver is still alive");
+        drop(tx);
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(strip_w, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, strip_w, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = HalfBlockRenderer;
+        let mut events = ScriptedEvents::new(vec![
+            Some(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: left,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })),
+            // One more idle tick: the frame signature only changes (and so
+            // only repaints) on the tick *after* `hovered` is updated.
+            None,
+        ]);
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &AlwaysClaims,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &Diagnostic::new(),
+        )
+        .expect("the scripted loop quits cleanly");
+
+        let rows = rows_of(terminal.backend());
+        assert!(
+            rows[0].contains("sheepy"),
+            "the hovered member's label must be drawn once run_loop notices \
+             the Moved event: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn run_loop_focuses_the_clicked_member_via_the_herdr_cli_with_its_terminal_id() {
+        use AgentStatus::Idle;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let strip_w = 40u16;
+        let state = &species[0].states[&Idle];
+        let left = (animate("t0", Idle, state, 0, None).x_fraction
+            * band_max_x(&species, strip_w as usize))
+        .round() as u16;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+        drop(tx);
+
+        let args = Rc::new(RefCell::new(Vec::new()));
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::clone(&args),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(strip_w, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, strip_w, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = HalfBlockRenderer;
+        let mut events = ScriptedEvents::new(vec![Some(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }))]);
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &AlwaysClaims,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &Diagnostic::new(),
+        )
+        .expect("the scripted loop quits cleanly");
+
+        assert_eq!(
+            *args.borrow(),
+            vec!["agent", "focus", "t0"],
+            "a left click on the member must focus it via the herdr CLI, \
+             with the clicked member's own terminal_id"
         );
     }
 }

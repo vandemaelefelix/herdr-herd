@@ -624,6 +624,27 @@ fn parse_split_pane_id(reply: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("no result.pane.pane_id in pane split reply"))
 }
 
+/// Replace this process's image, behind a seam so `reload`'s failure path is
+/// testable: a real `exec` would replace the test binary itself, so it must
+/// never actually run in a test.
+pub trait Exec {
+    /// Exec `self_exe` with the current process's own argv (skipping argv[0]).
+    /// Only returns on failure — a successful exec never comes back.
+    fn exec(&self, self_exe: &str) -> io::Error;
+}
+
+/// Production: `execve` over this process, preserving argv.
+pub struct RealExec;
+
+#[cfg(unix)]
+impl Exec for RealExec {
+    fn exec(&self, self_exe: &str) -> io::Error {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::Command::new(self_exe).args(args).exec()
+    }
+}
+
 /// Run the watchdog: take the single-owner lock (exit cleanly if another
 /// controller holds it), then sweep every `interval` forever. The poll unifies
 /// startup, new-tab injection, and respawn/re-assert (a closed strip reappears
@@ -652,22 +673,45 @@ pub fn control(
         target_rows,
         probe_every_sweeps(interval),
     );
+    let exec = RealExec;
     let mut baseline = binary_stamp(self_exe);
     loop {
-        if binary_changed(baseline, binary_stamp(self_exe)) {
-            let err = reload(cli, self_exe);
-            // Only reached if the re-exec failed. Adopt the new stamp anyway,
-            // so a binary we cannot exec does not restart the herd on every
-            // sweep forever, then keep sweeping: this image is stale, but the
-            // sweep re-injects the strips just closed, and a stale herd beats
-            // no herd.
-            eprintln!("herdr-herd: could not re-exec {self_exe}: {err}; staying on this build");
-            baseline = binary_stamp(self_exe);
-        }
-        if let Err(e) = sweeper.sweep_once() {
-            eprintln!("herdr-herd: sweep failed: {e}");
-        }
+        control_tick(
+            &mut sweeper,
+            cli,
+            &exec,
+            self_exe,
+            &mut baseline,
+            binary_stamp(self_exe),
+        );
         std::thread::sleep(interval);
+    }
+}
+
+/// One control-loop iteration: reload if the binary changed underneath us,
+/// then sweep. Split out from [`control`]'s infinite loop so tests can drive a
+/// bounded number of iterations instead of the real `thread::sleep` forever;
+/// `current_stamp` is this iteration's freshly read binary stamp, read by the
+/// caller so a test can supply one directly without touching the filesystem.
+fn control_tick(
+    sweeper: &mut Sweeper,
+    cli: &dyn HerdrCli,
+    exec: &dyn Exec,
+    self_exe: &str,
+    baseline: &mut Option<u64>,
+    current_stamp: Option<u64>,
+) {
+    if binary_changed(*baseline, current_stamp) {
+        let err = reload(cli, self_exe, exec);
+        // Only reached if the re-exec failed. Adopt the new stamp anyway, so a
+        // binary we cannot exec does not restart the herd on every tick
+        // forever, then keep sweeping: this image is stale, but the sweep
+        // re-injects the strips just closed, and a stale herd beats no herd.
+        eprintln!("herdr-herd: could not re-exec {self_exe}: {err}; staying on this build");
+        *baseline = current_stamp;
+    }
+    if let Err(e) = sweeper.sweep_once() {
+        eprintln!("herdr-herd: sweep failed: {e}");
     }
 }
 
@@ -679,7 +723,7 @@ pub fn control(
 /// the controller lock. The lock is *not* dropped first, deliberately: Rust
 /// opens files `O_CLOEXEC`, so a successful `exec` releases it at exactly the
 /// right moment — after the point of no return — and the successor can take it.
-fn reload(cli: &dyn HerdrCli, self_exe: &str) -> io::Error {
+fn reload(cli: &dyn HerdrCli, self_exe: &str, exec: &dyn Exec) -> io::Error {
     eprintln!("herdr-herd: binary changed; restarting the herd");
     match cli.run_json(&["pane", "list"]).map(|s| parse_panes(&s)) {
         Ok(Ok(panes)) => close_strips(cli, &panes),
@@ -687,16 +731,7 @@ fn reload(cli: &dyn HerdrCli, self_exe: &str) -> io::Error {
             eprintln!("herdr-herd: could not list panes to restart them: {e}");
         }
     }
-    exec_self(self_exe)
-}
-
-/// Replace this process with a fresh `self_exe`, preserving argv. Only returns
-/// on failure — a successful `exec` never comes back.
-#[cfg(unix)]
-fn exec_self(self_exe: &str) -> io::Error {
-    use std::os::unix::process::CommandExt;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    std::process::Command::new(self_exe).args(args).exec()
+    exec.exec(self_exe)
 }
 
 /// Session-scoped path for the controller lock: next to the herdr socket if
@@ -720,6 +755,7 @@ pub fn controller_lock_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// A sweeper with no socket (so every read goes through the CLI double) and
     /// `probe_every = 1`, i.e. probing every strip every sweep.
@@ -1682,5 +1718,239 @@ mod tests {
             .collect();
         // t1 and t2 injected; t3 (stripped) and t4 (columned) skipped.
         assert_eq!(split_targets, vec!["w1:p1", "w1:p2"]);
+    }
+
+    // ---- issue #49: control()/reload()'s lifecycle -----------------------
+
+    #[test]
+    fn sweep_once_propagates_an_error_when_tab_list_fails() {
+        struct FailingTabList;
+        impl HerdrCli for FailingTabList {
+            fn run_json(&self, args: &[&str]) -> io::Result<String> {
+                match args {
+                    ["tab", "list"] => Err(io::Error::other("boom")),
+                    _ => Ok(r#"{"result":{"panes":[]}}"#.into()),
+                }
+            }
+        }
+        assert!(
+            sweeper(&FailingTabList).sweep_once().is_err(),
+            "a failed tab list must surface, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn sweep_once_propagates_an_error_when_pane_list_fails() {
+        struct FailingPaneList;
+        impl HerdrCli for FailingPaneList {
+            fn run_json(&self, args: &[&str]) -> io::Result<String> {
+                match args {
+                    ["tab", "list"] => Ok(r#"{"result":{"tabs":[]}}"#.into()),
+                    ["pane", "list"] => Err(io::Error::other("boom")),
+                    _ => Ok(r#"{"result":{}}"#.into()),
+                }
+            }
+        }
+        assert!(
+            sweeper(&FailingPaneList).sweep_once().is_err(),
+            "a failed pane list must surface, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn control_exits_cleanly_when_another_controller_already_holds_the_lock() {
+        let lock_path = std::env::temp_dir().join(format!(
+            "herdr-herd-control-test-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&lock_path);
+        let _held = lock::acquire(&lock_path)
+            .unwrap()
+            .expect("this test holds the lock first");
+
+        let cli = FakeCli::new();
+        let result = control(
+            None,
+            &cli,
+            "/abs/herdr-herd",
+            None,
+            &lock_path,
+            Duration::from_secs(1),
+            7,
+        );
+        assert!(
+            result.is_ok(),
+            "a lock contention exit must be a clean Ok(()), not an error"
+        );
+        assert!(
+            cli.calls.borrow().is_empty(),
+            "no sweep work happens when the lock is contended"
+        );
+
+        drop(_held);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// An `Exec` double that always fails (a real success would replace the
+    /// test binary), recording every attempt.
+    struct FailingExec {
+        calls: RefCell<usize>,
+    }
+    impl Exec for FailingExec {
+        fn exec(&self, _self_exe: &str) -> io::Error {
+            *self.calls.borrow_mut() += 1;
+            io::Error::other("exec unavailable in tests")
+        }
+    }
+
+    #[test]
+    fn control_tick_reloads_and_adopts_the_new_stamp_when_the_exec_fails() {
+        let cli = one_tab_cli();
+        let exec = FailingExec {
+            calls: RefCell::new(0),
+        };
+        let mut sw = sweeper(&cli);
+        let mut baseline = Some(100);
+
+        control_tick(
+            &mut sw,
+            &cli,
+            &exec,
+            "/abs/herdr-herd",
+            &mut baseline,
+            Some(200),
+        );
+
+        assert_eq!(
+            *exec.calls.borrow(),
+            1,
+            "a changed stamp must trigger exactly one reload attempt"
+        );
+        assert_eq!(
+            baseline,
+            Some(200),
+            "the new stamp is adopted even though the exec failed, so a binary \
+             that cannot be exec'd does not retry every tick forever"
+        );
+    }
+
+    #[test]
+    fn control_tick_does_not_reload_when_the_stamp_is_unchanged() {
+        let cli = one_tab_cli();
+        let exec = FailingExec {
+            calls: RefCell::new(0),
+        };
+        let mut sw = sweeper(&cli);
+        let mut baseline = Some(100);
+
+        control_tick(
+            &mut sw,
+            &cli,
+            &exec,
+            "/abs/herdr-herd",
+            &mut baseline,
+            Some(100),
+        );
+
+        assert_eq!(
+            *exec.calls.borrow(),
+            0,
+            "an unchanged stamp reloads nothing"
+        );
+        assert_eq!(baseline, Some(100));
+    }
+
+    #[test]
+    fn control_tick_still_sweeps_after_a_failed_reload() {
+        let cli = one_tab_cli();
+        let exec = FailingExec {
+            calls: RefCell::new(0),
+        };
+        let mut sw = sweeper(&cli);
+        let mut baseline = Some(1);
+
+        control_tick(
+            &mut sw,
+            &cli,
+            &exec,
+            "/abs/herdr-herd",
+            &mut baseline,
+            Some(2),
+        );
+
+        // one_tab_cli's tab has no full-width-bottom candidate probed here
+        // (it already holds a strip), so the sweep itself is a no-op; what
+        // matters is that it ran at all rather than being skipped after the
+        // reload failure.
+        assert!(
+            cli.calls
+                .borrow()
+                .iter()
+                .any(|c| c[..2] == ["tab".to_string(), "list".to_string()]),
+            "the sweep must still run in the same tick as a failed reload"
+        );
+    }
+
+    #[test]
+    fn control_tick_reload_closes_strips_before_attempting_the_reexec() {
+        struct OrderedCli {
+            log: Rc<RefCell<Vec<String>>>,
+        }
+        impl HerdrCli for OrderedCli {
+            fn run_json(&self, args: &[&str]) -> io::Result<String> {
+                self.log
+                    .borrow_mut()
+                    .push(format!("cli:{}", args.join(" ")));
+                match args {
+                    ["pane", "list"] => Ok(r#"{"result":{"panes":[
+                        {"pane_id":"w1:p1","tab_id":"w1:t1","label":"herdr-herd"}]}}"#
+                        .into()),
+                    ["tab", "list"] => Ok(r#"{"result":{"tabs":[]}}"#.into()),
+                    _ => Ok(r#"{"result":{}}"#.into()),
+                }
+            }
+        }
+        struct OrderedExec {
+            log: Rc<RefCell<Vec<String>>>,
+        }
+        impl Exec for OrderedExec {
+            fn exec(&self, _self_exe: &str) -> io::Error {
+                self.log.borrow_mut().push("exec".into());
+                io::Error::other("boom")
+            }
+        }
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let cli = OrderedCli {
+            log: Rc::clone(&log),
+        };
+        let exec = OrderedExec {
+            log: Rc::clone(&log),
+        };
+        let mut sw = sweeper(&cli);
+        let mut baseline = Some(1);
+
+        control_tick(
+            &mut sw,
+            &cli,
+            &exec,
+            "/abs/herdr-herd",
+            &mut baseline,
+            Some(2),
+        );
+
+        let log = log.borrow();
+        let exec_pos = log
+            .iter()
+            .position(|e| e == "exec")
+            .expect("exec attempted");
+        let close_pos = log
+            .iter()
+            .position(|e| e == "cli:pane close w1:p1")
+            .expect("the labelled strip was closed");
+        assert!(
+            close_pos < exec_pos,
+            "strips must be closed before the re-exec is attempted: {log:?}"
+        );
     }
 }

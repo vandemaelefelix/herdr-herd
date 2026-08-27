@@ -136,9 +136,9 @@ impl Default for Timings {
 
 /// The refresh schedule: when the next refresh is due, given what has arrived.
 ///
-/// Split out from the loop so both the real watcher and [`drain_events`] make
-/// the same decisions, and so the decisions can be tested without a thread, a
-/// socket or a clock.
+/// Split out from the loop so the debounce/coalesce decisions can be tested
+/// directly — without a thread, a socket or a clock — independently of
+/// [`watch`], which drives the same schedule against the real socket/clock.
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     timings: Timings,
@@ -190,41 +190,6 @@ impl Debouncer {
         self.last_send = Some(now_ms);
         self.due_at = None;
     }
-}
-
-/// Test seam: consume every line a socket yields, applying the same schedule
-/// the real loop applies, and return the snapshots that would be pushed.
-/// `event_time(i)` supplies the clock reading (ms) for the i-th event so tests
-/// can place events in and out of the debounce windows.
-///
-/// Only the event-driven decisions: nothing here waits for a window to close on
-/// its own, because the socket runs dry rather than idling.
-pub fn drain_events(
-    feed: &mut HerdFeed,
-    socket: &mut dyn SocketClient,
-    timings: Timings,
-    mut event_time: impl FnMut(usize) -> u64,
-) -> Vec<Vec<Agent>> {
-    let _ = socket.send_line(&subscribe_request());
-    let mut snaps = Vec::new();
-    let mut schedule = Debouncer::new(timings);
-    let mut i = 0;
-    while let Ok(line) = socket.recv_line() {
-        let t = event_time(i);
-        i += 1;
-        let class = classify_event(&line);
-        if class == EventClass::Labels {
-            feed.invalidate_labels();
-        }
-        schedule.on_event(class, t);
-        if schedule.due(t) {
-            if let Some(s) = feed.herd(t) {
-                snaps.push(s);
-            }
-            schedule.sent(t);
-        }
-    }
-    snaps
 }
 
 /// Spawn the real watcher thread. Pushes an initial snapshot, then subscribes
@@ -321,7 +286,6 @@ pub fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentStatus;
     use crate::herdr::{CommandRunner, LiveHerdr};
     use std::ffi::OsStr;
     use std::os::unix::process::ExitStatusExt;
@@ -375,77 +339,36 @@ mod tests {
         HerdFeed::new(None, Box::new(LiveHerdr::with_runner("herdr", FakeRunner)))
     }
 
-    // A fake socket that emits N event lines then blocks forever (returns Err).
-    struct FakeSocket {
-        remaining: usize,
-        line: String,
-    }
-    impl FakeSocket {
-        fn emitting(n: usize) -> Self {
-            Self::emitting_line(n, r#"{"event":"pane_agent_status_changed"}"#)
-        }
-
-        /// Emit `n` copies of a caller-chosen wire line, verbatim. Lets a
-        /// test push a real herdr event line (e.g. `pane_focused`) through
-        /// `drain_events` instead of a hand-built `EventClass`.
-        fn emitting_line(n: usize, line: &str) -> Self {
-            Self {
-                remaining: n,
-                line: line.to_string(),
-            }
-        }
-    }
-    impl crate::socket::SocketClient for FakeSocket {
-        fn send_line(&mut self, _l: &str) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn recv_line(&mut self) -> std::io::Result<String> {
-            if self.remaining == 0 {
-                return Err(std::io::Error::other("done"));
-            }
-            self.remaining -= 1;
-            Ok(self.line.clone())
-        }
-    }
-
-    fn timings(debounce_ms: u64) -> Timings {
-        Timings {
-            debounce_ms,
-            ..Timings::default()
-        }
-    }
-
     /// The first event of a session (nothing sent yet) refreshes right away,
     /// same as `watch()`'s initial snapshot. Everything that lands inside the
     /// window it opens is held and coalesced into one trailing refetch once
-    /// the window closes, rather than each being dropped on the floor.
+    /// the window closes, rather than each being dropped on the floor. Tests
+    /// `Debouncer` directly (see issue #49: `drain_events`, a test-only
+    /// reimplementation of this same rule, has been replaced by driving
+    /// `watch()` itself further down).
     #[test]
-    fn debounce_coalesces_a_burst_into_one_refetch() {
-        let mut feed = cli_feed();
+    fn debounce_delivers_an_immediate_priming_refresh_then_one_trailing_refetch_for_the_burst() {
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
+        });
         // event 0 primes the schedule (nothing sent yet, so it fires at
         // once); events 1-4 land inside the 250ms window it opens and must
         // not each refetch; event 5, past the window, is what finally
         // flushes them as a single coalesced refetch.
-        let times = [0u64, 10, 50, 100, 200, 300];
-        let mut i = 0;
-        let snaps = drain_events(
-            &mut feed,
-            &mut FakeSocket::emitting(times.len()),
-            timings(250),
-            move |_| {
-                let t = times[i];
-                i += 1;
-                t
-            },
-        );
+        let mut refetches = 0;
+        for t in [0u64, 10, 50, 100, 200, 300] {
+            d.on_event(EventClass::Structural, t);
+            if d.due(t) {
+                refetches += 1;
+                d.sent(t);
+            }
+        }
         assert_eq!(
-            snaps.len(),
-            2,
+            refetches, 2,
             "one immediate refetch for the priming event, one trailing \
              refetch for the whole burst behind it"
         );
-        assert_eq!(snaps[1].len(), 1);
-        assert_eq!(snaps[1][0].agent_status, AgentStatus::Idle);
     }
 
     /// The core of #38: a burst of events inside one window must not each
@@ -454,7 +377,10 @@ mod tests {
     /// settled state, not whichever event happened to arrive first.
     #[test]
     fn a_burst_of_events_inside_the_window_stays_undue_until_it_closes() {
-        let mut d = Debouncer::new(timings(250));
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
+        });
         d.sent(0);
         for t in [1u64, 5, 40, 120, 200] {
             d.on_event(EventClass::Structural, t);
@@ -464,51 +390,22 @@ mod tests {
     }
 
     #[test]
-    fn separated_events_produce_separate_refetches() {
-        let mut feed = cli_feed();
-        let mut tick = 0u64;
-        let snaps = drain_events(
-            &mut feed,
-            &mut FakeSocket::emitting(3),
-            timings(250),
-            move |_| {
-                tick += 1000;
-                tick
-            },
-        );
-        assert_eq!(snaps.len(), 3);
-    }
-
-    /// #75: the fast focus window only protects the hat if a real wire line
-    /// actually reaches it. Every other test of the fast path builds
-    /// `EventClass::Focus` by hand, so it would stay green even if
-    /// `classify_event` mapped `pane_focused` to the wrong class entirely
-    /// (herdr's wire names are underscored; `subscribe_request`'s
-    /// subscription types are dotted, and it is easy to get that backwards).
-    /// This one starts from the literal line herdr emits and goes through
-    /// `drain_events` end to end, so it fails if that mapping breaks.
-    #[test]
-    fn a_real_pane_focused_wire_line_takes_the_fast_focus_window() {
-        let mut feed = cli_feed();
-        let mut socket = FakeSocket::emitting_line(2, r#"{"event":"pane_focused"}"#);
-        // First line primes the schedule (nothing sent yet, fires at once);
-        // the second lands 150ms later. That is well inside the 100ms focus
-        // window closing, but nowhere near the 750ms structural one, so it
-        // can only be due here if classify_event routed it to Focus.
-        let times = [0u64, 150];
-        let mut i = 0;
-        let snaps = drain_events(&mut feed, &mut socket, Timings::default(), move |_| {
-            let t = times[i];
-            i += 1;
-            t
+    fn debounce_produces_a_separate_refetch_for_each_widely_spaced_event() {
+        let mut d = Debouncer::new(Timings {
+            debounce_ms: 250,
+            ..Timings::default()
         });
+        let mut refetches = 0;
+        for t in [1_000u64, 2_000, 3_000] {
+            d.on_event(EventClass::Structural, t);
+            if d.due(t) {
+                refetches += 1;
+                d.sent(t);
+            }
+        }
         assert_eq!(
-            snaps.len(),
-            2,
-            "a real pane_focused line must be due within the 100ms focus \
-             window; if it fell back to the 750ms structural one this second \
-             line would not be due yet and only the priming refetch would \
-             have happened"
+            refetches, 3,
+            "events spaced well past the debounce window each get their own refetch"
         );
     }
 
@@ -623,5 +520,307 @@ mod tests {
             t.focus_ms < t.debounce_ms,
             "raising the debounce must not slow the hat"
         );
+    }
+
+    // ---- issue #49: drive `watch` itself, not a test-only shadow ---------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A deterministic, `Send` clock for driving `watch` on its own spawned
+    /// thread: every call advances by a fixed `step`, so a test can reason
+    /// about exactly which `now_ms` reading backs each loop decision without
+    /// touching the real clock.
+    struct StepClock {
+        ms: AtomicU64,
+        step: u64,
+    }
+
+    impl StepClock {
+        fn new(step: u64) -> Self {
+            Self {
+                ms: AtomicU64::new(0),
+                step,
+            }
+        }
+    }
+
+    impl Clock for StepClock {
+        fn now_ms(&self) -> u64 {
+            self.ms.fetch_add(self.step, Ordering::SeqCst)
+        }
+    }
+
+    /// A `Send` clock that returns each of `values` in order, then freezes at
+    /// the last one forever. Unlike [`StepClock`], this never advances on its
+    /// own: a test that must distinguish "due because of window A" from "due
+    /// because of window B" cannot use an ever-advancing clock, since `watch`'s
+    /// idle branch has no real sleep and will eventually trip *any* window,
+    /// however large, defeating the distinction (see
+    /// `a_pane_focused_wire_line_reaches_watch_via_the_fast_focus_window`).
+    struct ScriptedClock {
+        values: Vec<u64>,
+        next: std::sync::Mutex<usize>,
+    }
+
+    impl ScriptedClock {
+        fn new(values: Vec<u64>) -> Self {
+            assert!(!values.is_empty());
+            Self {
+                values,
+                next: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl Clock for ScriptedClock {
+        fn now_ms(&self) -> u64 {
+            let mut i = self.next.lock().unwrap();
+            let v = self.values[(*i).min(self.values.len() - 1)];
+            if *i + 1 < self.values.len() {
+                *i += 1;
+            }
+            v
+        }
+    }
+
+    /// One scripted `recv_line` outcome for [`ScriptedSocket`].
+    #[derive(Clone)]
+    enum SocketOutcome {
+        /// A framed event line arrives.
+        Line(&'static str),
+        /// `WouldBlock`: the real idle tick within the read timeout, not a
+        /// dead connection (see [`SocketClient::recv_line`]).
+        Idle,
+        /// A real close: the production loop must degrade to poll-only.
+        Closed,
+    }
+
+    /// A `SocketClient` double that drives `watch` directly, per issue #49,
+    /// replacing `drain_events`, a test-only reimplementation of the debounce
+    /// rule that could drift from the real loop. Yields each scripted outcome
+    /// in order; once exhausted, settles into permanent idle ticks, which is
+    /// always safe (never a hang risk) unlike defaulting to a close, which
+    /// would route every exhausted script into the real `thread::sleep`
+    /// degrade path.
+    struct ScriptedSocket {
+        script: std::collections::VecDeque<SocketOutcome>,
+    }
+
+    impl ScriptedSocket {
+        fn new(script: Vec<SocketOutcome>) -> Self {
+            Self {
+                script: script.into(),
+            }
+        }
+    }
+
+    impl crate::socket::SocketClient for ScriptedSocket {
+        fn send_line(&mut self, _line: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn recv_line(&mut self) -> std::io::Result<String> {
+            match self.script.pop_front() {
+                Some(SocketOutcome::Line(l)) => Ok(l.to_string()),
+                Some(SocketOutcome::Closed) => Err(std::io::Error::other("closed")),
+                Some(SocketOutcome::Idle) | None => {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for `handle` to finish. A bare `.join()` on a
+    /// wedged watcher thread would hang the whole suite with no diagnostic
+    /// (the same failure mode issue #53 names for socket tests); this fails
+    /// loudly instead.
+    fn join_with_timeout<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => std::panic::resume_unwind(e),
+            Err(_) => panic!("watcher thread did not finish within {timeout:?}"),
+        }
+    }
+
+    const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+    const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn watch_pushes_an_initial_snapshot_then_a_debounced_refresh_for_a_burst_of_events() {
+        // A near-infinite slow poll isolates this test to the debounce path
+        // (own `last_send` bookkeeping) rather than the safety net.
+        let timings = Timings {
+            slow_ms: 1_000_000,
+            debounce_ms: 50,
+            focus_ms: 50,
+        };
+        let socket = ScriptedSocket::new(vec![
+            SocketOutcome::Line(r#"{"event":"pane_created"}"#),
+            SocketOutcome::Line(r#"{"event":"pane_created"}"#),
+        ]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(20)),
+            tx,
+            timings,
+            Diagnostic::new(),
+        );
+
+        let initial = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("the initial snapshot is pushed before any socket event");
+        assert_eq!(initial.len(), 1);
+
+        let refreshed = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("a debounced refresh follows the burst of structural events");
+        assert_eq!(refreshed.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    #[test]
+    fn watch_treats_idle_ticks_as_a_normal_wait_and_the_slow_poll_net_still_fires() {
+        // The debounce window is effectively infinite, so with zero events at
+        // all the only thing that can produce a second snapshot is the
+        // slow-poll safety net — proving idle ticks (`WouldBlock`) are neither
+        // mistaken for a close nor themselves trigger a refresh.
+        let timings = Timings {
+            slow_ms: 40,
+            debounce_ms: 1_000_000,
+            focus_ms: 1_000_000,
+        };
+        let socket = ScriptedSocket::new(vec![SocketOutcome::Idle; 50]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(10)),
+            tx,
+            timings,
+            Diagnostic::new(),
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        let polled = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("the slow-poll net still refreshes with no socket events at all");
+        assert_eq!(polled.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    #[test]
+    fn watch_degrades_to_poll_only_when_the_socket_closes_for_real() {
+        let timings = Timings {
+            slow_ms: 5,
+            debounce_ms: 1_000_000,
+            focus_ms: 1_000_000,
+        };
+        let socket = ScriptedSocket::new(vec![SocketOutcome::Closed]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(StepClock::new(10)),
+            tx,
+            timings,
+            Diagnostic::new(),
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        // The socket closes on the very first read; production must degrade
+        // to poll-only rather than treat that as fatal, so a refresh must
+        // still arrive off the slow-poll safety net alone.
+        let polled = rx
+            .recv_timeout(RECV_TIMEOUT)
+            .expect("a poll-only refresh still arrives after the socket closes");
+        assert_eq!(polled.len(), 1);
+
+        drop(rx);
+        join_with_timeout(handle, JOIN_TIMEOUT);
+    }
+
+    /// #75: the fast focus window only protects the hat if a real wire line
+    /// actually reaches it. Every other test of the fast path builds
+    /// `EventClass::Focus` by hand, so it would stay green even if
+    /// `classify_event` mapped `pane_focused` to the wrong class entirely
+    /// (herdr's wire names are underscored; `subscribe_request`'s subscription
+    /// types are dotted, and it is easy to get that backwards).
+    ///
+    /// Ported from a `drain_events`-based test (issue #49: `drain_events` is a
+    /// test-only reimplementation of this same debounce rule and has been
+    /// deleted) to drive the real `watch()` loop instead, which is a strictly
+    /// stronger proof: it shows the wire line reaches the fast path through
+    /// production code, not through a seam that mirrors it.
+    ///
+    /// `now_ms` is pinned to an exact, non-advancing sequence (`ScriptedClock`,
+    /// not the auto-advancing `StepClock`): with no real sleep on the idle
+    /// path, an ever-advancing clock eventually trips *any* window, focus,
+    /// structural or the slow poll, so it can't tell them apart. Freezing the
+    /// clock the instant this scenario is decided means a second snapshot can
+    /// only arrive if the 100ms focus window closed it, not the 750ms
+    /// structural one or the 2500ms slow poll.
+    ///
+    /// Verified against the exact mutation issue #75 names — replacing
+    /// `classify_event`'s `name.ends_with("_focused")` branch with `false` —
+    /// which routes this line to `Structural` and makes the assertion below
+    /// time out (the clock freezes at 150ms, short of the 750ms structural
+    /// close), while it passes against the real function.
+    #[test]
+    fn a_pane_focused_wire_line_reaches_watch_via_the_fast_focus_window() {
+        let socket = ScriptedSocket::new(vec![
+            SocketOutcome::Line(r#"{"event":"pane_focused"}"#),
+            // Closes right after, so the loop settles into a real (bounded)
+            // `thread::sleep` once the clock freezes, instead of a tight
+            // CPU-spinning idle loop for the rest of the test binary's life.
+            SocketOutcome::Closed,
+        ]);
+        // call 1 (before the loop): the initial snapshot, t=0.
+        // call 2: on_event(Focus, 50) for the pane_focused line -> due_at=100.
+        // call 3: the same iteration's due-check at t=50 -> not due yet.
+        // call 4 (next iteration, right as the socket closes): due-check at
+        // t=150 -> due only if the 100ms focus window applies; frozen here
+        // forever after, so the 750ms structural window and the 2500ms slow
+        // poll (which do not care about t=150) can never fire instead.
+        let clock = ScriptedClock::new(vec![0, 50, 50, 150]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Not joined: once the clock freezes at 150ms and the socket has
+        // closed, due() is false forever, so the thread just sleeps
+        // (Timings::default()'s slow_ms) harmlessly until the test binary
+        // exits, the same as a real watcher whose pane was simply killed.
+        let _handle = watch(
+            cli_feed(),
+            Some(Box::new(socket)),
+            Box::new(clock),
+            tx,
+            Timings::default(),
+            Diagnostic::new(),
+        );
+
+        let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
+        assert_eq!(initial.len(), 1);
+
+        let focused = rx.recv_timeout(RECV_TIMEOUT).expect(
+            "a pane_focused line must be due within the 100ms focus window; if \
+             it fell back to the 750ms structural window (or the 2500ms slow \
+             poll) the clock freezes at 150ms and this would never arrive",
+        );
+        assert_eq!(focused.len(), 1);
     }
 }
