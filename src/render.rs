@@ -21,6 +21,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::agent::{Agent, AgentIconStyle};
 use crate::anim::{Overlay, OverlayColor, Rgb};
+use crate::diag::Diagnostic;
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
 use crate::marker;
@@ -887,6 +888,7 @@ pub fn run(
     sound_cfg: crate::config::SoundConfig,
     sound_player: Box<dyn crate::sound::SoundPlayer>,
     agent_icon: AgentIconStyle,
+    diag: Diagnostic,
 ) -> io::Result<()> {
     // Every terminal mutation below belongs to `guard`, so the `?`s here and a
     // panic inside the loop both hand the terminal back (issue #35).
@@ -928,6 +930,7 @@ pub fn run(
         sound_player.as_ref(),
         &mut CrosstermEvents,
         agent_icon,
+        &diag,
     );
 
     let _ = renderer.teardown(); // best-effort: deletes any transmitted kitty images
@@ -973,6 +976,7 @@ fn run_loop<B: ratatui::backend::Backend>(
     sound_player: &dyn crate::sound::SoundPlayer,
     events: &mut dyn EventSource,
     agent_icon: AgentIconStyle,
+    diag: &Diagnostic,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -1013,7 +1017,9 @@ where
         // Mouse hit-testing has to agree with what is on screen, so the width
         // it uses is the width the last frame actually drew at.
         let strip_w = area.width as usize;
-        let caption = hovered.clone();
+        // A latched diagnostic outranks the hover caption: a real problem is
+        // more useful than "which sheep the cursor is over" (issue #84).
+        let caption = diag.get().or_else(|| hovered.clone());
         // Skip the whole frame when nothing visible changed. Measured on an
         // idle pane, 1197 of 1199 frames produce zero changed cells, yet each
         // one still allocates an 8.6-14.4 KB `PixelBuf`, blits it, and writes
@@ -1058,8 +1064,11 @@ where
                             renderer.member_at_column(&herd, species, strip_w, column, now_ms)
                         {
                             let tid = herd.members[i].terminal_id.clone();
-                            // Swallow focus errors: the strip must keep running.
-                            let _ = focus_agent(focus, &tid);
+                            // The strip must keep running on a failed focus,
+                            // but not silently forever: latch it (issue #84).
+                            if let Err(e) = focus_agent(focus, &tid) {
+                                diag.set(format!("focus failed: {e}"));
+                            }
                         }
                     }
                     _ => {}
@@ -2147,6 +2156,7 @@ mod tests {
     struct CountingRenderer {
         draws: usize,
         areas: Vec<Rect>,
+        captions: Vec<Option<String>>,
     }
 
     impl MemberRenderer for CountingRenderer {
@@ -2157,10 +2167,11 @@ mod tests {
             _species: &[Species],
             _theme: Theme,
             _now_ms: u64,
-            _hover_label: Option<&str>,
+            hover_label: Option<&str>,
         ) {
             self.draws += 1;
             self.areas.push(frame.area());
+            self.captions.push(hover_label.map(String::from));
         }
         fn frame_signature(
             &self,
@@ -2185,6 +2196,51 @@ mod tests {
         }
         fn backend_name(&self) -> &'static str {
             "counting"
+        }
+    }
+
+    /// Wraps [`CountingRenderer`] but reports every column as a hit on member
+    /// 0, so a scripted mouse event actually populates the hover caption (or
+    /// reaches the click-to-focus path) instead of always landing on `None`.
+    struct HitRenderer(CountingRenderer);
+
+    impl MemberRenderer for HitRenderer {
+        fn draw(
+            &mut self,
+            frame: &mut Frame,
+            herd: &Herd,
+            species: &[Species],
+            theme: Theme,
+            now_ms: u64,
+            hover_label: Option<&str>,
+        ) {
+            self.0
+                .draw(frame, herd, species, theme, now_ms, hover_label);
+        }
+        fn frame_signature(
+            &self,
+            herd: &Herd,
+            species: &[Species],
+            theme: Theme,
+            area: Rect,
+            now_ms: u64,
+            hover_label: Option<&str>,
+        ) -> u64 {
+            self.0
+                .frame_signature(herd, species, theme, area, now_ms, hover_label)
+        }
+        fn member_at_column(
+            &self,
+            _herd: &Herd,
+            _species: &[Species],
+            _strip_w: usize,
+            _col: u16,
+            _now_ms: u64,
+        ) -> Option<usize> {
+            Some(0)
+        }
+        fn backend_name(&self) -> &'static str {
+            "hit"
         }
     }
 
@@ -2266,6 +2322,7 @@ mod tests {
             &SilentPlayer,
             &mut events,
             AgentIconStyle::Emoji,
+            &Diagnostic::new(),
         )
         .expect("the scripted loop quits cleanly");
         renderer
@@ -2379,6 +2436,7 @@ mod tests {
             &SilentPlayer,
             &mut events,
             AgentIconStyle::Emoji,
+            &Diagnostic::new(),
         )
         .expect("the scripted loop quits cleanly");
 
@@ -2414,6 +2472,212 @@ mod tests {
             size_calls.get(),
             0,
             "the render loop must not query the terminal size per frame"
+        );
+    }
+
+    // ---- issue #84: diagnostics drawn into the strip, never eprintln'd ----
+
+    #[test]
+    fn this_module_never_writes_to_stdout_or_stderr() {
+        // `run_loop` and everything it calls directly execute inside the
+        // strip's raw mode + alternate screen (`crate::term::TerminalGuard`),
+        // which shares its tty with stderr — see the `rust-error-handling`
+        // skill's rule 6 and `crate::diag`. Mirrors `sound`'s copy of this
+        // guard, built from parts so this list does not trip its own scan.
+        let bang = "!";
+        let banned = [
+            format!("println{bang}"),
+            format!("eprintln{bang}"),
+            format!("print{bang}("),
+            format!("eprint{bang}("),
+            format!("dbg{bang}("),
+        ];
+        let source = include_str!("render.rs");
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // doc/line comments may mention these macros in prose
+            }
+            for needle in &banned {
+                assert!(
+                    !line.contains(needle.as_str()),
+                    "found `{needle}` outside a comment, in: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_latched_diagnostic_reaches_the_strip_even_with_nothing_hovered() {
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+        drop(tx);
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(40, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 40, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = CountingRenderer::default();
+        let mut events = ScriptedEvents::new(vec![None]);
+        let diag = Diagnostic::new();
+        diag.set("herd refresh failed: socket and herdr CLI both unavailable");
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &diag,
+        )
+        .expect("the scripted loop quits cleanly");
+
+        assert_eq!(
+            renderer.captions.first(),
+            Some(&Some(
+                "herd refresh failed: socket and herdr CLI both unavailable".to_string()
+            )),
+            "a latched diagnostic must reach the strip's caption lane, not stderr, \
+             even though nothing is hovered"
+        );
+    }
+
+    #[test]
+    fn a_latched_diagnostic_outranks_the_hover_caption() {
+        use AgentStatus::*;
+        let species = vec![parse_species(BLOB).unwrap()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+        drop(tx);
+
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let (backend, _) = IoTestBackend::new(40, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 40, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        // `HitRenderer` makes every column hit member 0, so the `Moved` event
+        // below genuinely populates `hovered` with that member's label rather
+        // than leaving it `None` (which `CountingRenderer` alone would).
+        let mut renderer = HitRenderer(CountingRenderer::default());
+        let mut events = ScriptedEvents::new(vec![
+            Some(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })),
+            None, // one more idle tick, so a second frame draws with hover already set
+        ]);
+        let diag = Diagnostic::new();
+        diag.set("focus failed: herdr exited non-zero");
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &diag,
+        )
+        .expect("the scripted loop quits cleanly");
+
+        let sanity_herd = fixed_herd(&[Idle]);
+        assert_ne!(
+            next_hover(Some(0), &sanity_herd.members, AgentIconStyle::Emoji),
+            None,
+            "sanity: member 0 does have a label to hover"
+        );
+        assert!(
+            renderer
+                .0
+                .captions
+                .iter()
+                .all(|c| c.as_deref() == Some("focus failed: herdr exited non-zero")),
+            "the diagnostic must win over a real, populated hover caption, on every \
+             drawn frame: {:?}",
+            renderer.0.captions
+        );
+    }
+
+    #[test]
+    fn a_failed_focus_click_latches_a_diagnostic_instead_of_vanishing() {
+        use AgentStatus::*;
+
+        struct FailingRunner;
+        impl CommandRunner for FailingRunner {
+            fn run(&self, _program: &OsStr, _args: &[&str]) -> std::io::Result<Output> {
+                Ok(Output {
+                    status: ExitStatus::from_raw(1 << 8), // non-zero exit
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let species = vec![parse_species(BLOB).unwrap()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![agent("t0", Idle)])
+            .expect("the receiver is still alive");
+        drop(tx);
+
+        let cli = LiveHerdr::with_runner("herdr", FailingRunner);
+        let (backend, _) = IoTestBackend::new(40, 10);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 40, 10));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = HitRenderer(CountingRenderer::default());
+        let mut events = ScriptedEvents::new(vec![Some(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }))]);
+        let diag = Diagnostic::new();
+
+        run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &diag,
+        )
+        .expect("the scripted loop quits cleanly");
+
+        assert_eq!(
+            diag.get().as_deref(),
+            Some("focus failed: herdr exited non-zero"),
+            "a failed click-to-focus must latch a diagnostic rather than vanish (issue #84)"
         );
     }
 
