@@ -24,6 +24,7 @@
 //! closing it, since herdr's forwarding can still interleave complete
 //! escape sequences from concurrent panes (issue #64).
 
+use crate::chrome;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -770,7 +771,7 @@ impl KittyRenderer {
         // none, so the emitted bytes are unchanged there.
         if let Some(text) = crate::marker::build_marker() {
             let text: String = text.chars().take(width).collect();
-            s.push_str(&format!("\x1b[38;2;107;122;107m{text}\x1b[0m"));
+            s.push_str(&format!("\x1b[{}m{text}\x1b[0m", chrome::sgr_fg(chrome::MARKER_GRAY)));
         }
         // `+N` for the members the strip has no room for, dim gray (SGR 90 —
         // ratatui's `Color::DarkGray` on the half-block side), rightmost in the
@@ -800,7 +801,8 @@ impl KittyRenderer {
             // clear of `+N` by a further column when the strip is overflowing.
             let col = width.saturating_sub(tw + counter_w).max(1);
             s.push_str(&format!(
-                "\x1b[{row};{col}H\x1b[38;2;217;164;65m{text}\x1b[0m"
+                "\x1b[{row};{col}H\x1b[{sgr}m{text}\x1b[0m",
+                sgr = chrome::sgr_fg(chrome::CAPTION_OCHRE)
             ));
         }
         self.out.write_all(s.as_bytes())

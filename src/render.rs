@@ -21,6 +21,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::agent::{Agent, AgentIconStyle};
 use crate::anim::{Overlay, OverlayColor, Rgb};
+use crate::chrome;
 use crate::herd::{Herd, visible_and_hidden};
 use crate::herdr::HerdrCli;
 use crate::marker;
@@ -464,7 +465,7 @@ pub fn draw_herd(
         };
         let color = match state.overlay.color {
             OverlayColor::Literal(c) => to_color(c),
-            OverlayColor::Accent => Color::Rgb(0xe6, 0xc8, 0x77),
+            OverlayColor::Accent => chrome::cell(chrome::ACCENT),
             OverlayColor::Default => Color::Gray,
         };
         let cx = area.x
@@ -509,7 +510,7 @@ pub fn overlay_lane_row0(area: Rect) -> u16 {
 
 /// Dim gray — the build marker reads as chrome, never competing with the
 /// caption's ochre or a member's colors.
-const MARKER_GRAY: Color = Color::Rgb(0x6b, 0x7a, 0x6b);
+const MARKER_GRAY: Color = chrome::cell(chrome::MARKER_GRAY);
 
 /// Draw the dev build marker at the left of the overlay lane, or nothing in a
 /// shipped build (where [`marker::build_marker`] is `None`). The lane's other
@@ -534,7 +535,7 @@ pub fn draw_build_marker(frame: &mut Frame, area: Rect, y: u16) {
 
 /// Ochre — the hovered member's caption color, distinct from the `+N` marker's
 /// neutral dark gray.
-const CAPTION_OCHRE: Color = Color::Rgb(0xd9, 0xa4, 0x41);
+const CAPTION_OCHRE: Color = chrome::cell(chrome::CAPTION_OCHRE);
 
 /// Draw the hover caption top-right in the reserved top lane (row `y`),
 /// right-aligned and ochre, or nothing when `label` is `None`. When `hidden`
@@ -1426,7 +1427,7 @@ mod tests {
         let label_start = row0.find("backend-api").unwrap();
         assert_eq!(
             fg[label_start],
-            Color::Rgb(0xd9, 0xa4, 0x41),
+            chrome::cell(chrome::CAPTION_OCHRE),
             "caption is ochre"
         );
     }
