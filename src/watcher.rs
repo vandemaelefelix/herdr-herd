@@ -672,6 +672,7 @@ mod tests {
             Box::new(StepClock::new(20)),
             tx,
             timings,
+            Diagnostic::new(),
         );
 
         let initial = rx
@@ -707,6 +708,7 @@ mod tests {
             Box::new(StepClock::new(10)),
             tx,
             timings,
+            Diagnostic::new(),
         );
 
         let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
@@ -736,6 +738,7 @@ mod tests {
             Box::new(StepClock::new(10)),
             tx,
             timings,
+            Diagnostic::new(),
         );
 
         let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");
@@ -807,6 +810,7 @@ mod tests {
             Box::new(clock),
             tx,
             Timings::default(),
+            Diagnostic::new(),
         );
 
         let initial = rx.recv_timeout(RECV_TIMEOUT).expect("initial snapshot");

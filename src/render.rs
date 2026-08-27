@@ -2539,6 +2539,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &Diagnostic::new(),
@@ -2763,6 +2764,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -2823,6 +2825,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -2891,6 +2894,7 @@ mod tests {
             &mut renderer,
             &crate::config::SoundConfig::default(),
             &SilentPlayer,
+            &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
             &diag,
@@ -3120,6 +3124,7 @@ mod tests {
             &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
+            &Diagnostic::new(),
         )
         .expect("the scripted loop quits cleanly");
 
@@ -3184,6 +3189,7 @@ mod tests {
             &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
+            &Diagnostic::new(),
         )
         .expect("the scripted loop quits cleanly");
 
@@ -3241,6 +3247,7 @@ mod tests {
             &AlwaysClaims,
             &mut events,
             AgentIconStyle::Emoji,
+            &Diagnostic::new(),
         )
         .expect("the scripted loop quits cleanly");
 
