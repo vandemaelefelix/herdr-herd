@@ -667,6 +667,12 @@ pub trait MemberRenderer {
     /// backend supports it) overlays/`+N`/the hover caption. `now_ms` drives
     /// every member's position/pose (see `motion::animate`). `hover_label` is the
     /// hovered member's name, if any, drawn top-right in the reserved lane.
+    ///
+    /// Fallible because the kitty backend writes escapes straight to stdout: a
+    /// broken pipe or a full buffer must reach the caller instead of vanishing
+    /// (issue #55) — `cache`/`placements` would otherwise keep claiming images
+    /// the terminal never received. `run_loop` treats an error as unrecoverable
+    /// and exits rather than retrying it forever.
     fn draw(
         &mut self,
         frame: &mut Frame,
@@ -675,7 +681,7 @@ pub trait MemberRenderer {
         theme: Theme,
         now_ms: u64,
         hover_label: Option<&str>,
-    );
+    ) -> io::Result<()>;
     /// A hash of everything this frame would put on screen, at this backend's
     /// own quantisation: the visible members' already-rounded poses and
     /// positions, the `+N` overflow count, the hover caption, and `area`.
@@ -700,16 +706,22 @@ pub trait MemberRenderer {
         hover_label: Option<&str>,
     ) -> u64;
     /// The visible member under terminal column `col`, if any (for hover/click).
-    /// `now_ms` must match the value passed to `draw` this frame.
+    /// `now_ms` and `area` must match the values passed to `draw` this frame —
+    /// `area` carries the height a backend needs to size its hit box, not just
+    /// the width, so a caller can never leave a backend guessing at a height it
+    /// was never actually told (see issue #55: kitty used to fall back to an
+    /// arbitrary constant here when `draw` had not run yet).
     fn member_at_column(
         &self,
         herd: &Herd,
         species: &[Species],
-        strip_w: usize,
+        area: Rect,
         col: u16,
         now_ms: u64,
     ) -> Option<usize>;
-    /// Release backend resources (kitty: delete transmitted images). Default no-op.
+    /// Release backend resources (kitty: delete transmitted images). Default
+    /// no-op. The sole caller (`run`) discards the result deliberately — a
+    /// teardown failure on process exit has nothing left to degrade into.
     fn teardown(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -730,13 +742,17 @@ impl MemberRenderer for HalfBlockRenderer {
         theme: Theme,
         now_ms: u64,
         hover_label: Option<&str>,
-    ) {
+    ) -> io::Result<()> {
         draw_herd(frame, herd, species, theme, now_ms, hover_label);
         // Drawn here rather than inside `draw_herd` so the herd itself stays
         // feature-independent: the layout snapshots keep asserting the shipped
         // strip whichever way the crate is built. Mirrors the kitty path, which
         // emits its marker from its own `MemberRenderer::draw`.
         draw_build_marker(frame, frame.area(), overlay_lane_row0(frame.area()));
+        // Cells go through ratatui's own buffer, not a raw write, so there is
+        // nothing here that can fail the way the kitty backend's stdout writes
+        // can.
+        Ok(())
     }
     fn frame_signature(
         &self,
@@ -753,11 +769,11 @@ impl MemberRenderer for HalfBlockRenderer {
         &self,
         herd: &Herd,
         species: &[Species],
-        strip_w: usize,
+        area: Rect,
         col: u16,
         now_ms: u64,
     ) -> Option<usize> {
-        member_at_column(herd, species, strip_w, col, now_ms)
+        member_at_column(herd, species, area.width as usize, col, now_ms)
     }
     fn backend_name(&self) -> &'static str {
         "half-block"
@@ -1014,9 +1030,6 @@ where
         if !transitions.is_empty() {
             crate::sound::play_claimed(sound_player, sound_claim.as_ref(), &transitions, sound_cfg);
         }
-        // Mouse hit-testing has to agree with what is on screen, so the width
-        // it uses is the width the last frame actually drew at.
-        let strip_w = area.width as usize;
         // A latched diagnostic outranks the hover caption: a real problem is
         // more useful than "which sheep the cursor is over" (issue #84).
         let caption = diag.get().or_else(|| hovered.clone());
@@ -1031,9 +1044,33 @@ where
         let sig = renderer.frame_signature(&herd, species, theme, area, now_ms, caption.as_deref());
         let redrew = last_sig != Some(sig);
         if redrew {
+            // `terminal.draw`'s closure returns `()`, so a `MemberRenderer::draw`
+            // error is captured here rather than propagated through it directly.
+            let mut draw_result = Ok(());
             terminal.draw(|f| {
-                renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
+                draw_result = renderer.draw(f, &herd, species, theme, now_ms, caption.as_deref());
             })?;
+            // A failed draw (issue #55) is treated as unrecoverable: the kitty
+            // backend's `cache`/`placements` may already claim images the
+            // terminal never received, so retrying next frame would only place
+            // against ids that no longer mean anything. Exiting non-zero is what
+            // turns the controller's existing process-liveness probe truthful
+            // again (issue #60): the pane falls back to its shell instead of a
+            // wedged renderer masquerading as a healthy one, so the next sweep
+            // replaces it.
+            //
+            // No `eprintln!` here deliberately: this runs with the alternate
+            // screen and raw mode still active, so writing to stderr would
+            // paint over the strip (and stair-step, with raw mode's bare `\n`)
+            // rather than explain anything. `run`'s caller prints this error
+            // (wrapped with context below) only *after* `guard.restore()` has
+            // handed the terminal back, where it actually lands somewhere
+            // readable.
+            if let Err(e) = draw_result {
+                return Err(io::Error::other(format!(
+                    "rendering failed ({e}); exiting so the strip can be replaced"
+                )));
+            }
             last_sig = Some(sig);
         }
         // Same-iteration reset (#62): computed from this frame's own redraw
@@ -1054,14 +1091,15 @@ where
                     MouseEventKind::Moved => {
                         // Follow the cursor: show the hovered member's name, and
                         // clear it when the cursor is over empty strip — so the
-                        // caption disappears when you're not on a sheep.
-                        let hit =
-                            renderer.member_at_column(&herd, species, strip_w, column, now_ms);
+                        // caption disappears when you're not on a sheep. `area`
+                        // is the geometry the last frame actually drew at, so
+                        // hit-testing agrees with what is on screen.
+                        let hit = renderer.member_at_column(&herd, species, area, column, now_ms);
                         hovered = next_hover(hit, &herd.members, agent_icon);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(i) =
-                            renderer.member_at_column(&herd, species, strip_w, column, now_ms)
+                            renderer.member_at_column(&herd, species, area, column, now_ms)
                         {
                             let tid = herd.members[i].terminal_id.clone();
                             // The strip must keep running on a failed focus,
@@ -1552,6 +1590,7 @@ mod tests {
                     NOW_MS,
                     None,
                 )
+                .unwrap();
             })
             .unwrap();
         let lane = &rows_of(terminal.backend())[0];
@@ -1579,6 +1618,7 @@ mod tests {
                     NOW_MS,
                     Some("a-very-long-agent-name-that-does-not-fit"),
                 )
+                .unwrap();
             })
             .unwrap();
         let lane = &rows_of(terminal.backend())[0];
@@ -1748,7 +1788,11 @@ mod tests {
         let herd = fixed_herd(&[AgentStatus::Working, AgentStatus::Blocked]);
         let mut via_trait = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_trait
-            .draw(|f| HalfBlockRenderer.draw(f, &herd, &species, Theme::Dark, NOW_MS, None))
+            .draw(|f| {
+                HalfBlockRenderer
+                    .draw(f, &herd, &species, Theme::Dark, NOW_MS, None)
+                    .unwrap()
+            })
             .unwrap();
         let mut via_fn = Terminal::new(TestBackend::new(60, 11)).unwrap();
         via_fn
@@ -2168,10 +2212,11 @@ mod tests {
             _theme: Theme,
             _now_ms: u64,
             hover_label: Option<&str>,
-        ) {
+        ) -> io::Result<()> {
             self.draws += 1;
             self.areas.push(frame.area());
             self.captions.push(hover_label.map(String::from));
+            Ok(())
         }
         fn frame_signature(
             &self,
@@ -2188,7 +2233,7 @@ mod tests {
             &self,
             _herd: &Herd,
             _species: &[Species],
-            _strip_w: usize,
+            _area: Rect,
             _col: u16,
             _now_ms: u64,
         ) -> Option<usize> {
@@ -2213,9 +2258,9 @@ mod tests {
             theme: Theme,
             now_ms: u64,
             hover_label: Option<&str>,
-        ) {
+        ) -> io::Result<()> {
             self.0
-                .draw(frame, herd, species, theme, now_ms, hover_label);
+                .draw(frame, herd, species, theme, now_ms, hover_label)
         }
         fn frame_signature(
             &self,
@@ -2233,7 +2278,7 @@ mod tests {
             &self,
             _herd: &Herd,
             _species: &[Species],
-            _strip_w: usize,
+            _area: Rect,
             _col: u16,
             _now_ms: u64,
         ) -> Option<usize> {
@@ -2326,6 +2371,101 @@ mod tests {
         )
         .expect("the scripted loop quits cleanly");
         renderer
+    }
+
+    // ---- issues #55/#60: a failed draw must end the strip, not vanish -------
+
+    /// A renderer whose `draw` always fails, standing in for a kitty backend
+    /// whose stdout writes have started erroring.
+    struct FailingRenderer;
+
+    impl MemberRenderer for FailingRenderer {
+        fn draw(
+            &mut self,
+            _frame: &mut Frame,
+            _herd: &Herd,
+            _species: &[Species],
+            _theme: Theme,
+            _now_ms: u64,
+            _hover_label: Option<&str>,
+        ) -> io::Result<()> {
+            Err(io::Error::other("stdout closed"))
+        }
+        fn frame_signature(
+            &self,
+            _herd: &Herd,
+            _species: &[Species],
+            _theme: Theme,
+            _area: Rect,
+            _now_ms: u64,
+            _hover_label: Option<&str>,
+        ) -> u64 {
+            0
+        }
+        fn member_at_column(
+            &self,
+            _herd: &Herd,
+            _species: &[Species],
+            _area: Rect,
+            _col: u16,
+            _now_ms: u64,
+        ) -> Option<usize> {
+            None
+        }
+        fn backend_name(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    #[test]
+    fn a_failed_draw_ends_the_loop_instead_of_retrying_forever() {
+        // The bug issue #60 names: a wedged-but-alive renderer that keeps
+        // looping (and keeps failing every frame) is indistinguishable from a
+        // healthy one to the controller's process-liveness probe. `run_loop`
+        // must surface the failure as an error rather than swallow it and try
+        // again next tick — a script long enough to hang forever if it did.
+        use AgentStatus::*;
+        let (backend, _) = IoTestBackend::new(90, 11);
+        let species = vec![parse_species(BLOB).unwrap()];
+        let agents: Vec<_> = [Idle]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| agent(&format!("t{i}"), *s))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(agents).expect("the receiver is still alive");
+        drop(tx);
+        let cli = LiveHerdr::with_runner(
+            "herdr",
+            Recorder {
+                args: Rc::new(RefCell::new(Vec::new())),
+            },
+        );
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 90, 11));
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport }).unwrap();
+        let mut renderer = FailingRenderer;
+        // Long enough to hang the test if a failed draw were retried forever
+        // instead of ending the loop.
+        let mut events = ScriptedEvents::new(vec![None; 1000]);
+        let result = run_loop(
+            &mut terminal,
+            rx,
+            &species,
+            Theme::Dark,
+            &cli,
+            true,
+            &mut renderer,
+            &crate::config::SoundConfig::default(),
+            &SilentPlayer,
+            &mut events,
+            AgentIconStyle::Emoji,
+            &Diagnostic::new(),
+        );
+        assert!(
+            result.is_err(),
+            "an unrecoverable draw failure must end the loop so the process \
+             exits non-zero and the controller's liveness probe replaces it"
+        );
     }
 
     // ---- issue #62: adaptive tick -------------------------------------------
@@ -2762,7 +2902,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut renderer = HalfBlockRenderer;
         terminal
-            .draw(|f| renderer.draw(f, herd, species, Theme::Dark, now_ms, None))
+            .draw(|f| {
+                renderer
+                    .draw(f, herd, species, Theme::Dark, now_ms, None)
+                    .unwrap()
+            })
             .unwrap();
         format!("{}", terminal.backend())
     }
