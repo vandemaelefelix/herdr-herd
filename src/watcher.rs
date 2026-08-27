@@ -15,6 +15,7 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
 use crate::agent::Agent;
+use crate::diag::Diagnostic;
 use crate::herdr::HerdFeed;
 use crate::socket::{SocketClient, subscribe_request};
 
@@ -204,21 +205,39 @@ pub fn watch(
     clock: Box<dyn Clock + Send>,
     tx: Sender<Vec<Agent>>,
     timings: Timings,
+    diag: Diagnostic,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         use std::io::ErrorKind;
+
+        // A herd refresh that fails on both the socket and the CLI fallback
+        // (`HerdFeed::herd` returns `None`) used to fail silently forever;
+        // latch it into the strip instead (issue #84). Cleared once a refresh
+        // succeeds again, so a transient failure does not linger.
+        let refresh = |feed: &mut HerdFeed, now: u64| match feed.herd(now) {
+            Some(s) => {
+                diag.clear();
+                Some(s)
+            }
+            None => {
+                diag.set("herd refresh failed: socket and herdr CLI both unavailable");
+                None
+            }
+        };
 
         let mut schedule = Debouncer::new(timings);
 
         // Initial snapshot.
         let now = clock.now_ms();
-        if let Some(s) = feed.herd(now) {
+        if let Some(s) = refresh(&mut feed, now) {
             let _ = tx.send(s);
         }
         schedule.sent(now);
 
-        if let Some(sock) = socket.as_mut() {
-            let _ = sock.send_line(&subscribe_request());
+        if let Some(sock) = socket.as_mut()
+            && let Err(e) = sock.send_line(&subscribe_request())
+        {
+            diag.set(format!("socket subscribe failed: {e}"));
         }
         loop {
             if let Some(sock) = socket.as_mut() {
@@ -253,7 +272,7 @@ pub fn watch(
             // degraded to `None`).
             let now = clock.now_ms();
             if schedule.due(now) {
-                if let Some(s) = feed.herd(now)
+                if let Some(s) = refresh(&mut feed, now)
                     && tx.send(s).is_err()
                 {
                     return;
@@ -271,6 +290,36 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn this_module_never_writes_to_stdout_or_stderr() {
+        // The watcher thread shares a process with `render::run_loop`'s raw
+        // mode + alternate screen, so it has the same no-stderr constraint —
+        // see the `rust-error-handling` skill's rule 6 and `crate::diag`.
+        // Mirrors `sound` and `render`'s copies of this guard, built from
+        // parts so this list does not trip its own scan.
+        let bang = "!";
+        let banned = [
+            format!("println{bang}"),
+            format!("eprintln{bang}"),
+            format!("print{bang}("),
+            format!("eprint{bang}("),
+            format!("dbg{bang}("),
+        ];
+        let source = include_str!("watcher.rs");
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // doc/line comments may mention these macros in prose
+            }
+            for needle in &banned {
+                assert!(
+                    !line.contains(needle.as_str()),
+                    "found `{needle}` outside a comment, in: {line:?}"
+                );
+            }
+        }
+    }
 
     const LIST: &str = r#"{"result":{"agents":[{"agent_status":"idle","cwd":"/","focused":false,"foreground_cwd":"/","pane_id":"p","revision":0,"tab_id":"t","terminal_id":"x","workspace_id":"w"}]}}"#;
 
