@@ -25,6 +25,17 @@ value the caller can't trust, or before adding an `unwrap()`.
    failed fetch or parse collapses to an empty herd, not an abort.
 5. **`unwrap` / `expect` live only in `#[cfg(test)]`.** In tests they document
    an invariant (`expect("valid fixture")`). In production code they are a bug.
+6. **Never `eprintln!` from the render process.** `render::run_loop` and
+   anything running in its process (including the watcher thread spawned by
+   `watcher::watch`) execute after raw mode + the alternate screen are
+   entered — stderr shares the live TUI's tty, so a diagnostic printed there
+   paints over the strip, stair-steps (raw mode sends a bare LF), and on the
+   fatal path is discarded by `LeaveAlternateScreen` before anyone reads it
+   (issue #84). `eprintln!` is fine in `main.rs` and `src/control.rs`: both
+   run with normal stdio, outside any raw-mode guard. From inside the render
+   process, latch degraded-boundary failures into [`crate::diag::Diagnostic`]
+   instead — `run_loop` reads it every frame and draws it through the strip's
+   own caption lane, the same one the hover name uses.
 
 ## The pattern
 
@@ -59,3 +70,5 @@ let agents = herdr
   way. Match the existing `std`-error style first.
 - Swallowing an error silently where the caller *could* act on it. Only degrade
   to a default at a genuine boundary (the draw loop), not in the middle of logic.
+- `eprintln!("...")` anywhere reachable from `render::run` or `watcher::watch`
+  — see rule 6. Use `diag.set(...)` there instead.

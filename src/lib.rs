@@ -20,6 +20,7 @@ pub(crate) mod base64;
 pub(crate) mod caps;
 pub mod config;
 pub mod control;
+pub mod diag;
 pub(crate) mod herd;
 pub mod herdr;
 pub(crate) mod icon;

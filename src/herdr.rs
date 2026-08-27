@@ -99,19 +99,6 @@ pub struct HerdFeed {
     rpc: Option<Box<dyn RpcClient + Send>>,
     cli: Box<dyn HerdrCli + Send>,
     labels: Option<CachedLabels>,
-    /// Refreshes in a row that have come back empty-handed (neither path
-    /// answered). Resets to 0 the moment either path succeeds.
-    ///
-    /// Tracked but not (yet) surfaced anywhere: an `eprintln!` was tried here
-    /// (issue #55) for a prolonged stall, but `herd()` is called from the
-    /// watcher thread of the render process, which has the alternate screen
-    /// and raw mode active — stderr lands on the strip's own tty and corrupts
-    /// it rather than explaining anything. A real diagnostic belongs drawn
-    /// into the strip itself; this counter is exactly the state such a
-    /// diagnostic would need, kept ready for whoever builds that surface
-    /// (tracked separately alongside #55/#60, see also PR #81's `sound.rs`
-    /// reversion for the same trap).
-    consecutive_failures: u32,
 }
 
 /// The label maps the CLI fallback reuses between refreshes, with the reading of
@@ -130,7 +117,6 @@ impl HerdFeed {
             rpc,
             cli,
             labels: None,
-            consecutive_failures: 0,
         }
     }
 
@@ -141,12 +127,7 @@ impl HerdFeed {
     /// `now_ms` is a reading of the watcher's clock, used only to age the CLI
     /// fallback's label cache.
     pub fn herd(&mut self, now_ms: u64) -> Option<Vec<Agent>> {
-        let result = self.via_socket().or_else(|| self.via_cli(now_ms));
-        match &result {
-            Some(_) => self.consecutive_failures = 0,
-            None => self.consecutive_failures = self.consecutive_failures.saturating_add(1),
-        }
-        result
+        self.via_socket().or_else(|| self.via_cli(now_ms))
     }
 
     /// Drop the cached label maps, so the next CLI-path refresh refetches them.
@@ -479,64 +460,6 @@ mod tests {
         feed.invalidate_labels();
         feed.herd(1);
         assert_eq!(cli.spawns_of("workspace list"), 2);
-    }
-
-    /// Issue #55: with both paths down, a missing `herdr` renders an empty
-    /// strip with nothing to explain it — `consecutive_failures` is the state
-    /// a future in-strip diagnostic needs to say so, and it must never itself
-    /// break `herd()`'s contract: every failed refresh still degrades to
-    /// `None`, consistently, whether it is the first failure or the fifth.
-    #[test]
-    fn repeated_refresh_failures_keep_degrading_to_none() {
-        let (mut feed, _cli) = feed_with(
-            None,
-            RecordingCli {
-                fail: Some("agent list"),
-                ..Default::default()
-            },
-        );
-        for t in 0..5 {
-            assert!(feed.herd(t).is_none(), "both paths are down at tick {t}");
-        }
-    }
-
-    /// A CLI whose `agent list` fails `remaining` times, then succeeds — for
-    /// exercising a stall that recovers.
-    struct FlakyThenOk {
-        remaining: std::sync::Mutex<usize>,
-    }
-    impl HerdrCli for FlakyThenOk {
-        fn run_json(&self, args: &[&str]) -> io::Result<String> {
-            if args == ["agent", "list"] {
-                let mut remaining = self.remaining.lock().unwrap();
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Err(io::Error::other("boom"));
-                }
-                return Ok(r#"{"result":{"agents":[]}}"#.into());
-            }
-            Ok(r#"{"result":{}}"#.into())
-        }
-    }
-
-    /// A stall that clears must not keep the streak primed for next time — a
-    /// later, separate stall is a fresh count, not a continuation of the old
-    /// one.
-    #[test]
-    fn a_recovered_refresh_resets_the_failure_streak() {
-        let mut feed = HerdFeed::new(
-            None,
-            Box::new(FlakyThenOk {
-                remaining: std::sync::Mutex::new(2),
-            }),
-        );
-        assert!(feed.herd(0).is_none(), "first failure");
-        assert!(feed.herd(1).is_none(), "second failure");
-        assert!(feed.herd(2).is_some(), "recovers on the third try");
-        assert_eq!(
-            feed.consecutive_failures, 0,
-            "a successful refresh clears the streak"
-        );
     }
 
     /// A transient label-list failure must not be cached, or one bad spawn
